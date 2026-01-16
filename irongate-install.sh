@@ -3209,7 +3209,10 @@ cat > /opt/irongate/irongate.py << 'IRONGATEPY'
 #!/usr/bin/env python3
 """
 Irongate Network Isolation Engine
-Provides 7-layer defense (single-NIC) or bridge isolation (dual-NIC)
+Middleground ARP isolation: ~95% protection without breaking unprotected devices
+- Unicast ARP to ALL known LAN devices telling them protected IPs are at Irongate
+- Does NOT touch anyone's gateway entry except protected devices
+- Unprotected devices keep their internet, can't reach protected servers
 """
 
 import os
@@ -3220,6 +3223,7 @@ import signal
 import logging
 import threading
 import subprocess
+import sqlite3
 from pathlib import Path
 
 logging.basicConfig(
@@ -3228,12 +3232,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger('irongate')
 
+DB_PATH = '/var/www/irongate/dhcp.db'
+
 class Irongate:
     def __init__(self, config_path='/etc/irongate/config.yaml'):
         self.config_path = config_path
         self.config = {}
         self.running = False
         self.threads = []
+        # Track devices
+        self.protected_devices = []  # List of (ip, mac, zone) tuples
+        self.lan_devices = []  # List of (ip, mac) tuples - all known LAN devices
+        self.gateway_ip = None
+        self.gateway_mac = None
+        self.interface = 'eth0'
+        self.local_mac = None
+        self.local_ip = None
         
     def load_config(self):
         try:
@@ -3249,78 +3263,438 @@ class Irongate:
             logger.error(f"Failed to load config: {e}")
             return False
     
+    def _load_lan_devices(self):
+        """Load all known LAN devices from DHCP database"""
+        self.lan_devices = []
+        
+        # Get protected IPs and MACs to exclude
+        protected_ips = set(d[0] for d in self.protected_devices)
+        protected_macs = set(d[1].lower() for d in self.protected_devices)
+        
+        try:
+            if not os.path.exists(DB_PATH):
+                logger.warning(f"Database not found: {DB_PATH}")
+                return
+            
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Get from DHCP leases
+            try:
+                cursor.execute("SELECT ip, mac FROM leases WHERE ip IS NOT NULL AND mac IS NOT NULL")
+                for row in cursor.fetchall():
+                    ip, mac = row[0], row[1].lower()
+                    # Skip protected devices, gateway, and self
+                    if (ip not in protected_ips and 
+                        mac not in protected_macs and
+                        ip != self.gateway_ip and 
+                        ip != self.local_ip and
+                        mac.lower() != self.local_mac.lower()):
+                        self.lan_devices.append((ip, mac))
+            except sqlite3.OperationalError:
+                pass
+            
+            # Also get from irongate_devices table (trusted devices)
+            try:
+                cursor.execute("SELECT ip, mac FROM irongate_devices WHERE zone = 'trusted' AND ip IS NOT NULL AND mac IS NOT NULL")
+                for row in cursor.fetchall():
+                    ip, mac = row[0], row[1].lower()
+                    if ip != self.gateway_ip and ip != self.local_ip:
+                        # Check not already added
+                        if not any(d[0] == ip for d in self.lan_devices):
+                            self.lan_devices.append((ip, mac))
+            except sqlite3.OperationalError:
+                pass
+            
+            conn.close()
+            
+            # Deduplicate by IP
+            seen_ips = set()
+            unique_devices = []
+            for ip, mac in self.lan_devices:
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
+                    unique_devices.append((ip, mac))
+            self.lan_devices = unique_devices
+            
+            logger.info(f"Loaded {len(self.lan_devices)} LAN devices from database")
+            
+        except Exception as e:
+            logger.error(f"Failed to load LAN devices: {e}")
+    
     def setup_kernel(self):
-        """Enable required kernel features"""
-        commands = [
-            'sysctl -w net.ipv4.ip_forward=1',
-            'sysctl -w net.ipv4.conf.all.arp_filter=1',
-            'sysctl -w net.ipv4.conf.all.arp_announce=2',
-        ]
-        for cmd in commands:
-            os.system(cmd + ' 2>/dev/null')
+        """Enable IP forwarding for traffic we intercept"""
+        os.system('sysctl -w net.ipv4.ip_forward=1 2>/dev/null')
+    
+    def _get_mac(self, ip):
+        """Resolve MAC address via ARP request"""
+        try:
+            from scapy.all import Ether, ARP, srp, conf
+            conf.verb = 0
+            ans, _ = srp(
+                Ether(dst='ff:ff:ff:ff:ff:ff')/ARP(pdst=ip),
+                timeout=3, verbose=0, iface=self.interface
+            )
+            if ans:
+                return ans[0][1].hwsrc
+        except Exception as e:
+            logger.error(f"Failed to resolve MAC for {ip}: {e}")
+        return None
+    
+    def _send_unicast_arp(self, target_ip, target_mac, spoof_ip):
+        """Send UNICAST ARP reply to specific target only."""
+        try:
+            from scapy.all import Ether, ARP, sendp, conf
+            conf.verb = 0
+            
+            pkt = Ether(dst=target_mac, src=self.local_mac) / ARP(
+                op=2,              # ARP reply
+                pdst=target_ip,    # Who we're telling
+                hwdst=target_mac,  # UNICAST - only this device
+                psrc=spoof_ip,     # IP we're impersonating
+                hwsrc=self.local_mac
+            )
+            sendp(pkt, iface=self.interface, verbose=False)
+            return True
+        except Exception as e:
+            return False
+    
+    def _restore_arp_tables(self):
+        """Restore legitimate ARP mappings on shutdown"""
+        try:
+            from scapy.all import Ether, ARP, sendp, conf
+            conf.verb = 0
+        except ImportError:
+            return
+        
+        logger.info("Restoring ARP tables...")
+        
+        # Restore protected devices
+        for dev_ip, dev_mac, zone in self.protected_devices:
+            # Restore gateway's view of this device
+            if self.gateway_mac:
+                pkt = Ether(dst=self.gateway_mac, src=dev_mac) / ARP(
+                    op=2,
+                    pdst=self.gateway_ip,
+                    hwdst=self.gateway_mac,
+                    psrc=dev_ip,
+                    hwsrc=dev_mac
+                )
+                sendp(pkt, iface=self.interface, verbose=False, count=5)
+            
+            # Restore device's view of gateway
+            pkt = Ether(dst=dev_mac, src=self.gateway_mac) / ARP(
+                op=2,
+                pdst=dev_ip,
+                hwdst=dev_mac,
+                psrc=self.gateway_ip,
+                hwsrc=self.gateway_mac
+            )
+            sendp(pkt, iface=self.interface, verbose=False, count=5)
+            
+            # Restore all LAN devices' view of this protected device
+            for lan_ip, lan_mac in self.lan_devices:
+                pkt = Ether(dst=lan_mac, src=dev_mac) / ARP(
+                    op=2,
+                    pdst=lan_ip,
+                    hwdst=lan_mac,
+                    psrc=dev_ip,
+                    hwsrc=dev_mac  # Real MAC
+                )
+                sendp(pkt, iface=self.interface, verbose=False, count=3)
+            
+            logger.info(f"  Restored: {dev_ip}")
+        
+        logger.info("ARP tables restored")
     
     def run_single_nic(self):
-        """Run 7-layer software isolation"""
-        logger.info("Starting single-NIC mode (7-layer isolation)")
+        """Run middleground ARP-based isolation (~95% protection)"""
+        logger.info("Starting single-NIC mode (middleground ARP isolation)")
         
         net = self.config.get('network', {})
-        layers = self.config.get('layers', {})
-        interface = net.get('interface', 'eth0')
-        gateway_ip = net.get('gateway_ip', '')
-        gateway_mac = net.get('gateway_mac', '')
-        local_ip = net.get('local_ip', '')
-        local_mac = net.get('local_mac', '')
+        self.interface = net.get('interface', 'eth0')
+        self.gateway_ip = net.get('gateway_ip', '')
+        self.gateway_mac = net.get('gateway_mac', '')
+        self.local_mac = net.get('local_mac', '')
+        self.local_ip = net.get('local_ip', '')
         devices = self.config.get('devices', [])
         
-        if not gateway_mac:
-            logger.warning("Gateway MAC not known, attempting to discover...")
-            os.system(f"arping -c 1 -I {interface} {gateway_ip} 2>/dev/null")
-            time.sleep(1)
+        # Resolve gateway MAC if not provided
+        if not self.gateway_mac:
+            logger.info(f"Resolving gateway MAC for {self.gateway_ip}...")
+            self.gateway_mac = self._get_mac(self.gateway_ip)
+            if self.gateway_mac:
+                logger.info(f"  Gateway MAC: {self.gateway_mac}")
+            else:
+                logger.error("Could not resolve gateway MAC - ARP spoofing disabled")
+                return
         
-        # === CRITICAL: Set static ARP entries for protected devices ===
-        # This allows Irongate to forward traffic to real device MACs
-        # even while we're ARP-spoofing the rest of the network
-        logger.info("Setting up static ARP entries for protected devices...")
+        # Build list of protected devices (isolated + servers, NOT trusted)
+        self.protected_devices = []
         for dev in devices:
             dev_ip = dev.get('ip')
-            dev_mac = dev.get('mac')
-            if dev_ip and dev_mac:
-                # Add permanent ARP entry so kernel knows the REAL MAC
-                os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {interface} nud permanent 2>/dev/null")
-                logger.info(f"  Static ARP: {dev_ip} -> {dev_mac}")
-        
-        # Layer 2: ARP Defense
-        if layers.get('arp_defense', True):
-            t = threading.Thread(target=self._arp_defense_loop, daemon=True)
-            t.start()
-            self.threads.append(t)
-            logger.info("Layer 2: ARP Defense started")
-        
-        # Layer 3: IPv6 RA
-        if layers.get('ipv6_ra', True):
-            t = threading.Thread(target=self._ipv6_ra_loop, daemon=True)
-            t.start()
-            self.threads.append(t)
-            logger.info("Layer 3: IPv6 RA Attack started")
-        
-        # Layer 4: Firewall
-        self._setup_firewall()
-        logger.info("Layer 4: Firewall configured")
-        
-        # Layer 5+6: Gateway Takeover + Bypass Detection
-        if layers.get('gateway_takeover', True):
-            t = threading.Thread(target=self._gateway_takeover_loop, daemon=True)
-            t.start()
-            self.threads.append(t)
-            logger.info("Layer 5+6: Gateway Takeover started")
+            dev_mac = dev.get('mac', '').lower()
+            zone = dev.get('zone', 'isolated')
             
-            # Layer 7: ARP Reply Interception (prevents Layer 2 bypass)
-            t2 = threading.Thread(target=self._arp_reply_handler, daemon=True)
-            t2.start()
-            self.threads.append(t2)
-            logger.info("Layer 7: ARP Reply Interception started")
+            if not dev_ip:
+                continue
+                
+            if zone == 'trusted':
+                logger.info(f"  TRUSTED (no spoofing): {dev_ip}")
+                continue
+            
+            if not dev_mac:
+                dev_mac = self._get_mac(dev_ip)
+                if not dev_mac:
+                    logger.warning(f"  Cannot resolve MAC for {dev_ip}, skipping")
+                    continue
+            
+            self.protected_devices.append((dev_ip, dev_mac, zone))
+            logger.info(f"  PROTECTED ({zone}): {dev_ip} ({dev_mac})")
         
-        logger.info("Single-NIC isolation active")
+        if not self.protected_devices:
+            logger.warning("No protected devices - nothing to isolate")
+            return
+        
+        # Load all known LAN devices from database
+        self._load_lan_devices()
+        
+        # Set up static ARP entries on Irongate
+        logger.info("Setting up local static ARP entries...")
+        for dev_ip, dev_mac, zone in self.protected_devices:
+            os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {self.interface} nud permanent 2>/dev/null")
+        os.system(f"ip neigh replace {self.gateway_ip} lladdr {self.gateway_mac} dev {self.interface} nud permanent 2>/dev/null")
+        
+        # Setup firewall
+        self._setup_firewall()
+        logger.info("Firewall configured")
+        
+        # Start ARP spoofing thread
+        t = threading.Thread(target=self._middleground_arp_spoof_loop, daemon=True)
+        t.start()
+        self.threads.append(t)
+        logger.info("Middleground ARP spoofing started")
+        
+        # Start ARP defense thread
+        t2 = threading.Thread(target=self._arp_defense_loop, daemon=True)
+        t2.start()
+        self.threads.append(t2)
+        logger.info("ARP defense started")
+        
+        # Start LAN device refresh thread (picks up new devices)
+        t3 = threading.Thread(target=self._lan_device_refresh_loop, daemon=True)
+        t3.start()
+        self.threads.append(t3)
+        logger.info("LAN device refresh started")
+        
+        logger.info(f"Single-NIC isolation active")
+        logger.info(f"  Protected: {len(self.protected_devices)} devices")
+        logger.info(f"  LAN targets: {len(self.lan_devices)} devices")
+    
+    def _lan_device_refresh_loop(self):
+        """Periodically refresh list of LAN devices from database"""
+        while self.running:
+            time.sleep(60)  # Refresh every minute
+            try:
+                old_count = len(self.lan_devices)
+                self._load_lan_devices()
+                if len(self.lan_devices) != old_count:
+                    logger.info(f"LAN devices updated: {old_count} -> {len(self.lan_devices)}")
+            except Exception as e:
+                logger.error(f"LAN refresh error: {e}")
+    
+    def _middleground_arp_spoof_loop(self):
+        """
+        Middleground ARP spoofing for ~95% protection:
+        1. Tell protected devices: gateway = Irongate (for their outbound)
+        2. Tell gateway: protected IPs = Irongate (for return traffic)
+        3. Tell ALL LAN devices: protected IPs = Irongate (blocks LAN->server)
+        
+        We NEVER touch anyone's gateway entry except protected devices.
+        """
+        if not self.gateway_mac:
+            logger.error("No gateway MAC, cannot spoof")
+            return
+        
+        logger.info(f"ARP spoof: {len(self.protected_devices)} protected, {len(self.lan_devices)} LAN targets")
+        
+        spoof_count = 0
+        while self.running:
+            try:
+                for dev_ip, dev_mac, zone in self.protected_devices:
+                    
+                    # 1. Tell protected device: "Gateway is at Irongate's MAC"
+                    #    This routes their outbound traffic through us
+                    self._send_unicast_arp(
+                        target_ip=dev_ip,
+                        target_mac=dev_mac,
+                        spoof_ip=self.gateway_ip
+                    )
+                    
+                    # 2. Tell gateway: "Protected device is at Irongate's MAC"
+                    #    This routes return traffic through us
+                    self._send_unicast_arp(
+                        target_ip=self.gateway_ip,
+                        target_mac=self.gateway_mac,
+                        spoof_ip=dev_ip
+                    )
+                    
+                    # 3. Tell ALL LAN devices: "Protected device is at Irongate's MAC"
+                    #    This prevents LAN devices from reaching protected servers directly
+                    #    We do NOT touch their gateway - their internet still works
+                    for lan_ip, lan_mac in self.lan_devices:
+                        self._send_unicast_arp(
+                            target_ip=lan_ip,
+                            target_mac=lan_mac,
+                            spoof_ip=dev_ip  # Protected device IP
+                        )
+                    
+                    spoof_count += 2 + len(self.lan_devices)
+                
+                # Log every 100 rounds
+                if spoof_count % (100 * (2 + len(self.lan_devices) + 1)) < (2 + len(self.lan_devices)):
+                    logger.debug(f"ARP spoof packets sent: {spoof_count}")
+                
+                # 1 second interval
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"ARP spoof error: {e}")
+                time.sleep(5)
+    
+    def _arp_defense_loop(self):
+        """Monitor ARP and counter protected devices announcing real MACs"""
+        try:
+            from scapy.all import Ether, ARP, sniff, sendp, conf
+            conf.verb = 0
+        except ImportError:
+            logger.warning("scapy not available for ARP defense")
+            return
+        
+        # Build lookup of protected IPs
+        protected_ips = {}
+        for dev_ip, dev_mac, zone in self.protected_devices:
+            protected_ips[dev_ip] = dev_mac
+        
+        def handle_arp(pkt):
+            if ARP not in pkt:
+                return
+            
+            try:
+                arp = pkt[ARP]
+                
+                # Handle ARP Requests for protected devices
+                if arp.op == 1:
+                    requested_ip = arp.pdst
+                    requester_mac = arp.hwsrc
+                    requester_ip = arp.psrc
+                    
+                    if requested_ip in protected_ips:
+                        if requester_mac.lower() != self.local_mac.lower() and requester_ip != requested_ip:
+                            # Respond: protected_ip is at our MAC
+                            reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
+                                op=2,
+                                pdst=requester_ip,
+                                hwdst=requester_mac,
+                                psrc=requested_ip,
+                                hwsrc=self.local_mac
+                            )
+                            sendp(reply, iface=self.interface, verbose=False)
+                            sendp(reply, iface=self.interface, verbose=False)
+                
+                # Handle ARP Replies from protected devices
+                elif arp.op == 2:
+                    sender_ip = arp.psrc
+                    sender_mac = arp.hwsrc.lower()
+                    target_mac = arp.hwdst
+                    target_ip = arp.pdst
+                    
+                    # If protected device announces its real MAC, counter it
+                    if sender_ip in protected_ips and sender_mac == protected_ips[sender_ip]:
+                        if target_mac.lower() != 'ff:ff:ff:ff:ff:ff':
+                            counter = Ether(dst=target_mac, src=self.local_mac) / ARP(
+                                op=2,
+                                pdst=target_ip,
+                                hwdst=target_mac,
+                                psrc=sender_ip,
+                                hwsrc=self.local_mac
+                            )
+                            sendp(counter, iface=self.interface, verbose=False)
+                            sendp(counter, iface=self.interface, verbose=False)
+                            
+            except Exception:
+                pass
+        
+        logger.info(f"ARP defense monitoring {len(protected_ips)} protected IPs")
+        
+        while self.running:
+            try:
+                sniff(iface=self.interface, filter="arp", prn=handle_arp,
+                      store=False, timeout=5)
+            except Exception as e:
+                if self.running:
+                    time.sleep(1)
+    
+    def _setup_firewall(self):
+        """Configure nftables for traffic control"""
+        devices = self.config.get('devices', [])
+        
+        isolated_ips = []
+        servers_ips = []
+        
+        for dev in devices:
+            ip = dev.get('ip', '')
+            zone = dev.get('zone', 'isolated')
+            if ip:
+                if zone == 'isolated':
+                    isolated_ips.append(ip)
+                elif zone == 'servers':
+                    servers_ips.append(ip)
+        
+        isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
+        servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
+        
+        rules = f"""
+table inet irongate {{
+    set isolated_devices {{
+        type ipv4_addr
+        elements = {{ {isolated_set} }}
+    }}
+    
+    set servers_devices {{
+        type ipv4_addr
+        elements = {{ {servers_set} }}
+    }}
+    
+    chain forward {{
+        type filter hook forward priority 0; policy accept;
+        
+        ct state established,related accept
+        
+        # Isolated: block all LAN access
+        ip saddr @isolated_devices ip daddr 10.0.0.0/8 drop
+        ip saddr @isolated_devices ip daddr 172.16.0.0/12 drop
+        ip saddr @isolated_devices ip daddr 192.168.0.0/16 drop
+        
+        # Servers: allow inter-server, block other LAN
+        ip saddr @servers_devices ip daddr @servers_devices accept
+        ip saddr @servers_devices ip daddr 10.0.0.0/8 drop
+        ip saddr @servers_devices ip daddr 172.16.0.0/12 drop
+        ip saddr @servers_devices ip daddr 192.168.0.0/16 drop
+    }}
+}}
+"""
+        try:
+            os.system('nft delete table inet irongate 2>/dev/null')
+            with open('/tmp/irongate.nft', 'w') as f:
+                f.write(rules)
+            result = os.system('nft -f /tmp/irongate.nft')
+            if result == 0:
+                logger.info(f"Firewall: {len(isolated_ips)} isolated, {len(servers_ips)} servers")
+            else:
+                logger.error("Failed to apply firewall rules")
+        except Exception as e:
+            logger.error(f"Firewall error: {e}")
     
     def run_dual_nic(self):
         """Run bridge isolation mode"""
@@ -3335,388 +3709,54 @@ class Irongate:
             logger.error("No isolated interface configured!")
             return False
         
-        # Check interface exists
         if not os.path.exists(f'/sys/class/net/{isolated_iface}'):
             logger.error(f"Isolated interface {isolated_iface} not found!")
             return False
         
-        # Create bridge
         logger.info(f"Creating bridge {bridge_name}")
         os.system(f'ip link set {bridge_name} down 2>/dev/null')
         os.system(f'brctl delbr {bridge_name} 2>/dev/null')
         os.system(f'brctl addbr {bridge_name}')
         os.system(f'brctl stp {bridge_name} off')
         
-        # Add isolated interface
         os.system(f'ip link set {isolated_iface} down')
         os.system(f'ip addr flush dev {isolated_iface}')
         os.system(f'brctl addif {bridge_name} {isolated_iface}')
         os.system(f'ip link set {isolated_iface} up')
         
-        # Configure bridge IP
         os.system(f'ip addr add {bridge_ip}/16 dev {bridge_name}')
         os.system(f'ip link set {bridge_name} up')
         
-        # Enable port isolation (kernel-enforced)
         result = os.system(f'bridge link set dev {isolated_iface} isolated on 2>/dev/null')
         if result == 0:
-            logger.info("Port isolation enabled (kernel-enforced)")
+            logger.info("Port isolation enabled")
         else:
-            logger.warning("Port isolation not available, using ebtables")
             os.system(f'ebtables -A FORWARD -i {isolated_iface} -o {isolated_iface} -j DROP')
         
-        # Setup NAT
         net = self.config.get('network', {})
         uplink = net.get('interface', 'eth0')
-        os.system(f'nft add table nat')
-        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }}')
-        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade')
+        os.system(f'nft add table nat 2>/dev/null')
+        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }} 2>/dev/null')
+        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade 2>/dev/null')
         
-        # Setup DHCP for bridge (using dnsmasq)
         dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
         dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
         
         dnsmasq_conf = f"""
-# Irongate Bridge DHCP
 interface={bridge_name}
 bind-interfaces
 dhcp-range={dhcp_start},{dhcp_end},24h
 dhcp-option=option:router,{bridge_ip}
 dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
-log-dhcp
 """
         with open('/etc/irongate/bridge-dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        # Start bridge DHCP
         os.system('pkill -f "dnsmasq.*bridge-dnsmasq" 2>/dev/null')
         os.system('dnsmasq --conf-file=/etc/irongate/bridge-dnsmasq.conf &')
         
-        logger.info("Dual-NIC bridge isolation active")
-        logger.info(f"  Bridge: {bridge_name} ({bridge_ip})")
-        logger.info(f"  Isolated: {isolated_iface}")
-        logger.info(f"  DHCP: {dhcp_start} - {dhcp_end}")
-        
+        logger.info(f"Dual-NIC bridge active: {bridge_name} ({bridge_ip})")
         return True
-    
-    def _arp_defense_loop(self):
-        """Continuous ARP poisoning for gateway"""
-        try:
-            from scapy.all import Ether, ARP, sendp, conf
-            conf.verb = 0
-        except ImportError:
-            logger.warning("scapy not available, ARP defense disabled")
-            return
-        
-        net = self.config.get('network', {})
-        interface = net.get('interface', 'eth0')
-        gateway_ip = net.get('gateway_ip')
-        local_mac = net.get('local_mac')
-        gateway_mac = net.get('gateway_mac')
-        
-        if not all([gateway_ip, local_mac]):
-            logger.error("Missing network config for ARP defense")
-            return
-        
-        while self.running:
-            try:
-                # Gratuitous ARP: tell everyone we are the gateway
-                pkt = Ether(dst="ff:ff:ff:ff:ff:ff", src=local_mac) / ARP(
-                    op=2, psrc=gateway_ip, hwsrc=local_mac,
-                    pdst=gateway_ip, hwdst="ff:ff:ff:ff:ff:ff"
-                )
-                sendp(pkt, iface=interface, verbose=False)
-                time.sleep(2)
-            except Exception as e:
-                logger.error(f"ARP defense error: {e}")
-                time.sleep(5)
-    
-    def _ipv6_ra_loop(self):
-        """Send IPv6 Router Advertisements"""
-        try:
-            from scapy.all import Ether, IPv6, ICMPv6ND_RA, ICMPv6NDOptPrefixInfo, sendp, conf
-            conf.verb = 0
-        except ImportError:
-            logger.warning("scapy not available, IPv6 RA disabled")
-            return
-        
-        net = self.config.get('network', {})
-        interface = net.get('interface', 'eth0')
-        local_mac = net.get('local_mac')
-        
-        error_logged = False
-        while self.running:
-            try:
-                pkt = Ether(src=local_mac, dst="33:33:00:00:00:01") / \
-                      IPv6(src="fe80::1", dst="ff02::1") / \
-                      ICMPv6ND_RA(routerlifetime=1800) / \
-                      ICMPv6NDOptPrefixInfo(prefix="fd00:iron:gate::", prefixlen=64)
-                sendp(pkt, iface=interface, verbose=False)
-                error_logged = False  # Reset on success
-                time.sleep(0.5)
-            except Exception as e:
-                if not error_logged:
-                    logger.error(f"IPv6 RA error (will retry silently): {e}")
-                    error_logged = True
-                time.sleep(5)
-    
-    def _gateway_takeover_loop(self):
-        """Bidirectional ARP poisoning - claim to BE each protected device to entire LAN"""
-        try:
-            from scapy.all import Ether, ARP, sendp, conf
-            conf.verb = 0
-        except ImportError:
-            return
-        
-        net = self.config.get('network', {})
-        interface = net.get('interface', 'eth0')
-        gateway_ip = net.get('gateway_ip')
-        gateway_mac = net.get('gateway_mac')
-        local_mac = net.get('local_mac')
-        local_ip = net.get('local_ip')
-        
-        devices = self.config.get('devices', [])
-        
-        while self.running:
-            try:
-                for dev in devices:
-                    dev_ip = dev.get('ip')
-                    zone = dev.get('zone', 'isolated')
-                    
-                    # Skip trusted devices - they don't need isolation
-                    if not dev_ip or zone == 'trusted':
-                        continue
-                    
-                    # === LAYER 2 BYPASS PREVENTION ===
-                    # Broadcast gratuitous ARP: "I am <protected_device_ip>"
-                    # This makes ALL LAN devices think protected device is at Irongate's MAC
-                    # So when they try to reach it, traffic comes to Irongate first
-                    broadcast_pkt = Ether(dst="ff:ff:ff:ff:ff:ff", src=local_mac) / ARP(
-                        op=2,  # ARP reply
-                        psrc=dev_ip,      # "I am this IP..."
-                        hwsrc=local_mac,  # "...and my MAC is Irongate's MAC"
-                        pdst=dev_ip,
-                        hwdst="ff:ff:ff:ff:ff:ff"
-                    )
-                    sendp(broadcast_pkt, iface=interface, verbose=False)
-                    
-                    # Also tell gateway specifically (for return traffic)
-                    if gateway_mac:
-                        gw_pkt = Ether(dst=gateway_mac, src=local_mac) / ARP(
-                            op=2, psrc=dev_ip, hwsrc=local_mac,
-                            pdst=gateway_ip, hwdst=gateway_mac
-                        )
-                        sendp(gw_pkt, iface=interface, verbose=False)
-                
-                # Also claim to be gateway for protected devices (existing behavior)
-                for dev in devices:
-                    dev_ip = dev.get('ip')
-                    dev_mac = dev.get('mac')
-                    if dev_ip and dev_mac and gateway_ip:
-                        # Tell device that gateway is at our MAC
-                        gw_spoof = Ether(dst=dev_mac, src=local_mac) / ARP(
-                            op=2, psrc=gateway_ip, hwsrc=local_mac,
-                            pdst=dev_ip, hwdst=dev_mac
-                        )
-                        sendp(gw_spoof, iface=interface, verbose=False)
-                
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"Gateway takeover error: {e}")
-                time.sleep(5)
-    
-    def _arp_reply_handler(self):
-        """Intercept ARP requests for protected devices and respond with our MAC"""
-        try:
-            from scapy.all import Ether, ARP, sniff, sendp, conf
-            conf.verb = 0
-        except ImportError:
-            return
-        
-        net = self.config.get('network', {})
-        interface = net.get('interface', 'eth0')
-        local_mac = net.get('local_mac')
-        local_ip = net.get('local_ip')
-        devices = self.config.get('devices', [])
-        
-        # Build set of protected IPs (non-trusted) and their real MACs
-        protected_ips = set()
-        protected_macs = {}  # ip -> mac
-        for dev in devices:
-            if dev.get('ip') and dev.get('zone', 'isolated') != 'trusted':
-                protected_ips.add(dev.get('ip'))
-                protected_macs[dev.get('ip')] = dev.get('mac', '').lower()
-        
-        logger.info(f"ARP Reply Handler protecting IPs: {protected_ips}")
-        
-        def handle_arp(pkt):
-            if ARP not in pkt:
-                return
-            
-            # Handle ARP requests - respond claiming to be the protected device
-            if pkt[ARP].op == 1:  # ARP request
-                requested_ip = pkt[ARP].pdst
-                requester_mac = pkt[ARP].hwsrc
-                requester_ip = pkt[ARP].psrc
-                
-                # If someone is asking for a protected device's MAC, respond with ours
-                if requested_ip in protected_ips and requester_ip != local_ip:
-                    # Send multiple replies to win the race against real device
-                    for _ in range(3):
-                        reply = Ether(dst=requester_mac, src=local_mac) / ARP(
-                            op=2,  # Reply
-                            psrc=requested_ip,    # "The IP you asked about..."
-                            hwsrc=local_mac,      # "...is at my MAC"
-                            pdst=requester_ip,
-                            hwdst=requester_mac
-                        )
-                        sendp(reply, iface=interface, verbose=False)
-                    logger.debug(f"ARP intercept: {requester_ip} asked for {requested_ip}")
-            
-            # Handle ARP replies from protected devices - re-poison immediately
-            elif pkt[ARP].op == 2:  # ARP reply
-                sender_ip = pkt[ARP].psrc
-                sender_mac = pkt[ARP].hwsrc.lower()
-                target_ip = pkt[ARP].pdst
-                
-                # If a protected device is announcing itself, immediately re-poison
-                if sender_ip in protected_ips and sender_mac == protected_macs.get(sender_ip):
-                    # The real device just announced itself - counter it
-                    counter = Ether(dst="ff:ff:ff:ff:ff:ff", src=local_mac) / ARP(
-                        op=2,
-                        psrc=sender_ip,
-                        hwsrc=local_mac,  # Claim WE are that IP
-                        pdst=sender_ip,
-                        hwdst="ff:ff:ff:ff:ff:ff"
-                    )
-                    for _ in range(2):
-                        sendp(counter, iface=interface, verbose=False)
-                    logger.debug(f"ARP counter-poison for {sender_ip}")
-        
-        while self.running:
-            try:
-                sniff(iface=interface, filter="arp", prn=handle_arp, 
-                      store=False, timeout=5)
-            except Exception as e:
-                logger.error(f"ARP reply handler error: {e}")
-                time.sleep(5)
-    
-    def _setup_firewall(self):
-        """Configure nftables firewall with zone-based rules"""
-        net = self.config.get('network', {})
-        interface = net.get('interface', 'eth0')
-        gateway_ip = net.get('gateway_ip', '')
-        local_ip = net.get('local_ip', '')
-        devices = self.config.get('devices', [])
-        
-        logger.info(f"Setting up firewall with {len(devices)} devices")
-        
-        # Group devices by zone
-        isolated_ips = []
-        servers_ips = []
-        trusted_ips = []
-        
-        for dev in devices:
-            ip = dev.get('ip', '')
-            zone = dev.get('zone', 'isolated')
-            if ip:
-                logger.info(f"  Firewall: {ip} -> {zone}")
-                if zone == 'isolated':
-                    isolated_ips.append(ip)
-                elif zone == 'servers':
-                    servers_ips.append(ip)
-                elif zone == 'trusted':
-                    trusted_ips.append(ip)
-        
-        logger.info(f"  Isolated IPs: {isolated_ips}")
-        logger.info(f"  Server IPs: {servers_ips}")
-        
-        # Build IP sets
-        isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
-        servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
-        
-        # RFC1918 private ranges (LAN)
-        lan_ranges = '10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16'
-        
-        rules = f"""
-# Irongate Zone-Based Firewall
-# Generated by Irongate Engine
-
-table inet irongate {{
-    # IP Sets for zones
-    set isolated_devices {{
-        type ipv4_addr
-        flags interval
-        elements = {{ {isolated_set} }}
-    }}
-    
-    set servers_devices {{
-        type ipv4_addr
-        flags interval
-        elements = {{ {servers_set} }}
-    }}
-    
-    set lan_ranges {{
-        type ipv4_addr
-        flags interval
-        elements = {{ {lan_ranges} }}
-    }}
-    
-    chain input {{
-        type filter hook input priority 0; policy accept;
-    }}
-    
-    chain forward {{
-        type filter hook forward priority 0; policy accept;
-        
-        # Allow established connections
-        ct state established,related accept
-        
-        # =====================================================
-        # ISOLATED zone: Internet only, no LAN, no other devices
-        # =====================================================
-        ip saddr @isolated_devices ip daddr @lan_ranges counter drop
-        ip saddr @isolated_devices ip daddr @isolated_devices counter drop
-        ip saddr @isolated_devices ip daddr @servers_devices counter drop
-        ip daddr @isolated_devices ip saddr @lan_ranges counter drop
-        ip daddr @isolated_devices ip saddr @servers_devices counter drop
-        ip daddr @isolated_devices ip saddr @isolated_devices counter drop
-        
-        # =====================================================
-        # SERVERS zone: Inter-server OK, no LAN access
-        # =====================================================
-        ip saddr @servers_devices ip daddr @lan_ranges counter drop
-        ip saddr @servers_devices ip daddr @isolated_devices counter drop
-        ip daddr @servers_devices ip saddr @lan_ranges counter drop
-        ip daddr @servers_devices ip saddr @isolated_devices counter drop
-        
-        # Everything else is allowed (trusted devices, internet traffic, etc)
-    }}
-    
-    chain output {{
-        type filter hook output priority 0; policy accept;
-    }}
-    
-    chain postrouting {{
-        type nat hook postrouting priority 100; policy accept;
-        oifname "{interface}" masquerade
-    }}
-}}
-"""
-        try:
-            # Flush existing irongate table
-            os.system('nft delete table inet irongate 2>/dev/null')
-            
-            with open('/tmp/irongate.nft', 'w') as f:
-                f.write(rules)
-            
-            result = os.system('nft -f /tmp/irongate.nft 2>/dev/null')
-            if result == 0:
-                logger.info(f"Firewall configured: {len(isolated_ips)} isolated, {len(servers_ips)} servers, {len(trusted_ips)} trusted")
-            else:
-                logger.error("Failed to apply nftables rules")
-        except Exception as e:
-            logger.error(f"Firewall setup error: {e}")
     
     def run(self):
         """Main run loop"""
@@ -3737,18 +3777,16 @@ table inet irongate {{
         
         logger.info("Irongate running")
         
-        # Keep alive
         while self.running:
             time.sleep(1)
         
         return True
     
     def stop(self):
-        """Stop all services and clean up firewall rules"""
+        """Stop and restore ARP tables"""
         self.running = False
-        # Remove firewall rules so they don't persist after stop
+        self._restore_arp_tables()
         os.system('nft delete table inet irongate 2>/dev/null')
-        logger.info("Firewall rules removed")
         logger.info("Irongate stopped")
 
 
