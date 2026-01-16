@@ -3240,6 +3240,10 @@ class Irongate:
             with open(self.config_path) as f:
                 self.config = yaml.safe_load(f)
             logger.info(f"Loaded config from {self.config_path}")
+            devices = self.config.get('devices', [])
+            logger.info(f"Found {len(devices)} devices in config")
+            for dev in devices:
+                logger.info(f"  Device: {dev.get('ip')} ({dev.get('mac')}) zone={dev.get('zone')}")
             return True
         except Exception as e:
             logger.error(f"Failed to load config: {e}")
@@ -3605,6 +3609,8 @@ log-dhcp
         local_ip = net.get('local_ip', '')
         devices = self.config.get('devices', [])
         
+        logger.info(f"Setting up firewall with {len(devices)} devices")
+        
         # Group devices by zone
         isolated_ips = []
         servers_ips = []
@@ -3614,12 +3620,16 @@ log-dhcp
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
+                logger.info(f"  Firewall: {ip} -> {zone}")
                 if zone == 'isolated':
                     isolated_ips.append(ip)
                 elif zone == 'servers':
                     servers_ips.append(ip)
                 elif zone == 'trusted':
                     trusted_ips.append(ip)
+        
+        logger.info(f"  Isolated IPs: {isolated_ips}")
+        logger.info(f"  Server IPs: {servers_ips}")
         
         # Build IP sets
         isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
