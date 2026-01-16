@@ -3369,19 +3369,14 @@ class Irongate:
         logger.info("Restoring ARP tables...")
         
         for dev_ip, dev_mac, zone in self.protected_devices:
-            if self.gateway_mac:
-                pkt = Ether(dst=self.gateway_mac, src=dev_mac) / ARP(
-                    op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac,
-                    psrc=dev_ip, hwsrc=dev_mac
-                )
-                sendp(pkt, iface=self.interface, verbose=False, count=5)
-            
+            # Restore protected device's view of gateway
             pkt = Ether(dst=dev_mac, src=self.gateway_mac) / ARP(
                 op=2, pdst=dev_ip, hwdst=dev_mac,
                 psrc=self.gateway_ip, hwsrc=self.gateway_mac
             )
             sendp(pkt, iface=self.interface, verbose=False, count=5)
             
+            # Restore all LAN devices' view of protected device
             for lan_ip, lan_mac in self.lan_devices:
                 pkt = Ether(dst=lan_mac, src=dev_mac) / ARP(
                     op=2, pdst=lan_ip, hwdst=lan_mac,
@@ -3484,32 +3479,33 @@ class Irongate:
     def _middleground_arp_spoof_loop(self):
         """
         Middleground ARP spoofing for ~95% protection.
-        We NEVER touch anyone's gateway entry except protected devices.
+        - Tell protected devices: gateway is Irongate (route outbound through us)
+        - Tell LAN devices: protected IPs are at Irongate (intercept LAN→protected)
+        - DON'T spoof gateway/Firewalla - let it see real device MACs for proper routing
         """
         if not self.gateway_mac:
             logger.error("No gateway MAC, cannot spoof")
             return
         
         logger.info(f"ARP spoof: {len(self.protected_devices)} protected, {len(self.lan_devices)} LAN targets")
+        logger.info("NOTE: Not spoofing gateway - Firewalla will see real device MACs")
         
         while self.running:
             try:
                 for dev_ip, dev_mac, zone in self.protected_devices:
                     # Tell protected device: "Gateway is at Irongate's MAC"
+                    # This routes their outbound traffic through Irongate
                     self._send_unicast_arp(
                         target_ip=dev_ip,
                         target_mac=dev_mac,
                         spoof_ip=self.gateway_ip
                     )
                     
-                    # Tell gateway: "Protected device is at Irongate's MAC"
-                    self._send_unicast_arp(
-                        target_ip=self.gateway_ip,
-                        target_mac=self.gateway_mac,
-                        spoof_ip=dev_ip
-                    )
+                    # DO NOT tell gateway about protected devices
+                    # Firewalla needs to see real MACs to route traffic properly
                     
                     # Tell ALL LAN devices: "Protected device is at Irongate's MAC"
+                    # This intercepts any LAN device trying to reach protected servers
                     for lan_ip, lan_mac in self.lan_devices:
                         self._send_unicast_arp(
                             target_ip=lan_ip,
@@ -3623,7 +3619,8 @@ table inet irongate {{
         
         ct state established,related accept
         
-        # Isolated: block LAN access
+        # === OUTBOUND: Protected devices cannot reach LAN ===
+        # Isolated: block all LAN access
         ip saddr @isolated_devices ip daddr 10.0.0.0/8 drop
         ip saddr @isolated_devices ip daddr 172.16.0.0/12 drop
         ip saddr @isolated_devices ip daddr 192.168.0.0/16 drop
@@ -3633,6 +3630,18 @@ table inet irongate {{
         ip saddr @servers_devices ip daddr 10.0.0.0/8 drop
         ip saddr @servers_devices ip daddr 172.16.0.0/12 drop
         ip saddr @servers_devices ip daddr 192.168.0.0/16 drop
+        
+        # === INBOUND: LAN cannot reach protected devices ===
+        # Block LAN trying to reach isolated devices (RDP, SSH, etc)
+        ip daddr @isolated_devices ip saddr 10.0.0.0/8 drop
+        ip daddr @isolated_devices ip saddr 172.16.0.0/12 drop
+        ip daddr @isolated_devices ip saddr 192.168.0.0/16 drop
+        
+        # Block LAN trying to reach servers (except from other servers)
+        ip daddr @servers_devices ip saddr @servers_devices accept
+        ip daddr @servers_devices ip saddr 10.0.0.0/8 drop
+        ip daddr @servers_devices ip saddr 172.16.0.0/12 drop
+        ip daddr @servers_devices ip saddr 192.168.0.0/16 drop
     }}
 }}
 """
