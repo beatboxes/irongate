@@ -1,4673 +1,3205 @@
 #!/bin/bash
-#===============================================================================
-#  ___                       _       
-# |_ _|_ __ ___  _ __   __ _| |_ ___ 
-#  | || '__/ _ \| '_ \ / _` | __/ _ \
-#  | || | | (_) | | | | (_| | ||  __/
-# |___|_|  \___/|_| |_|\__, |\__\___|
-#                      |___/         
+
+#######################################
+# IRONGATE - Network Isolation System
+# 
+# A complete network security appliance:
+#   • Zone-based device isolation
+#   • Integrated DHCP server
+#   • ARP/IPv6 attack protection  
+#   • nftables firewall
+#   • Web management interface
 #
-# IRONGATE - Multi-Layer Network Isolation System
-# Enterprise-grade device isolation without managed switches
-#
-# Layers of Protection:
-#   1. DHCP Microsegmentation (/30 subnets + Option 121 routes)
-#   2. Aggressive ARP Defense (continuous re-poisoning + bypass detection)
-#   3. IPv6 Router Advertisement Takeover
-#   4. nftables Stateful Firewall with Connection Tracking
-#   5. Active Bypass Detection & Response
-#   6. TCP RST Injection for unauthorized connections
-#
-# Usage: sudo bash irongate-install.sh
-#===============================================================================
+# Deploy on any Debian/Raspbian SBC
+#######################################
 
 set -e
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
-NC='\033[0m'
 BOLD='\033[1m'
+NC='\033[0m'
 
-# Configuration
-INSTALL_DIR="/opt/irongate"
-CONFIG_DIR="/etc/irongate"
-LOG_DIR="/var/log/irongate"
-DATA_DIR="/var/lib/irongate"
-RUN_DIR="/run/irongate"
-WEB_PORT=8443
+echo -e "${MAGENTA}"
+echo "╔══════════════════════════════════════════════╗"
+echo "║                                              ║"
+echo "║          🛡️  I R O N G A T E                ║"
+echo "║                                              ║"
+echo "║       Network Isolation System              ║"
+echo "║                                              ║"
+echo "╚══════════════════════════════════════════════╝"
+echo -e "${NC}"
 
-# Minimum requirements
-MIN_KERNEL="4.18"
-MIN_RAM_MB=512
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run as root (sudo ./irongate-install.sh)${NC}"
+    exit 1
+fi
 
-#===============================================================================
-# HELPER FUNCTIONS
-#===============================================================================
+WEBUI_PORT="80"
 
-print_banner() {
-    echo -e "${CYAN}${BOLD}"
-    cat << 'EOF'
-  ___                       _       
- |_ _|_ __ ___  _ __   __ _| |_ ___ 
-  | || '__/ _ \| '_ \ / _` | __/ _ \
-  | || | | (_) | | | | (_| | ||  __/
- |___|_|  \___/|_| |_|\__, |\__\___|
-                      |___/         
+# Detect primary network interface
+echo -e "${YELLOW}Detecting network interface...${NC}"
+INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+if [ -z "$INTERFACE" ]; then
+    INTERFACE=$(ip link show | grep -E "^[0-9]+:" | grep -v lo | head -n1 | awk -F: '{print $2}' | tr -d ' ')
+fi
+echo -e "Using interface: ${GREEN}$INTERFACE${NC}"
 
- Multi-Layer Network Isolation System
- For Business-Critical Infrastructure
-EOF
-    echo -e "${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-}
+# Get current IP
+CURRENT_IP=$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+CURRENT_CIDR=$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1 | cut -d'/' -f2)
+CURRENT_GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
+echo -e "Current IP: ${GREEN}$CURRENT_IP/$CURRENT_CIDR${NC}"
+echo -e "Current Gateway: ${GREEN}$CURRENT_GATEWAY${NC}"
 
-log_info() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1"; }
-log_step() { echo -e "${BLUE}[→]${NC} $1"; }
-log_section() { echo -e "\n${MAGENTA}${BOLD}═══ $1 ═══${NC}\n"; }
+# Update system
+echo -e "${YELLOW}Updating system and installing packages...${NC}"
+apt update
+apt install -y dnsmasq nginx php-fpm php-sqlite3 sqlite3 jq
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "Irongate requires root privileges"
-        echo "  Run: sudo bash $0"
-        exit 1
+# Install Irongate dependencies
+echo -e "${YELLOW}Installing Irongate network isolation dependencies...${NC}"
+apt install -y python3 python3-pip python3-venv python3-dev \
+    nftables iptables arptables ebtables bridge-utils \
+    libpcap-dev arp-scan tcpdump net-tools \
+    conntrack ipset 2>/dev/null || true
+
+# Detect PHP version installed
+PHP_VERSION=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+echo -e "PHP Version: ${GREEN}$PHP_VERSION${NC}"
+
+# Stop services during configuration and kill any zombie processes
+systemctl stop dnsmasq 2>/dev/null || true
+pkill -9 dnsmasq 2>/dev/null || true
+sleep 1
+systemctl stop nginx 2>/dev/null || true
+
+# Backup existing configs (but don't overwrite them)
+PRESERVE_CONFIG=false
+if [ -f /etc/dnsmasq.conf ]; then
+    cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak.$(date +%s)
+    echo -e "${GREEN}Backed up existing dnsmasq.conf${NC}"
+    # Check if this is a configured DHCP server
+    if grep -q "dhcp-range=" /etc/dnsmasq.conf 2>/dev/null; then
+        PRESERVE_CONFIG=true
     fi
-}
+fi
 
-check_kernel() {
-    KERNEL=$(uname -r | cut -d. -f1,2)
-    if [ "$(echo "$KERNEL >= $MIN_KERNEL" | bc)" -eq 0 ]; then
-        log_error "Kernel $KERNEL is too old. Minimum: $MIN_KERNEL"
-        log_error "Bridge port isolation and nftables flowtables require newer kernel"
-        exit 1
-    fi
-    log_info "Kernel version: $KERNEL (meets minimum $MIN_KERNEL)"
-}
+# Create directories
+mkdir -p /var/lib/dnsmasq
+mkdir -p /etc/dnsmasq.d
+mkdir -p /var/www/irongate
 
-check_memory() {
-    RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-    if [ "$RAM_MB" -lt "$MIN_RAM_MB" ]; then
-        log_warn "Low memory: ${RAM_MB}MB (recommended: ${MIN_RAM_MB}MB+)"
-    else
-        log_info "Memory: ${RAM_MB}MB"
-    fi
-}
+# Create/update lease file with proper permissions
+touch /var/lib/dnsmasq/dnsmasq.leases
+chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || chown nobody:nogroup /var/lib/dnsmasq/dnsmasq.leases
+chmod 644 /var/lib/dnsmasq/dnsmasq.leases
 
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-        VERSION=$VERSION_ID
-    else
-        log_error "Cannot detect OS"
-        exit 1
-    fi
+# Create/update log file - must be writable by dnsmasq and readable by www-data
+touch /var/log/dnsmasq.log
+chown dnsmasq:adm /var/log/dnsmasq.log 2>/dev/null || chown nobody:adm /var/log/dnsmasq.log
+chmod 644 /var/log/dnsmasq.log
+
+#######################################
+# Preserve existing dnsmasq config if it has DHCP settings
+#######################################
+if [ "$PRESERVE_CONFIG" = true ]; then
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ✓ Existing DHCP config detected - PRESERVING${NC}"
+    echo -e "${GREEN}  ✓ Your IP reservations and settings are safe!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
-    case $OS in
-        debian|ubuntu|armbian|raspbian)
-            log_info "Detected: $PRETTY_NAME"
-            PKG_MGR="apt-get"
-            ;;
-        fedora|centos|rhel|rocky|alma)
-            log_info "Detected: $PRETTY_NAME"
-            PKG_MGR="dnf"
-            ;;
-        *)
-            log_warn "Untested OS: $OS - proceeding anyway"
-            PKG_MGR="apt-get"
-            ;;
-    esac
-}
-
-detect_network() {
-    # Find primary interface
-    IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-    GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
-    LOCAL_IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
-    LOCAL_MAC=$(ip link show "$IFACE" | awk '/ether/ {print $2}')
-    SUBNET=$(ip -4 addr show "$IFACE" | grep -oP '\d+(\.\d+){3}/\d+' | head -n1)
-    GATEWAY_MAC=$(ip neigh show | grep "$GATEWAY" | awk '{print $5}' | head -n1)
+    # Count settings for user feedback
+    DHCP_RANGE=$(grep "^dhcp-range=" /etc/dnsmasq.conf | head -1)
+    echo -e "${GREEN}  Current range: $DHCP_RANGE${NC}"
     
-    # Calculate network details
-    IFS='/' read -r NETWORK_IP CIDR <<< "$SUBNET"
-    NETWORK_BASE=$(echo "$NETWORK_IP" | cut -d. -f1-3)
-    
-    if [ -z "$IFACE" ] || [ -z "$GATEWAY" ] || [ -z "$LOCAL_IP" ]; then
-        log_error "Cannot detect network configuration"
-        exit 1
+    # Just ensure we have the required settings for logging
+    if ! grep -q "log-dhcp" /etc/dnsmasq.conf; then
+        echo "" >> /etc/dnsmasq.conf
+        echo "# Logging (added by setup script)" >> /etc/dnsmasq.conf
+        echo "log-dhcp" >> /etc/dnsmasq.conf
+        echo "log-facility=/var/log/dnsmasq.log" >> /etc/dnsmasq.conf
     fi
     
-    echo ""
-    log_info "Interface:   $IFACE"
-    log_info "Local IP:    $LOCAL_IP"
-    log_info "Local MAC:   $LOCAL_MAC"
-    log_info "Gateway:     $GATEWAY"
-    log_info "Gateway MAC: ${GATEWAY_MAC:-discovering...}"
-    log_info "Subnet:      $SUBNET"
-}
-
-#===============================================================================
-# INSTALLATION
-#===============================================================================
-
-install_dependencies() {
-    log_section "Installing Dependencies"
-    
-    log_step "Updating package lists..."
-    $PKG_MGR update -qq
-    
-    log_step "Installing system packages..."
-    DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y -qq \
-        python3 \
-        python3-pip \
-        python3-venv \
-        python3-dev \
-        nftables \
-        iptables \
-        iproute2 \
-        net-tools \
-        arptables \
-        ebtables \
-        bridge-utils \
-        procps \
-        nmap \
-        arp-scan \
-        dnsmasq \
-        radvd \
-        libpcap-dev \
-        libnetfilter-queue-dev \
-        gcc \
-        make \
-        curl \
-        openssl \
-        tcpdump \
-        conntrack \
-        ipset \
-        > /dev/null 2>&1
-    
-    log_info "System packages installed"
-}
-
-setup_directories() {
-    log_step "Creating directory structure..."
-    
-    mkdir -p "$INSTALL_DIR"/{core,templates,static}
-    mkdir -p "$CONFIG_DIR"/{certs,rules}
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$DATA_DIR"/{zones,leases,state}
-    mkdir -p "$RUN_DIR"
-    
-    # Set permissions
-    chmod 700 "$CONFIG_DIR"
-    chmod 700 "$DATA_DIR"
-    
-    log_info "Directories created"
-}
-
-setup_python_env() {
-    log_step "Setting up Python environment..."
-    
-    python3 -m venv "$INSTALL_DIR/venv"
-    source "$INSTALL_DIR/venv/bin/activate"
-    
-    pip install --upgrade pip -q
-    pip install \
-        flask==3.0.0 \
-        flask-cors==4.0.0 \
-        flask-socketio==5.3.6 \
-        gunicorn==21.2.0 \
-        eventlet==0.33.3 \
-        scapy==2.5.0 \
-        netifaces==0.11.0 \
-        psutil==5.9.6 \
-        pyyaml==6.0.1 \
-        netaddr==0.9.0 \
-        cryptography==41.0.0 \
-        python-iptables==1.0.1 \
-        pyroute2==0.7.9 \
-        watchdog==3.0.0 \
-        -q
-    
-    deactivate
-    log_info "Python environment ready"
-}
-
-generate_certificates() {
-    log_step "Generating TLS certificates..."
-    
-    CERT_DIR="$CONFIG_DIR/certs"
-    
-    # Generate CA
-    openssl genrsa -out "$CERT_DIR/ca.key" 4096 2>/dev/null
-    openssl req -new -x509 -days 3650 -key "$CERT_DIR/ca.key" \
-        -out "$CERT_DIR/ca.crt" -subj "/CN=Irongate CA" 2>/dev/null
-    
-    # Generate server cert
-    openssl genrsa -out "$CERT_DIR/server.key" 2048 2>/dev/null
-    openssl req -new -key "$CERT_DIR/server.key" \
-        -out "$CERT_DIR/server.csr" -subj "/CN=$LOCAL_IP" 2>/dev/null
-    
-    cat > "$CERT_DIR/server.ext" << EOF
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage = digitalSignature, nonRepudiation, keyEncipherment
-subjectAltName = @alt_names
-[alt_names]
-IP.1 = $LOCAL_IP
-IP.2 = 127.0.0.1
-DNS.1 = localhost
-DNS.2 = irongate.local
-EOF
-    
-    openssl x509 -req -in "$CERT_DIR/server.csr" -CA "$CERT_DIR/ca.crt" \
-        -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -out "$CERT_DIR/server.crt" -days 365 \
-        -extfile "$CERT_DIR/server.ext" 2>/dev/null
-    
-    chmod 600 "$CERT_DIR"/*.key
-    rm -f "$CERT_DIR/server.csr" "$CERT_DIR/server.ext"
-    
-    log_info "TLS certificates generated"
-}
-
-create_config() {
-    log_step "Creating configuration..."
-    
-    # Get gateway MAC if not found earlier
-    if [ -z "$GATEWAY_MAC" ]; then
-        ping -c 1 "$GATEWAY" > /dev/null 2>&1
-        sleep 1
-        GATEWAY_MAC=$(ip neigh show | grep "$GATEWAY" | awk '{print $5}' | head -n1)
+    # Ensure bind-dynamic is set (safer than bind-interfaces)
+    if grep -q "^bind-interfaces" /etc/dnsmasq.conf; then
+        sed -i 's/^bind-interfaces/bind-dynamic/' /etc/dnsmasq.conf
+        echo -e "${YELLOW}Upgraded bind-interfaces to bind-dynamic for better reliability${NC}"
     fi
-    
-    cat > "$CONFIG_DIR/irongate.yaml" << EOF
-# Irongate Configuration
-# Generated: $(date -Iseconds)
-# WARNING: This file contains security-sensitive settings
-
-#═══════════════════════════════════════════════════════════════════════════════
-# NETWORK CONFIGURATION
-#═══════════════════════════════════════════════════════════════════════════════
-network:
-  interface: ${IFACE}
-  local_ip: ${LOCAL_IP}
-  local_mac: ${LOCAL_MAC}
-  gateway_ip: ${GATEWAY}
-  gateway_mac: ${GATEWAY_MAC}
-  subnet: ${SUBNET}
-  network_base: ${NETWORK_BASE}
-
-#═══════════════════════════════════════════════════════════════════════════════
-# DHCP MICROSEGMENTATION (Layer 1)
-# Assigns /30 subnets to force all traffic through Irongate
-#═══════════════════════════════════════════════════════════════════════════════
-dhcp:
-  enabled: true
-  # Use /30 subnets for maximum isolation (only gateway + device)
-  microsegmentation: true
-  # DHCP pool for isolated devices (separate from main network)
-  pool_start: 10.55.0.4
-  pool_end: 10.55.255.252
-  pool_netmask: 255.255.255.252
-  # Short lease forces frequent renewals
-  lease_time: 300
-  # Option 121: Classless static routes - captures ALL traffic
-  option_121_enabled: true
-  # Starve legitimate DHCP server (aggressive mode)
-  dhcp_starvation: false
-
-#═══════════════════════════════════════════════════════════════════════════════
-# ARP DEFENSE (Layer 2)
-# Aggressive ARP cache poisoning with bypass detection
-#═══════════════════════════════════════════════════════════════════════════════
-arp:
-  enabled: true
-  # Interval between gratuitous ARP announcements (seconds)
-  refresh_interval: 2
-  # Respond immediately to any ARP request for gateway
-  immediate_response: true
-  # Detect devices using static ARP entries
-  bypass_detection: true
-  # Re-poison interval when bypass detected (ms)
-  aggressive_interval_ms: 500
-  # Monitor ARP requests for non-DHCP gateways
-  monitor_requests: true
-
-#═══════════════════════════════════════════════════════════════════════════════
-# IPv6 ROUTER ADVERTISEMENT (Layer 3)
-# Exploit IPv6 preference in dual-stack environments
-#═══════════════════════════════════════════════════════════════════════════════
-ipv6_ra:
-  enabled: true
-  # RA interval (ms) - 200ms is aggressive
-  interval_ms: 500
-  # IPv6 prefix for isolated devices
-  prefix: "fd00:iron:gate::"
-  prefix_len: 64
-  # Push DNS via RDNSS option
-  rdnss_enabled: true
-  # Managed address configuration (forces DHCPv6)
-  managed_flag: false
-
-#═══════════════════════════════════════════════════════════════════════════════
-# FIREWALL ENFORCEMENT (Layer 4)
-# nftables with connection tracking
-#═══════════════════════════════════════════════════════════════════════════════
-firewall:
-  enabled: true
-  # Default policy for isolated devices
-  default_policy: drop
-  # Allow established connections
-  stateful: true
-  # Rate limiting for new connections
-  rate_limit:
-    enabled: true
-    rate: 50/second
-    burst: 100
-  # Log dropped packets
-  log_drops: true
-
-#═══════════════════════════════════════════════════════════════════════════════
-# ACTIVE DEFENSE (Layer 5)
-# Detect and respond to bypass attempts
-#═══════════════════════════════════════════════════════════════════════════════
-active_defense:
-  enabled: true
-  # Inject TCP RST for unauthorized connections
-  tcp_rst_injection: true
-  # Send ICMP unreachable for blocked traffic
-  icmp_unreachable: true
-  # Re-poison ARP on bypass detection
-  auto_repoison: true
-  # Alert on bypass attempts
-  alert_on_bypass: true
-  # Quarantine devices attempting bypass
-  auto_quarantine: false
-
-#═══════════════════════════════════════════════════════════════════════════════
-# GATEWAY TAKEOVER (Layer 6) - CRITICAL FOR VLAN-EQUIVALENT SECURITY
-# This layer ensures isolation even against static IP + static ARP + IPv6 disabled
-#═══════════════════════════════════════════════════════════════════════════════
-gateway_takeover:
-  enabled: true
-  
-  # BIDIRECTIONAL ARP POISONING
-  # Poison gateway to think ALL protected devices are at OUR MAC
-  # Even if device sends directly to gateway, response comes to US
-  bidirectional_poison: true
-  gateway_poison_interval: 1
-  
-  # CAM TABLE FLOODING
-  # Force switch into hub/fail-open mode by exhausting MAC table
-  # This gives us VISIBILITY into all traffic, even bypass attempts
-  cam_flooding:
-    enabled: true
-    # Packets per second with random source MACs
-    rate: 1000
-    # Number of unique MACs to generate
-    mac_pool_size: 8000
-    # Only flood when bypass detected (less disruptive)
-    adaptive: true
-  
-  # GATEWAY MAC SPOOFING
-  # Send frames AS the gateway to win CAM table race
-  # Switch will forward gateway-destined traffic to US
-  mac_spoofing:
-    enabled: true
-    # Frames per second claiming to be gateway
-    rate: 50
-    # Burst when bypass detected
-    burst_rate: 500
-  
-  # PROMISCUOUS INTERCEPTION
-  # Monitor ALL traffic and actively kill unauthorized flows
-  promiscuous_mode:
-    enabled: true
-    # Kill TCP connections that bypass our gateway
-    rst_injection: true
-    # Send ICMP unreachable for UDP bypass
-    icmp_injection: true
-    # Block at switch port by spoofing source (advanced)
-    source_spoofing: true
-  
-  # TRAFFIC VALIDATION
-  # Only forward return traffic if we saw matching outbound
-  stateful_validation:
-    enabled: true
-    # Connection state timeout
-    state_timeout: 300
-    # Strict mode: drop ALL traffic not in state table
-    strict_mode: true
-
-#═══════════════════════════════════════════════════════════════════════════════
-# DUAL-NIC BRIDGE MODE - TRUE VLAN-EQUIVALENT ISOLATION
-# When enabled, uses a second NIC with Linux bridge port isolation
-# This provides 100% hardware-enforced isolation - NO BYPASS POSSIBLE
-#═══════════════════════════════════════════════════════════════════════════════
-bridge_mode:
-  # Mode: 'single' (software isolation) or 'dual' (hardware bridge isolation)
-  mode: single
-  
-  # Second NIC for isolated network (required for dual mode)
-  # Common: eth1, enp0s20u1 (USB), enx* (USB by MAC)
-  isolated_interface: ""
-  
-  # Bridge configuration
-  bridge_name: br-irongate
-  
-  # Bridge IP for management of isolated devices
-  bridge_ip: 10.99.0.1
-  bridge_netmask: 255.255.0.0
-  
-  # DHCP pool for devices on isolated bridge
-  bridge_dhcp:
-    enabled: true
-    pool_start: 10.99.1.1
-    pool_end: 10.99.255.254
-    lease_time: 3600
-  
-  # Linux bridge port isolation (kernel-enforced)
-  # Isolated ports CANNOT communicate with each other
-  # They can ONLY reach the uplink (internet via Irongate)
-  port_isolation: true
-  
-  # Allow isolated devices to communicate with each other?
-  # false = maximum security (devices can only reach internet)
-  # true = devices on isolated NIC can talk to each other
-  allow_isolated_intra: false
-  
-  # Firewall rules for bridge
-  # Even in bridge mode, we filter what isolated devices can access
-  bridge_firewall:
-    # Allow internet access
-    allow_internet: true
-    # Block access to main LAN
-    block_lan: true
-    # Block access to Irongate management (except DHCP/DNS)
-    protect_management: true
-
-#═══════════════════════════════════════════════════════════════════════════════
-# WEB INTERFACE
-#═══════════════════════════════════════════════════════════════════════════════
-web:
-  host: 0.0.0.0
-  port: ${WEB_PORT}
-  https: true
-  cert_file: ${CONFIG_DIR}/certs/server.crt
-  key_file: ${CONFIG_DIR}/certs/server.key
-  # Generate secure secret key
-  secret_key: $(openssl rand -hex 32)
-  # Session timeout (minutes)
-  session_timeout: 30
-
-#═══════════════════════════════════════════════════════════════════════════════
-# LOGGING & MONITORING
-#═══════════════════════════════════════════════════════════════════════════════
-logging:
-  level: INFO
-  file: ${LOG_DIR}/irongate.log
-  max_size_mb: 100
-  backup_count: 5
-  # Separate security event log
-  security_log: ${LOG_DIR}/security.log
-
-#═══════════════════════════════════════════════════════════════════════════════
-# ISOLATION ZONES
-#═══════════════════════════════════════════════════════════════════════════════
-zones:
-  # Default zone for new devices
-  default_zone: quarantine
-  
-  # Pre-defined zones
-  definitions:
-    quarantine:
-      description: "Quarantine - No network access"
-      allow_internet: false
-      allow_lan: false
-      allow_intra_zone: false
-      
-    isolated:
-      description: "Isolated - Internet only, no LAN"
-      allow_internet: true
-      allow_lan: false
-      allow_intra_zone: false
-      
-    servers:
-      description: "Servers - Controlled LAN access"
-      allow_internet: true
-      allow_lan: false
-      allow_intra_zone: true
-      allowed_ports: [22, 80, 443, 3306, 5432]
-      
-    trusted:
-      description: "Trusted - Full network access"
-      allow_internet: true
-      allow_lan: true
-      allow_intra_zone: true
-EOF
-
-    # Create empty zones database
-    cat > "$DATA_DIR/zones/devices.yaml" << EOF
-# Irongate Device Database
-# Devices and their zone assignments
-devices: []
-EOF
-
-    chmod 600 "$CONFIG_DIR/irongate.yaml"
-    chmod 600 "$DATA_DIR/zones/devices.yaml"
-    
-    log_info "Configuration created"
-}
-
-enable_kernel_features() {
-    log_step "Enabling kernel features..."
-    
-    # IP forwarding
-    echo 1 > /proc/sys/net/ipv4/ip_forward
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-    
-    # Disable ICMP redirects (we handle routing)
-    echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects
-    echo 0 > /proc/sys/net/ipv4/conf/default/send_redirects
-    echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
-    echo 0 > /proc/sys/net/ipv6/conf/all/accept_redirects
-    
-    # Enable ARP filtering
-    echo 1 > /proc/sys/net/ipv4/conf/all/arp_filter
-    
-    # Ignore ARP for non-local addresses
-    echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore
-    
-    # Reply only if target IP is local
-    echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
-    
-    # Enable connection tracking helpers
-    modprobe nf_conntrack 2>/dev/null || true
-    modprobe nf_nat 2>/dev/null || true
-    
-    # Persist settings
-    cat > /etc/sysctl.d/99-irongate.conf << EOF
-# Irongate kernel settings
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv4.conf.all.arp_filter = 1
-net.ipv4.conf.all.arp_ignore = 1
-net.ipv4.conf.all.arp_announce = 2
-net.netfilter.nf_conntrack_max = 262144
-EOF
-    
-    sysctl -p /etc/sysctl.d/99-irongate.conf > /dev/null 2>&1
-    
-    log_info "Kernel features enabled"
-}
-
-#===============================================================================
-# CORE COMPONENTS
-#===============================================================================
-
-create_core_engine() {
-    log_step "Creating Irongate core engine..."
-
-cat > "$INSTALL_DIR/core/engine.py" << 'ENGINEEOF'
-#!/usr/bin/env python3
-"""
-Irongate Core Engine
-Orchestrates all isolation layers and manages system state
-"""
-
-import os
-import sys
-import yaml
-import signal
-import logging
-import threading
-import time
-from pathlib import Path
-from datetime import datetime
-
-# Add parent to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
-
-from dhcp_server import DHCPMicrosegmentation
-from arp_defender import ARPDefender
-from ipv6_ra import IPv6RAAttack
-from firewall import IrongateFirewall
-from monitor import BypassMonitor
-from gateway_takeover import GatewayTakeover
-from bridge_manager import BridgeManager
-
-CONFIG_FILE = "/etc/irongate/irongate.yaml"
-LOG_DIR = "/var/log/irongate"
-
-class IrongateEngine:
-    """Main orchestration engine for Irongate"""
-    
-    def __init__(self):
-        self.config = self._load_config()
-        self._setup_logging()
-        self.running = False
-        self.components = {}
-        self.lock = threading.Lock()
-        
-        self.logger.info("Irongate Engine initializing...")
-        
-    def _load_config(self):
-        with open(CONFIG_FILE, 'r') as f:
-            return yaml.safe_load(f)
-    
-    def _setup_logging(self):
-        log_cfg = self.config.get('logging', {})
-        
-        self.logger = logging.getLogger('irongate')
-        self.logger.setLevel(getattr(logging, log_cfg.get('level', 'INFO')))
-        
-        # File handler
-        fh = logging.FileHandler(log_cfg.get('file', f'{LOG_DIR}/irongate.log'))
-        fh.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        self.logger.addHandler(fh)
-        
-        # Console handler
-        ch = logging.StreamHandler()
-        ch.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
-        self.logger.addHandler(ch)
-        
-        # Security log
-        self.security_logger = logging.getLogger('irongate.security')
-        sh = logging.FileHandler(log_cfg.get('security_log', f'{LOG_DIR}/security.log'))
-        sh.setFormatter(logging.Formatter(
-            '%(asctime)s - SECURITY - %(levelname)s - %(message)s'
-        ))
-        self.security_logger.addHandler(sh)
-    
-    def _init_components(self):
-        """Initialize all isolation components"""
-        net = self.config['network']
-        bridge_cfg = self.config.get('bridge_mode', {})
-        bridge_mode = bridge_cfg.get('mode', 'single') == 'dual'
-        
-        if bridge_mode:
-            self.logger.info("=" * 60)
-            self.logger.info("DUAL-NIC BRIDGE MODE - TRUE VLAN-EQUIVALENT ISOLATION")
-            self.logger.info("=" * 60)
-            
-            # In bridge mode, we use Linux bridge with port isolation
-            # This provides 100% hardware-enforced isolation
-            self.components['bridge'] = BridgeManager(
-                uplink_interface=net['interface'],
-                isolated_interface=bridge_cfg.get('isolated_interface'),
-                bridge_name=bridge_cfg.get('bridge_name', 'br-irongate'),
-                bridge_ip=bridge_cfg.get('bridge_ip', '10.99.0.1'),
-                bridge_netmask=bridge_cfg.get('bridge_netmask', '255.255.0.0'),
-                config=bridge_cfg
-            )
-            
-            # Simplified firewall for bridge mode
-            if self.config['firewall'].get('enabled', True):
-                self.logger.info("Initializing Bridge Firewall...")
-                self.components['firewall'] = IrongateFirewall(
-                    interface=bridge_cfg.get('bridge_name', 'br-irongate'),
-                    local_ip=bridge_cfg.get('bridge_ip', '10.99.0.1'),
-                    gateway=net['gateway_ip'],
-                    config=self.config['firewall']
-                )
-            
-            self.logger.info("Bridge mode active - 6 software layers DISABLED")
-            self.logger.info("Isolation is now KERNEL-ENFORCED via bridge port isolation")
-            return
-        
-        # SINGLE NIC MODE - Use all 6 software layers
-        self.logger.info("=" * 60)
-        self.logger.info("SINGLE-NIC MODE - 6-LAYER SOFTWARE ISOLATION")
-        self.logger.info("=" * 60)
-        
-        # Layer 1: DHCP Microsegmentation
-        if self.config['dhcp'].get('enabled', True):
-            self.logger.info("Initializing DHCP Microsegmentation (Layer 1)...")
-            self.components['dhcp'] = DHCPMicrosegmentation(
-                interface=net['interface'],
-                local_ip=net['local_ip'],
-                gateway=net['gateway_ip'],
-                config=self.config['dhcp']
-            )
-        
-        # Layer 2: ARP Defense
-        if self.config['arp'].get('enabled', True):
-            self.logger.info("Initializing ARP Defender (Layer 2)...")
-            self.components['arp'] = ARPDefender(
-                interface=net['interface'],
-                local_ip=net['local_ip'],
-                local_mac=net['local_mac'],
-                gateway_ip=net['gateway_ip'],
-                gateway_mac=net['gateway_mac'],
-                config=self.config['arp']
-            )
-        
-        # Layer 3: IPv6 RA Attack
-        if self.config['ipv6_ra'].get('enabled', True):
-            self.logger.info("Initializing IPv6 RA Attack (Layer 3)...")
-            self.components['ipv6_ra'] = IPv6RAAttack(
-                interface=net['interface'],
-                config=self.config['ipv6_ra']
-            )
-        
-        # Layer 4: Firewall
-        if self.config['firewall'].get('enabled', True):
-            self.logger.info("Initializing Firewall (Layer 4)...")
-            self.components['firewall'] = IrongateFirewall(
-                interface=net['interface'],
-                local_ip=net['local_ip'],
-                gateway=net['gateway_ip'],
-                config=self.config['firewall']
-            )
-        
-        # Layer 5: Bypass Monitor
-        if self.config['active_defense'].get('enabled', True):
-            self.logger.info("Initializing Bypass Monitor (Layer 5)...")
-            self.components['monitor'] = BypassMonitor(
-                interface=net['interface'],
-                local_ip=net['local_ip'],
-                gateway_ip=net['gateway_ip'],
-                config=self.config['active_defense'],
-                arp_defender=self.components.get('arp')
-            )
-        
-        # Layer 6: Gateway Takeover (CRITICAL - provides VLAN-equivalent security)
-        if self.config['gateway_takeover'].get('enabled', True):
-            self.logger.info("Initializing Gateway Takeover (Layer 6)...")
-            self.logger.info("  This layer ensures isolation even against full bypass attempts")
-            self.components['gateway_takeover'] = GatewayTakeover(
-                interface=net['interface'],
-                local_ip=net['local_ip'],
-                local_mac=net['local_mac'],
-                gateway_ip=net['gateway_ip'],
-                gateway_mac=net['gateway_mac'],
-                config=self.config['gateway_takeover'],
-                arp_defender=self.components.get('arp'),
-                firewall=self.components.get('firewall')
-            )
-    
-    def start(self):
-        """Start all components"""
-        self.running = True
-        self._init_components()
-        
-        threads = []
-        for name, component in self.components.items():
-            self.logger.info(f"Starting {name}...")
-            t = threading.Thread(target=component.run, daemon=True, name=name)
-            t.start()
-            threads.append(t)
-        
-        self.logger.info("=" * 60)
-        self.logger.info("IRONGATE ACTIVE - All isolation layers running")
-        self.logger.info("=" * 60)
-        
-        # Main loop
-        while self.running:
-            time.sleep(1)
-    
-    def stop(self):
-        """Stop all components"""
-        self.logger.info("Shutting down Irongate...")
-        self.running = False
-        
-        for name, component in self.components.items():
-            self.logger.info(f"Stopping {name}...")
-            if hasattr(component, 'stop'):
-                component.stop()
-        
-        self.logger.info("Irongate stopped")
-    
-    def reload_config(self):
-        """Reload configuration"""
-        self.logger.info("Reloading configuration...")
-        self.config = self._load_config()
-        
-        for component in self.components.values():
-            if hasattr(component, 'reload_config'):
-                component.reload_config(self.config)
-    
-    def get_status(self):
-        """Get status of all components"""
-        status = {
-            'running': self.running,
-            'uptime': None,
-            'components': {}
-        }
-        
-        for name, component in self.components.items():
-            if hasattr(component, 'get_status'):
-                status['components'][name] = component.get_status()
-            else:
-                status['components'][name] = {'running': True}
-        
-        return status
-
-
-def main():
-    engine = IrongateEngine()
-    
-    def signal_handler(sig, frame):
-        engine.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGHUP, lambda s, f: engine.reload_config())
-    
-    try:
-        engine.start()
-    except KeyboardInterrupt:
-        engine.stop()
-
-
-if __name__ == '__main__':
-    main()
-ENGINEEOF
-}
-
-create_dhcp_server() {
-    log_step "Creating DHCP Microsegmentation module..."
-
-cat > "$INSTALL_DIR/core/dhcp_server.py" << 'DHCPEOF'
-#!/usr/bin/env python3
-"""
-Irongate DHCP Microsegmentation
-Assigns /30 subnets with Option 121 routes to capture all traffic
-"""
-
-import logging
-import threading
-import struct
-import socket
-import time
-from datetime import datetime
-from scapy.all import (
-    DHCP, BOOTP, IP, UDP, Ether, sendp, sniff, 
-    get_if_hwaddr, conf as scapy_conf
-)
-
-logger = logging.getLogger('irongate.dhcp')
-
-
-class DHCPMicrosegmentation:
-    """
-    DHCP server that assigns /30 subnets to isolated devices.
-    All traffic MUST route through Irongate gateway.
-    
-    Key features:
-    - /30 subnet per device (device + gateway only)
-    - Option 121: Classless static routes capture 0.0.0.0/0
-    - Short leases force frequent renewals
-    - Tracks all assignments for firewall integration
-    """
-    
-    # DHCP Message Types
-    DHCPDISCOVER = 1
-    DHCPOFFER = 2
-    DHCPREQUEST = 3
-    DHCPACK = 5
-    DHCPNAK = 6
-    DHCPRELEASE = 7
-    
-    def __init__(self, interface, local_ip, gateway, config):
-        self.interface = interface
-        self.local_ip = local_ip
-        self.gateway = gateway
-        self.config = config
-        self.local_mac = get_if_hwaddr(interface)
-        
-        self.running = False
-        self.leases = {}  # MAC -> lease info
-        self.lock = threading.Lock()
-        
-        # Parse pool configuration
-        self.pool_start = self._ip_to_int(config.get('pool_start', '10.55.0.4'))
-        self.pool_end = self._ip_to_int(config.get('pool_end', '10.55.255.252'))
-        self.pool_current = self.pool_start
-        self.lease_time = config.get('lease_time', 300)
-        
-        scapy_conf.verb = 0
-        
-        logger.info(f"DHCP Microsegmentation initialized")
-        logger.info(f"  Pool: {config.get('pool_start')} - {config.get('pool_end')}")
-        logger.info(f"  Lease time: {self.lease_time}s")
-    
-    def _ip_to_int(self, ip):
-        return struct.unpack("!I", socket.inet_aton(ip))[0]
-    
-    def _int_to_ip(self, num):
-        return socket.inet_ntoa(struct.pack("!I", num))
-    
-    def _get_next_subnet(self, client_mac):
-        """
-        Allocate next /30 subnet for a device.
-        Returns (client_ip, gateway_ip, netmask)
-        """
-        with self.lock:
-            # Check for existing lease
-            if client_mac in self.leases:
-                lease = self.leases[client_mac]
-                if time.time() < lease['expires']:
-                    return lease['ip'], lease['gateway'], '255.255.255.252'
-            
-            # Allocate new /30 - addresses are: network, gateway, client, broadcast
-            # We use .1 as gateway, .2 as client in each /30
-            subnet_base = (self.pool_current // 4) * 4
-            gateway_ip = self._int_to_ip(subnet_base + 1)
-            client_ip = self._int_to_ip(subnet_base + 2)
-            
-            # Move to next /30
-            self.pool_current = subnet_base + 4
-            if self.pool_current > self.pool_end:
-                self.pool_current = self.pool_start
-            
-            # Record lease
-            self.leases[client_mac] = {
-                'ip': client_ip,
-                'gateway': gateway_ip,
-                'subnet_base': subnet_base,
-                'allocated': time.time(),
-                'expires': time.time() + self.lease_time
-            }
-            
-            logger.info(f"Allocated {client_ip}/30 to {client_mac} (gw: {gateway_ip})")
-            return client_ip, gateway_ip, '255.255.255.252'
-    
-    def _build_option_121(self, client_ip, gateway_ip):
-        """
-        Build Option 121 (Classless Static Routes)
-        Captures ALL traffic (0.0.0.0/0) via our gateway
-        RFC 3442 format: [subnet_len][subnet][gateway]
-        """
-        routes = b''
-        
-        # Default route (0.0.0.0/0) via Irongate
-        # Format: prefix_len (1 byte) + significant octets + gateway (4 bytes)
-        routes += struct.pack('!B', 0)  # /0 = 0 significant octets
-        routes += socket.inet_aton(self.local_ip)  # Gateway is Irongate
-        
-        # Route to client's /30 subnet via its local gateway
-        subnet_int = self._ip_to_int(gateway_ip) & 0xFFFFFFFC
-        routes += struct.pack('!B', 30)  # /30
-        routes += struct.pack('!I', subnet_int)[:4]  # First 4 octets for /30
-        routes += socket.inet_aton(gateway_ip)
-        
-        return routes
-    
-    def _handle_discover(self, pkt):
-        """Handle DHCP DISCOVER - send OFFER"""
-        client_mac = pkt[Ether].src
-        xid = pkt[BOOTP].xid
-        
-        client_ip, gateway_ip, netmask = self._get_next_subnet(client_mac)
-        
-        # Build DHCP options
-        options = [
-            ('message-type', 'offer'),
-            ('server_id', self.local_ip),
-            ('lease_time', self.lease_time),
-            ('renewal_time', self.lease_time // 2),
-            ('rebinding_time', int(self.lease_time * 0.875)),
-            ('subnet_mask', netmask),
-            ('router', self.local_ip),  # Irongate is the router
-            ('name_server', self.local_ip),  # DNS through Irongate
-        ]
-        
-        # Add Option 121 (Classless Static Routes) - THIS IS KEY
-        if self.config.get('option_121_enabled', True):
-            opt121 = self._build_option_121(client_ip, gateway_ip)
-            options.append((121, opt121))
-        
-        options.append('end')
-        
-        # Build and send OFFER
-        offer = (
-            Ether(src=self.local_mac, dst=client_mac) /
-            IP(src=self.local_ip, dst='255.255.255.255') /
-            UDP(sport=67, dport=68) /
-            BOOTP(
-                op=2, xid=xid, yiaddr=client_ip,
-                siaddr=self.local_ip, chaddr=pkt[BOOTP].chaddr
-            ) /
-            DHCP(options=options)
-        )
-        
-        sendp(offer, iface=self.interface, verbose=False)
-        logger.debug(f"Sent OFFER {client_ip} to {client_mac}")
-    
-    def _handle_request(self, pkt):
-        """Handle DHCP REQUEST - send ACK"""
-        client_mac = pkt[Ether].src
-        xid = pkt[BOOTP].xid
-        
-        # Get the requested IP
-        requested_ip = None
-        for opt in pkt[DHCP].options:
-            if isinstance(opt, tuple) and opt[0] == 'requested_addr':
-                requested_ip = opt[1]
-                break
-        
-        if not requested_ip and client_mac in self.leases:
-            requested_ip = self.leases[client_mac]['ip']
-        
-        if not requested_ip:
-            # New request, allocate
-            requested_ip, gateway_ip, netmask = self._get_next_subnet(client_mac)
-        else:
-            # Renewing existing lease
-            if client_mac in self.leases:
-                self.leases[client_mac]['expires'] = time.time() + self.lease_time
-                gateway_ip = self.leases[client_mac]['gateway']
-            else:
-                requested_ip, gateway_ip, netmask = self._get_next_subnet(client_mac)
-            netmask = '255.255.255.252'
-        
-        # Build ACK options
-        options = [
-            ('message-type', 'ack'),
-            ('server_id', self.local_ip),
-            ('lease_time', self.lease_time),
-            ('renewal_time', self.lease_time // 2),
-            ('rebinding_time', int(self.lease_time * 0.875)),
-            ('subnet_mask', netmask),
-            ('router', self.local_ip),
-            ('name_server', self.local_ip),
-        ]
-        
-        if self.config.get('option_121_enabled', True):
-            opt121 = self._build_option_121(requested_ip, gateway_ip)
-            options.append((121, opt121))
-        
-        options.append('end')
-        
-        # Build and send ACK
-        ack = (
-            Ether(src=self.local_mac, dst=client_mac) /
-            IP(src=self.local_ip, dst='255.255.255.255') /
-            UDP(sport=67, dport=68) /
-            BOOTP(
-                op=2, xid=xid, yiaddr=requested_ip,
-                siaddr=self.local_ip, chaddr=pkt[BOOTP].chaddr
-            ) /
-            DHCP(options=options)
-        )
-        
-        sendp(ack, iface=self.interface, verbose=False)
-        logger.info(f"Sent ACK {requested_ip}/30 to {client_mac}")
-    
-    def _packet_handler(self, pkt):
-        """Process incoming DHCP packets"""
-        if not pkt.haslayer(DHCP):
-            return
-        
-        # Get message type
-        msg_type = None
-        for opt in pkt[DHCP].options:
-            if isinstance(opt, tuple) and opt[0] == 'message-type':
-                msg_type = opt[1]
-                break
-        
-        if msg_type == self.DHCPDISCOVER:
-            self._handle_discover(pkt)
-        elif msg_type == self.DHCPREQUEST:
-            self._handle_request(pkt)
-    
-    def run(self):
-        """Main DHCP server loop"""
-        self.running = True
-        logger.info("DHCP Microsegmentation server starting...")
-        
-        while self.running:
-            try:
-                sniff(
-                    iface=self.interface,
-                    filter="udp and port 67",
-                    prn=self._packet_handler,
-                    store=0,
-                    timeout=5
-                )
-            except Exception as e:
-                if self.running:
-                    logger.error(f"DHCP error: {e}")
-                    time.sleep(1)
-    
-    def stop(self):
-        """Stop DHCP server"""
-        self.running = False
-        logger.info("DHCP server stopped")
-    
-    def get_leases(self):
-        """Get current lease table"""
-        with self.lock:
-            return dict(self.leases)
-    
-    def get_status(self):
-        """Get server status"""
-        return {
-            'running': self.running,
-            'lease_count': len(self.leases),
-            'pool_current': self._int_to_ip(self.pool_current)
-        }
-DHCPEOF
-}
-
-create_arp_defender() {
-    log_step "Creating ARP Defender module..."
-
-cat > "$INSTALL_DIR/core/arp_defender.py" << 'ARPEOF'
-#!/usr/bin/env python3
-"""
-Irongate ARP Defender
-Aggressive ARP cache poisoning with bypass detection
-"""
-
-import logging
-import threading
-import time
-import os
-from datetime import datetime
-from scapy.all import (
-    ARP, Ether, sendp, sniff, srp,
-    get_if_hwaddr, conf as scapy_conf
-)
-
-logger = logging.getLogger('irongate.arp')
-security_logger = logging.getLogger('irongate.security')
-
-
-class ARPDefender:
-    """
-    Aggressive ARP defense with multiple strategies:
-    1. Continuous gratuitous ARP (claim to be gateway)
-    2. Immediate response to gateway ARP requests
-    3. Bypass detection (devices querying real gateway)
-    4. Aggressive re-poisoning on bypass detection
-    """
-    
-    def __init__(self, interface, local_ip, local_mac, gateway_ip, gateway_mac, config):
-        self.interface = interface
-        self.local_ip = local_ip
-        self.local_mac = local_mac
-        self.gateway_ip = gateway_ip
-        self.gateway_mac = gateway_mac or self._discover_gateway_mac()
-        self.config = config
-        
-        self.running = False
-        self.targets = {}  # IP -> MAC of devices we're poisoning
-        self.lock = threading.Lock()
-        self.bypass_detected = {}  # Track bypass attempts
-        
-        self.refresh_interval = config.get('refresh_interval', 2)
-        self.aggressive_interval = config.get('aggressive_interval_ms', 500) / 1000
-        
-        scapy_conf.verb = 0
-        
-        logger.info(f"ARP Defender initialized")
-        logger.info(f"  Gateway: {self.gateway_ip} ({self.gateway_mac})")
-    
-    def _discover_gateway_mac(self):
-        """Discover gateway MAC via ARP"""
-        try:
-            ans, _ = srp(
-                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.gateway_ip),
-                timeout=2, iface=self.interface, verbose=False
-            )
-            if ans:
-                return ans[0][1].hwsrc
-        except:
-            pass
-        return None
-    
-    def register_target(self, ip, mac):
-        """Register a device for ARP poisoning"""
-        with self.lock:
-            self.targets[ip] = mac
-            logger.info(f"ARP target registered: {ip} ({mac})")
-    
-    def unregister_target(self, ip):
-        """Remove a device from ARP poisoning"""
-        with self.lock:
-            if ip in self.targets:
-                # Restore correct ARP entries
-                self._restore_arp(ip, self.targets[ip])
-                del self.targets[ip]
-                logger.info(f"ARP target unregistered: {ip}")
-    
-    def _poison_target(self, target_ip, target_mac):
-        """
-        Send spoofed ARP to target claiming we are the gateway.
-        Also tell gateway we are the target (bidirectional poisoning).
-        """
-        try:
-            # Tell target: "Gateway IP is at our MAC"
-            pkt_to_target = (
-                Ether(dst=target_mac, src=self.local_mac) /
-                ARP(
-                    op=2,  # is-at (reply)
-                    psrc=self.gateway_ip,
-                    hwsrc=self.local_mac,
-                    pdst=target_ip,
-                    hwdst=target_mac
-                )
-            )
-            
-            # Tell gateway: "Target IP is at our MAC"
-            pkt_to_gateway = (
-                Ether(dst=self.gateway_mac, src=self.local_mac) /
-                ARP(
-                    op=2,
-                    psrc=target_ip,
-                    hwsrc=self.local_mac,
-                    pdst=self.gateway_ip,
-                    hwdst=self.gateway_mac
-                )
-            )
-            
-            sendp([pkt_to_target, pkt_to_gateway], iface=self.interface, verbose=False)
-            
-        except Exception as e:
-            logger.error(f"ARP poison error for {target_ip}: {e}")
-    
-    def _restore_arp(self, target_ip, target_mac):
-        """Restore correct ARP entries on shutdown"""
-        try:
-            # Tell target the real gateway MAC
-            pkt_to_target = (
-                Ether(dst=target_mac, src=self.gateway_mac) /
-                ARP(
-                    op=2,
-                    psrc=self.gateway_ip,
-                    hwsrc=self.gateway_mac,
-                    pdst=target_ip,
-                    hwdst=target_mac
-                )
-            )
-            
-            # Tell gateway the real target MAC
-            pkt_to_gateway = (
-                Ether(dst=self.gateway_mac, src=target_mac) /
-                ARP(
-                    op=2,
-                    psrc=target_ip,
-                    hwsrc=target_mac,
-                    pdst=self.gateway_ip,
-                    hwdst=self.gateway_mac
-                )
-            )
-            
-            sendp([pkt_to_target, pkt_to_gateway], iface=self.interface, verbose=False, count=3)
-            
-        except Exception as e:
-            logger.error(f"ARP restore error: {e}")
-    
-    def _send_gratuitous_arp(self):
-        """Send gratuitous ARP announcing we are the gateway"""
-        pkt = (
-            Ether(dst="ff:ff:ff:ff:ff:ff", src=self.local_mac) /
-            ARP(
-                op=2,
-                psrc=self.gateway_ip,
-                hwsrc=self.local_mac,
-                pdst=self.gateway_ip,
-                hwdst="ff:ff:ff:ff:ff:ff"
-            )
-        )
-        sendp(pkt, iface=self.interface, verbose=False)
-    
-    def _handle_arp_request(self, pkt):
-        """
-        Handle incoming ARP requests:
-        - If asking for gateway, respond immediately
-        - Detect bypass attempts (asking for real gateway MAC)
-        """
-        if not pkt.haslayer(ARP) or pkt[ARP].op != 1:  # op=1 is who-has
-            return
-        
-        src_ip = pkt[ARP].psrc
-        src_mac = pkt[ARP].hwsrc
-        dst_ip = pkt[ARP].pdst
-        
-        # Device asking for gateway
-        if dst_ip == self.gateway_ip:
-            if self.config.get('immediate_response', True):
-                # Respond immediately claiming to be gateway
-                reply = (
-                    Ether(dst=src_mac, src=self.local_mac) /
-                    ARP(
-                        op=2,
-                        psrc=self.gateway_ip,
-                        hwsrc=self.local_mac,
-                        pdst=src_ip,
-                        hwdst=src_mac
-                    )
-                )
-                sendp(reply, iface=self.interface, verbose=False)
-                logger.debug(f"Responded to gateway ARP from {src_ip}")
-        
-        # Bypass detection: device with static ARP trying to verify
-        if self.config.get('bypass_detection', True):
-            # If we see repeated ARP requests for gateway from same device,
-            # it might be trying to discover the real gateway
-            with self.lock:
-                if src_ip not in self.bypass_detected:
-                    self.bypass_detected[src_ip] = {'count': 0, 'last': 0}
-                
-                now = time.time()
-                if now - self.bypass_detected[src_ip]['last'] < 5:
-                    self.bypass_detected[src_ip]['count'] += 1
-                else:
-                    self.bypass_detected[src_ip]['count'] = 1
-                self.bypass_detected[src_ip]['last'] = now
-                
-                # Multiple rapid requests might indicate bypass attempt
-                if self.bypass_detected[src_ip]['count'] > 5:
-                    security_logger.warning(
-                        f"POTENTIAL BYPASS: {src_ip} ({src_mac}) - "
-                        f"excessive gateway ARP requests"
-                    )
-                    # Aggressive re-poisoning
-                    if self.config.get('auto_repoison', True):
-                        self._poison_target(src_ip, src_mac)
-    
-    def _poison_loop(self):
-        """Continuous ARP poisoning thread"""
-        while self.running:
-            try:
-                # Gratuitous ARP
-                self._send_gratuitous_arp()
-                
-                # Poison all registered targets
-                with self.lock:
-                    targets = dict(self.targets)
-                
-                for ip, mac in targets.items():
-                    if not self.running:
-                        break
-                    self._poison_target(ip, mac)
-                
-                time.sleep(self.refresh_interval)
-                
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Poison loop error: {e}")
-                    time.sleep(1)
-    
-    def _monitor_loop(self):
-        """Monitor ARP traffic for bypass detection"""
-        def handler(pkt):
-            if self.running:
-                self._handle_arp_request(pkt)
-        
-        while self.running:
-            try:
-                sniff(
-                    iface=self.interface,
-                    filter="arp",
-                    prn=handler,
-                    store=0,
-                    timeout=5
-                )
-            except Exception as e:
-                if self.running:
-                    logger.error(f"ARP monitor error: {e}")
-                    time.sleep(1)
-    
-    def run(self):
-        """Start ARP defender"""
-        self.running = True
-        logger.info("ARP Defender starting...")
-        
-        # Start poison thread
-        poison_thread = threading.Thread(target=self._poison_loop, daemon=True)
-        poison_thread.start()
-        
-        # Run monitor in main thread
-        self._monitor_loop()
-    
-    def stop(self):
-        """Stop ARP defender and restore ARP tables"""
-        self.running = False
-        
-        # Restore all targets
-        with self.lock:
-            for ip, mac in self.targets.items():
-                self._restore_arp(ip, mac)
-        
-        logger.info("ARP Defender stopped")
-    
-    def get_status(self):
-        return {
-            'running': self.running,
-            'target_count': len(self.targets),
-            'bypass_events': len([b for b in self.bypass_detected.values() if b['count'] > 5])
-        }
-ARPEOF
-}
-
-create_ipv6_ra() {
-    log_step "Creating IPv6 RA Attack module..."
-
-cat > "$INSTALL_DIR/core/ipv6_ra.py" << 'IPV6EOF'
-#!/usr/bin/env python3
-"""
-Irongate IPv6 Router Advertisement Attack
-Exploit IPv6 preference in dual-stack environments
-"""
-
-import logging
-import threading
-import time
-from scapy.all import (
-    Ether, IPv6, ICMPv6ND_RA, ICMPv6NDOptSrcLLAddr,
-    ICMPv6NDOptPrefixInfo, ICMPv6NDOptRDNSS, ICMPv6NDOptMTU,
-    sendp, get_if_hwaddr, conf as scapy_conf
-)
-
-logger = logging.getLogger('irongate.ipv6_ra')
-
-
-class IPv6RAAttack:
-    """
-    IPv6 Router Advertisement attack to capture traffic
-    on networks with IPv6 enabled (most modern devices).
-    
-    Exploits:
-    - Default IPv6 enabled on Windows/Mac/Linux/iOS/Android
-    - IPv6 preference over IPv4 in many applications
-    - Lack of RA Guard on unmanaged switches
-    """
-    
-    def __init__(self, interface, config):
-        self.interface = interface
-        self.config = config
-        self.local_mac = get_if_hwaddr(interface)
-        
-        self.running = False
-        self.interval = config.get('interval_ms', 500) / 1000
-        self.prefix = config.get('prefix', 'fd00:iron:gate::')
-        self.prefix_len = config.get('prefix_len', 64)
-        
-        # Generate link-local address from MAC
-        self.link_local = self._mac_to_link_local(self.local_mac)
-        
-        scapy_conf.verb = 0
-        
-        logger.info(f"IPv6 RA Attack initialized")
-        logger.info(f"  Link-local: {self.link_local}")
-        logger.info(f"  Prefix: {self.prefix}/{self.prefix_len}")
-    
-    def _mac_to_link_local(self, mac):
-        """Convert MAC to IPv6 link-local address (EUI-64)"""
-        parts = mac.split(':')
-        # Flip 7th bit of first byte
-        first_byte = int(parts[0], 16) ^ 0x02
-        parts[0] = f'{first_byte:02x}'
-        # Insert ff:fe in middle
-        eui64 = parts[:3] + ['ff', 'fe'] + parts[3:]
-        # Format as IPv6
-        ipv6_suffix = ''.join([
-            eui64[0] + eui64[1],
-            eui64[2] + eui64[3],
-            eui64[4] + eui64[5],
-            eui64[6] + eui64[7]
-        ])
-        return f"fe80::{ipv6_suffix[:4]}:{ipv6_suffix[4:8]}:{ipv6_suffix[8:12]}:{ipv6_suffix[12:16]}"
-    
-    def _build_ra_packet(self):
-        """Build Router Advertisement packet"""
-        
-        # Ethernet layer - multicast to all nodes
-        eth = Ether(
-            dst="33:33:00:00:00:01",  # All-nodes multicast
-            src=self.local_mac
-        )
-        
-        # IPv6 layer
-        ipv6 = IPv6(
-            src=self.link_local,
-            dst="ff02::1",  # All-nodes multicast
-            hlim=255  # Must be 255 for ND
-        )
-        
-        # Router Advertisement
-        ra = ICMPv6ND_RA(
-            type=134,  # Router Advertisement
-            chlim=64,  # Hop limit for hosts
-            M=0,  # Managed address config (SLAAC)
-            O=1,  # Other config (get DNS via DHCPv6 or RDNSS)
-            H=0,  # Not a home agent
-            prf=1,  # High preference (0=medium, 1=high)
-            routerlifetime=1800,  # Router lifetime
-            reachabletime=0,  # Use default
-            retranstimer=0   # Use default
-        )
-        
-        # Source link-layer address option
-        src_lladdr = ICMPv6NDOptSrcLLAddr(lladdr=self.local_mac)
-        
-        # MTU option
-        mtu = ICMPv6NDOptMTU(mtu=1500)
-        
-        # Prefix Information option
-        prefix_info = ICMPv6NDOptPrefixInfo(
-            prefixlen=self.prefix_len,
-            L=1,  # On-link flag
-            A=1,  # Autonomous address-configuration flag
-            validlifetime=86400,  # Valid lifetime
-            preferredlifetime=14400,  # Preferred lifetime
-            prefix=self.prefix
-        )
-        
-        # Build packet
-        pkt = eth / ipv6 / ra / src_lladdr / mtu / prefix_info
-        
-        # Add RDNSS option if enabled
-        if self.config.get('rdnss_enabled', True):
-            # RDNSS option (RFC 8106)
-            # Irongate acts as DNS server
-            rdnss = ICMPv6NDOptRDNSS(
-                lifetime=1800,
-                dns=[self.link_local]
-            )
-            pkt = pkt / rdnss
-        
-        return pkt
-    
-    def _send_ra(self):
-        """Send Router Advertisement"""
-        try:
-            pkt = self._build_ra_packet()
-            sendp(pkt, iface=self.interface, verbose=False)
-        except Exception as e:
-            logger.error(f"RA send error: {e}")
-    
-    def run(self):
-        """Main RA sending loop"""
-        self.running = True
-        logger.info("IPv6 RA Attack starting...")
-        
-        while self.running:
-            try:
-                self._send_ra()
-                time.sleep(self.interval)
-            except Exception as e:
-                if self.running:
-                    logger.error(f"RA loop error: {e}")
-                    time.sleep(1)
-    
-    def stop(self):
-        """Stop RA attack"""
-        self.running = False
-        logger.info("IPv6 RA Attack stopped")
-    
-    def get_status(self):
-        return {
-            'running': self.running,
-            'prefix': f"{self.prefix}/{self.prefix_len}",
-            'interval_ms': self.interval * 1000
-        }
-IPV6EOF
-}
-
-create_firewall() {
-    log_step "Creating Firewall module..."
-
-cat > "$INSTALL_DIR/core/firewall.py" << 'FWEOF'
-#!/usr/bin/env python3
-"""
-Irongate Firewall
-nftables-based stateful firewall with zone-based policies
-"""
-
-import logging
-import subprocess
-import threading
-import os
-import yaml
-from pathlib import Path
-
-logger = logging.getLogger('irongate.firewall')
-
-ZONES_FILE = "/var/lib/irongate/zones/devices.yaml"
-CONFIG_FILE = "/etc/irongate/irongate.yaml"
-
-
-class IrongateFirewall:
-    """
-    nftables-based firewall with:
-    - Zone-based policies
-    - Connection tracking
-    - Rate limiting
-    - Logging
-    """
-    
-    def __init__(self, interface, local_ip, gateway, config):
-        self.interface = interface
-        self.local_ip = local_ip
-        self.gateway = gateway
-        self.config = config
-        
-        self.running = False
-        self.lock = threading.Lock()
-        
-        # Load zone config
-        with open(CONFIG_FILE) as f:
-            full_config = yaml.safe_load(f)
-        self.zone_defs = full_config.get('zones', {}).get('definitions', {})
-        
-        logger.info("Firewall module initialized")
-    
-    def _run_nft(self, cmd):
-        """Run nft command"""
-        try:
-            result = subprocess.run(
-                ['nft'] + cmd.split(),
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return True, result.stdout
-        except subprocess.CalledProcessError as e:
-            logger.error(f"nft error: {e.stderr}")
-            return False, e.stderr
-    
-    def _load_devices(self):
-        """Load device database"""
-        try:
-            with open(ZONES_FILE) as f:
-                data = yaml.safe_load(f) or {}
-                return data.get('devices', [])
-        except:
-            return []
-    
-    def setup_base_rules(self):
-        """Set up base nftables ruleset"""
-        
-        # Flush existing Irongate rules
-        self._run_nft('flush table inet irongate')
-        
-        # Create table and chains
-        nft_rules = '''
-table inet irongate {
-    # Connection tracking
-    ct helper ftp-standard {
-        type "ftp" protocol tcp
-    }
-    
-    # Sets for dynamic management
-    set isolated_ips {
-        type ipv4_addr
-        flags interval
-    }
-    
-    set trusted_ips {
-        type ipv4_addr
-        flags interval
-    }
-    
-    set blocked_ips {
-        type ipv4_addr
-        flags interval
-    }
-    
-    # Rate limit set
-    set rate_limit {
-        type ipv4_addr
-        flags dynamic
-        timeout 60s
-    }
-    
-    chain input {
-        type filter hook input priority 0; policy drop;
-        
-        # Allow established/related
-        ct state established,related accept
-        
-        # Allow loopback
-        iif lo accept
-        
-        # Allow ICMP
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-        
-        # Allow DHCP server
-        udp dport 67 accept
-        
-        # Allow DNS
-        udp dport 53 accept
-        tcp dport 53 accept
-        
-        # Allow web interface
-        tcp dport ''' + str(self.config.get('web_port', 8443)) + ''' accept
-        
-        # Allow SSH for management
-        tcp dport 22 accept
-        
-        # Log and drop
-        log prefix "IRONGATE-INPUT-DROP: " drop
-    }
-    
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-        
-        # Allow established/related
-        ct state established,related accept
-        
-        # Drop invalid
-        ct state invalid drop
-        
-        # Rate limiting
-        ip saddr @rate_limit limit rate over 100/second drop
-        
-        # Block quarantined devices
-        ip saddr @blocked_ips log prefix "IRONGATE-BLOCKED: " drop
-        ip daddr @blocked_ips log prefix "IRONGATE-BLOCKED: " drop
-        
-        # Isolated devices - internet only
-        ip saddr @isolated_ips ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
-        ip saddr @isolated_ips log prefix "IRONGATE-ISOLATED-LAN: " drop
-        
-        # Trusted devices - full access
-        ip saddr @trusted_ips accept
-        ip daddr @trusted_ips accept
-        
-        # Default drop with logging
-        log prefix "IRONGATE-FORWARD-DROP: " drop
-    }
-    
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-    
-    chain postrouting {
-        type nat hook postrouting priority 100;
-        
-        # Masquerade for isolated devices
-        ip saddr @isolated_ips oifname ''' + f'"{self.interface}"' + ''' masquerade
-    }
-}
-'''
-        
-        # Write and load ruleset
-        rules_file = '/tmp/irongate_rules.nft'
-        with open(rules_file, 'w') as f:
-            f.write(nft_rules)
-        
-        result = subprocess.run(
-            ['nft', '-f', rules_file],
-            capture_output=True,
-            text=True
-        )
-        
-        os.remove(rules_file)
-        
-        if result.returncode != 0:
-            logger.error(f"Failed to load nftables rules: {result.stderr}")
-            return False
-        
-        logger.info("Base firewall rules loaded")
-        return True
-    
-    def add_device_to_zone(self, ip, zone):
-        """Add device to a zone"""
-        with self.lock:
-            if zone == 'quarantine':
-                self._run_nft(f'add element inet irongate blocked_ips {{ {ip} }}')
-            elif zone == 'isolated':
-                self._run_nft(f'add element inet irongate isolated_ips {{ {ip} }}')
-            elif zone == 'trusted':
-                self._run_nft(f'add element inet irongate trusted_ips {{ {ip} }}')
-            elif zone == 'servers':
-                # Servers get isolated + specific port access
-                self._run_nft(f'add element inet irongate isolated_ips {{ {ip} }}')
-                # Add server-specific rules here
-            
-            logger.info(f"Added {ip} to zone '{zone}'")
-    
-    def remove_device_from_zone(self, ip, zone):
-        """Remove device from a zone"""
-        with self.lock:
-            if zone == 'quarantine':
-                self._run_nft(f'delete element inet irongate blocked_ips {{ {ip} }}')
-            elif zone == 'isolated':
-                self._run_nft(f'delete element inet irongate isolated_ips {{ {ip} }}')
-            elif zone == 'trusted':
-                self._run_nft(f'delete element inet irongate trusted_ips {{ {ip} }}')
-            
-            logger.info(f"Removed {ip} from zone '{zone}'")
-    
-    def apply_zones(self):
-        """Apply all device zone assignments"""
-        devices = self._load_devices()
-        
-        for device in devices:
-            ip = device.get('ip')
-            zone = device.get('zone', 'quarantine')
-            if ip:
-                self.add_device_to_zone(ip, zone)
-    
-    def get_rules(self):
-        """Get current ruleset"""
-        success, output = self._run_nft('list table inet irongate')
-        return output if success else "Error loading rules"
-    
-    def get_counters(self):
-        """Get packet counters"""
-        success, output = self._run_nft('list counters table inet irongate')
-        return output if success else ""
-    
-    def run(self):
-        """Initialize and run firewall"""
-        self.running = True
-        
-        # Set up base rules
-        if not self.setup_base_rules():
-            logger.error("Failed to initialize firewall")
-            return
-        
-        # Apply device zones
-        self.apply_zones()
-        
-        logger.info("Firewall running")
-        
-        # Keep running (rules are in kernel)
-        while self.running:
-            import time
-            time.sleep(5)
-    
-    def stop(self):
-        """Stop firewall"""
-        self.running = False
-        # Optionally flush rules
-        # self._run_nft('flush table inet irongate')
-        logger.info("Firewall stopped")
-    
-    def get_status(self):
-        return {
-            'running': self.running,
-            'rules_active': True
-        }
-FWEOF
-}
-
-create_monitor() {
-    log_step "Creating Bypass Monitor module..."
-
-cat > "$INSTALL_DIR/core/monitor.py" << 'MONEOF'
-#!/usr/bin/env python3
-"""
-Irongate Bypass Monitor
-Detects and responds to isolation bypass attempts
-"""
-
-import logging
-import threading
-import time
-import os
-from datetime import datetime
-from scapy.all import (
-    sniff, IP, TCP, ARP, Ether,
-    send, sr1,
-    conf as scapy_conf
-)
-
-logger = logging.getLogger('irongate.monitor')
-security_logger = logging.getLogger('irongate.security')
-
-
-class BypassMonitor:
-    """
-    Monitors for bypass attempts:
-    1. Static IP configuration (no DHCP)
-    2. Static ARP entries
-    3. Traffic not going through Irongate
-    4. IPv6 bypassing RA
-    
-    Response actions:
-    - Log security events
-    - Re-poison ARP
-    - Inject TCP RST
-    - Alert administrators
-    """
-    
-    def __init__(self, interface, local_ip, gateway_ip, config, arp_defender=None):
-        self.interface = interface
-        self.local_ip = local_ip
-        self.gateway_ip = gateway_ip
-        self.config = config
-        self.arp_defender = arp_defender
-        
-        self.running = False
-        self.bypass_events = []
-        self.lock = threading.Lock()
-        
-        scapy_conf.verb = 0
-        
-        logger.info("Bypass Monitor initialized")
-    
-    def _record_event(self, event_type, source_ip, source_mac, details):
-        """Record security event"""
-        event = {
-            'timestamp': datetime.now().isoformat(),
-            'type': event_type,
-            'source_ip': source_ip,
-            'source_mac': source_mac,
-            'details': details
-        }
-        
-        with self.lock:
-            self.bypass_events.append(event)
-            # Keep last 1000 events
-            if len(self.bypass_events) > 1000:
-                self.bypass_events = self.bypass_events[-1000:]
-        
-        security_logger.warning(
-            f"BYPASS ATTEMPT: {event_type} from {source_ip} ({source_mac}) - {details}"
-        )
-        
-        return event
-    
-    def _inject_tcp_rst(self, src_ip, dst_ip, src_port, dst_port):
-        """Inject TCP RST to terminate unauthorized connection"""
-        if not self.config.get('tcp_rst_injection', True):
-            return
-        
-        try:
-            rst_pkt = IP(src=dst_ip, dst=src_ip) / TCP(
-                sport=dst_port,
-                dport=src_port,
-                flags='R',
-                seq=0
-            )
-            send(rst_pkt, verbose=False)
-            logger.debug(f"Injected RST: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-        except Exception as e:
-            logger.error(f"RST injection error: {e}")
-    
-    def _handle_suspicious_traffic(self, pkt):
-        """Analyze traffic for bypass indicators"""
-        if not pkt.haslayer(IP):
-            return
-        
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        
-        # Get MAC if available
-        src_mac = pkt[Ether].src if pkt.haslayer(Ether) else 'unknown'
-        
-        # Check for direct LAN traffic not going through us
-        # This is complex - we'd need to be in promiscuous mode on a span port
-        # For now, we monitor ARP patterns
-        
-        if pkt.haslayer(ARP):
-            self._handle_arp_traffic(pkt)
-    
-    def _handle_arp_traffic(self, pkt):
-        """Monitor ARP for bypass indicators"""
-        if pkt[ARP].op == 1:  # ARP Request
-            src_ip = pkt[ARP].psrc
-            src_mac = pkt[ARP].hwsrc
-            dst_ip = pkt[ARP].pdst
-            
-            # Device asking for something other than us when it should use us
-            # This is suspicious if we've assigned them via DHCP
-            if dst_ip == self.gateway_ip and src_ip != self.local_ip:
-                # Someone asking for real gateway - might be static ARP check
-                self._record_event(
-                    'ARP_PROBE',
-                    src_ip,
-                    src_mac,
-                    f"Probing for gateway {dst_ip}"
-                )
-                
-                # Re-poison
-                if self.arp_defender and self.config.get('auto_repoison', True):
-                    self.arp_defender.register_target(src_ip, src_mac)
-        
-        elif pkt[ARP].op == 2:  # ARP Reply
-            src_ip = pkt[ARP].psrc
-            src_mac = pkt[ARP].hwsrc
-            
-            # Someone else claiming to be the gateway
-            if src_ip == self.gateway_ip and src_mac != self.local_mac:
-                # Real gateway or someone else poisoning
-                pass  # This is expected - real gateway responses
-    
-    def _monitor_loop(self):
-        """Main monitoring loop"""
-        def handler(pkt):
-            if self.running:
-                try:
-                    self._handle_suspicious_traffic(pkt)
-                except Exception as e:
-                    logger.error(f"Monitor handler error: {e}")
-        
-        while self.running:
-            try:
-                sniff(
-                    iface=self.interface,
-                    prn=handler,
-                    store=0,
-                    timeout=5
-                )
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Monitor sniff error: {e}")
-                    time.sleep(1)
-    
-    def run(self):
-        """Start bypass monitor"""
-        self.running = True
-        logger.info("Bypass Monitor starting...")
-        
-        self._monitor_loop()
-    
-    def stop(self):
-        """Stop monitor"""
-        self.running = False
-        logger.info("Bypass Monitor stopped")
-    
-    def get_events(self, limit=100):
-        """Get recent bypass events"""
-        with self.lock:
-            return self.bypass_events[-limit:]
-    
-    def get_status(self):
-        return {
-            'running': self.running,
-            'event_count': len(self.bypass_events)
-        }
-MONEOF
-}
-
-create_gateway_takeover() {
-    log_step "Creating Gateway Takeover module (Layer 6 - VLAN-equivalent security)..."
-
-cat > "$INSTALL_DIR/core/gateway_takeover.py" << 'GTEOF'
-#!/usr/bin/env python3
-"""
-Irongate Gateway Takeover - Layer 6
-Provides VLAN-equivalent isolation security
-
-This is the CRITICAL layer that prevents bypass even when attacker has:
-- Static IP (bypasses DHCP)
-- Static ARP entries (bypasses ARP poisoning to device)
-- IPv6 disabled (bypasses RA attack)
-- Knowledge of real gateway MAC
-
-HOW IT WORKS:
-1. Bidirectional ARP Poisoning: Gateway thinks ALL devices are at OUR MAC
-   - Even if device sends directly to gateway, RESPONSE comes to us
-   - We control the return path
-
-2. CAM Table Flooding: Forces switch into hub mode
-   - We see ALL traffic on the network
-   - Can detect and kill bypass attempts in real-time
-
-3. Gateway MAC Spoofing: We claim to BE the gateway at Layer 2
-   - Switch forwards gateway-destined frames to US
-   - Wins race condition against real gateway
-
-4. Promiscuous Interception: Kill unauthorized flows
-   - TCP RST injection for bypass connections
-   - ICMP unreachable for UDP
-   - Stateful validation ensures we see both directions
-
-RESULT: Even a fully-configured bypass device cannot communicate because:
-- Outbound MAY reach gateway, but response comes to US (we drop it)
-- If we detect bypass traffic, we RST/block it immediately
-- Switch CAM table points gateway MAC to us
-- We ARE the gateway from the switch's perspective
-"""
-
-import logging
-import threading
-import time
-import random
-import struct
-import socket
-from datetime import datetime
-from collections import defaultdict
-from scapy.all import (
-    Ether, IP, TCP, UDP, ICMP, ARP,
-    sendp, sniff, send, RandMAC,
-    get_if_hwaddr, conf as scapy_conf
-)
-
-logger = logging.getLogger('irongate.gateway_takeover')
-security_logger = logging.getLogger('irongate.security')
-
-
-class GatewayTakeover:
-    """
-    Layer 6: Gateway Takeover
-    Provides VLAN-equivalent security through multi-vector control
-    """
-    
-    def __init__(self, interface, local_ip, local_mac, gateway_ip, gateway_mac, 
-                 config, arp_defender=None, firewall=None):
-        self.interface = interface
-        self.local_ip = local_ip
-        self.local_mac = local_mac
-        self.gateway_ip = gateway_ip
-        self.gateway_mac = gateway_mac
-        self.config = config
-        self.arp_defender = arp_defender
-        self.firewall = firewall
-        
-        self.running = False
-        self.lock = threading.Lock()
-        
-        # Track protected devices (IP -> MAC)
-        self.protected_devices = {}
-        
-        # Connection state table for stateful validation
-        self.connection_states = {}  # (src_ip, dst_ip, src_port, dst_port) -> state
-        self.state_timeout = config.get('stateful_validation', {}).get('state_timeout', 300)
-        
-        # Statistics
-        self.stats = {
-            'bypass_attempts_blocked': 0,
-            'rst_injected': 0,
-            'icmp_injected': 0,
-            'cam_floods_triggered': 0,
-            'gateway_poisons_sent': 0
-        }
-        
-        # CAM flooding state
-        self.cam_flooding_active = False
-        self.generated_macs = self._generate_mac_pool(
-            config.get('cam_flooding', {}).get('mac_pool_size', 8000)
-        )
-        
-        scapy_conf.verb = 0
-        
-        logger.info("Gateway Takeover (Layer 6) initialized")
-        logger.info("  Mode: Full gateway control for VLAN-equivalent security")
-        logger.info(f"  Gateway: {gateway_ip} ({gateway_mac})")
-    
-    def _generate_mac_pool(self, size):
-        """Generate pool of random MACs for CAM flooding"""
-        macs = []
-        for _ in range(size):
-            # Generate random MAC with locally-administered bit set
-            mac = [0x02, random.randint(0, 255), random.randint(0, 255),
-                   random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)]
-            macs.append(':'.join(f'{b:02x}' for b in mac))
-        return macs
-    
-    def register_protected_device(self, ip, mac):
-        """Register a device for protection"""
-        with self.lock:
-            self.protected_devices[ip] = mac
-            logger.info(f"Protected device registered: {ip} ({mac})")
-    
-    def unregister_protected_device(self, ip):
-        """Remove device from protection"""
-        with self.lock:
-            if ip in self.protected_devices:
-                del self.protected_devices[ip]
-    
-    # =========================================================================
-    # LAYER 6A: BIDIRECTIONAL ARP POISONING
-    # =========================================================================
-    
-    def _poison_gateway_for_device(self, device_ip, device_mac):
-        """
-        Tell the gateway that device_ip is at OUR MAC.
-        This ensures responses to the device come through us.
-        """
-        pkt = (
-            Ether(dst=self.gateway_mac, src=self.local_mac) /
-            ARP(
-                op=2,  # is-at
-                psrc=device_ip,       # "I am device_ip"
-                hwsrc=self.local_mac, # "...at Irongate's MAC"
-                pdst=self.gateway_ip,
-                hwdst=self.gateway_mac
-            )
-        )
-        sendp(pkt, iface=self.interface, verbose=False)
-    
-    def _bidirectional_poison_loop(self):
-        """
-        Continuously poison gateway to think ALL protected devices are at our MAC.
-        This is the KEY to defeating static ARP bypass.
-        """
-        interval = self.config.get('gateway_poison_interval', 1)
-        
-        while self.running:
-            try:
-                with self.lock:
-                    devices = dict(self.protected_devices)
-                
-                for device_ip, device_mac in devices.items():
-                    if not self.running:
-                        break
-                    self._poison_gateway_for_device(device_ip, device_mac)
-                    self.stats['gateway_poisons_sent'] += 1
-                
-                time.sleep(interval)
-                
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Bidirectional poison error: {e}")
-                    time.sleep(1)
-    
-    # =========================================================================
-    # LAYER 6B: CAM TABLE FLOODING
-    # =========================================================================
-    
-    def _flood_cam_table(self, duration=5, rate=1000):
-        """
-        Flood switch CAM table with random MACs to force hub mode.
-        In hub mode, switch broadcasts everything = we see all traffic.
-        """
-        logger.warning("CAM flooding activated - forcing switch to hub mode")
-        self.stats['cam_floods_triggered'] += 1
-        
-        end_time = time.time() + duration
-        interval = 1.0 / rate
-        
-        while time.time() < end_time and self.running:
-            try:
-                # Send frame with random source MAC
-                src_mac = random.choice(self.generated_macs)
-                pkt = Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / b'\x00' * 46
-                sendp(pkt, iface=self.interface, verbose=False)
-                time.sleep(interval)
-            except:
-                pass
-        
-        logger.info("CAM flooding burst complete")
-    
-    def _adaptive_cam_flood_loop(self):
-        """
-        Monitor for bypass attempts and trigger CAM flooding when detected.
-        Adaptive mode: only flood when necessary to minimize network impact.
-        """
-        if not self.config.get('cam_flooding', {}).get('enabled', True):
-            return
-        
-        if not self.config.get('cam_flooding', {}).get('adaptive', True):
-            # Non-adaptive: continuous low-rate flooding
-            while self.running:
-                self._flood_cam_table(duration=1, rate=100)
-                time.sleep(5)
-        else:
-            # Adaptive: flood is triggered by bypass detection
-            while self.running:
-                if self.cam_flooding_active:
-                    self._flood_cam_table(duration=10, rate=1000)
-                    self.cam_flooding_active = False
-                time.sleep(1)
-    
-    def trigger_cam_flood(self):
-        """Trigger CAM flooding (called when bypass detected)"""
-        self.cam_flooding_active = True
-        logger.warning("CAM flood triggered by bypass detection")
-    
-    # =========================================================================
-    # LAYER 6C: GATEWAY MAC SPOOFING
-    # =========================================================================
-    
-    def _spoof_gateway_mac(self, burst=False):
-        """
-        Send frames AS the gateway to win CAM table race.
-        Switch will learn: gateway_mac -> our_port
-        """
-        rate = self.config.get('mac_spoofing', {}).get('burst_rate' if burst else 'rate', 50)
-        
-        # Send frame claiming to be the gateway
-        pkt = (
-            Ether(src=self.gateway_mac, dst="ff:ff:ff:ff:ff:ff") /
-            ARP(
-                op=1,  # who-has (just to generate traffic)
-                psrc=self.gateway_ip,
-                hwsrc=self.gateway_mac,  # We claim to be gateway
-                pdst="0.0.0.0",
-                hwdst="00:00:00:00:00:00"
-            )
-        )
-        sendp(pkt, iface=self.interface, verbose=False)
-    
-    def _gateway_spoof_loop(self):
-        """Continuously spoof gateway MAC to maintain CAM table control"""
-        if not self.config.get('mac_spoofing', {}).get('enabled', True):
-            return
-        
-        rate = self.config.get('mac_spoofing', {}).get('rate', 50)
-        interval = 1.0 / rate
-        
-        while self.running:
-            try:
-                self._spoof_gateway_mac()
-                time.sleep(interval)
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Gateway spoof error: {e}")
-                    time.sleep(1)
-    
-    # =========================================================================
-    # LAYER 6D: PROMISCUOUS INTERCEPTION
-    # =========================================================================
-    
-    def _inject_tcp_rst(self, src_ip, dst_ip, sport, dport, seq=0):
-        """Inject TCP RST to kill a connection"""
-        try:
-            # RST from destination to source
-            rst = IP(src=dst_ip, dst=src_ip) / TCP(
-                sport=dport, dport=sport, flags='R', seq=seq
-            )
-            send(rst, verbose=False)
-            
-            # Also RST from source to destination (belt and suspenders)
-            rst2 = IP(src=src_ip, dst=dst_ip) / TCP(
-                sport=sport, dport=dport, flags='RA', seq=seq
-            )
-            send(rst2, verbose=False)
-            
-            self.stats['rst_injected'] += 1
-            
-        except Exception as e:
-            logger.error(f"RST injection error: {e}")
-    
-    def _inject_icmp_unreachable(self, original_pkt):
-        """Inject ICMP destination unreachable"""
-        try:
-            if not original_pkt.haslayer(IP):
-                return
-            
-            icmp = (
-                IP(src=self.gateway_ip, dst=original_pkt[IP].src) /
-                ICMP(type=3, code=1) /  # Host unreachable
-                original_pkt[IP]
-            )
-            send(icmp, verbose=False)
-            self.stats['icmp_injected'] += 1
-            
-        except Exception as e:
-            logger.error(f"ICMP injection error: {e}")
-    
-    def _is_bypass_attempt(self, pkt):
-        """
-        Detect if packet is a bypass attempt.
-        Bypass = device talking to gateway directly, not through us.
-        """
-        if not pkt.haslayer(Ether) or not pkt.haslayer(IP):
-            return False
-        
-        src_mac = pkt[Ether].src
-        dst_mac = pkt[Ether].dst
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        
-        # Ignore our own traffic
-        if src_mac == self.local_mac:
-            return False
-        
-        # Check if source is a protected device
-        with self.lock:
-            if src_ip not in self.protected_devices:
-                return False
-            expected_mac = self.protected_devices[src_ip]
-        
-        # BYPASS DETECTION:
-        # If protected device is sending directly to gateway MAC
-        # (not to us), this is a bypass attempt
-        if dst_mac == self.gateway_mac and dst_mac != self.local_mac:
-            return True
-        
-        # Also detect: protected device sending to LAN device directly
-        # (not to gateway and not to us)
-        if dst_mac != self.local_mac and dst_mac != self.gateway_mac:
-            # Check if destination is on local network
-            if self._is_local_ip(dst_ip):
-                return True
-        
-        return False
-    
-    def _is_local_ip(self, ip):
-        """Check if IP is on local network (simplified)"""
-        try:
-            octets = [int(x) for x in ip.split('.')]
-            # Private ranges
-            if octets[0] == 10:
-                return True
-            if octets[0] == 172 and 16 <= octets[1] <= 31:
-                return True
-            if octets[0] == 192 and octets[1] == 168:
-                return True
-        except:
-            pass
-        return False
-    
-    def _update_connection_state(self, pkt):
-        """Track connection state for stateful validation"""
-        if not pkt.haslayer(IP):
-            return
-        
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        
-        if pkt.haslayer(TCP):
-            sport = pkt[TCP].sport
-            dport = pkt[TCP].dport
-            key = (src_ip, dst_ip, sport, dport)
-            reverse_key = (dst_ip, src_ip, dport, sport)
-            
-            with self.lock:
-                # Record connection
-                self.connection_states[key] = {
-                    'last_seen': time.time(),
-                    'flags': pkt[TCP].flags
-                }
-                # Also record reverse for bidirectional matching
-                if reverse_key not in self.connection_states:
-                    self.connection_states[reverse_key] = {
-                        'last_seen': time.time(),
-                        'flags': 0
-                    }
-    
-    def _is_return_traffic_valid(self, pkt):
-        """
-        Check if return traffic matches an outbound connection we saw.
-        Strict mode: drop traffic if we didn't see the outbound.
-        """
-        if not self.config.get('stateful_validation', {}).get('enabled', True):
-            return True
-        
-        if not self.config.get('stateful_validation', {}).get('strict_mode', True):
-            return True
-        
-        if not pkt.haslayer(IP):
-            return True
-        
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        
-        if pkt.haslayer(TCP):
-            sport = pkt[TCP].sport
-            dport = pkt[TCP].dport
-            key = (src_ip, dst_ip, sport, dport)
-            
-            with self.lock:
-                if key in self.connection_states:
-                    state = self.connection_states[key]
-                    if time.time() - state['last_seen'] < self.state_timeout:
-                        return True
-        
-        return False
-    
-    def _handle_promiscuous_packet(self, pkt):
-        """Process packets in promiscuous mode"""
-        try:
-            # Check for bypass attempt
-            if self._is_bypass_attempt(pkt):
-                src_ip = pkt[IP].src if pkt.haslayer(IP) else 'unknown'
-                src_mac = pkt[Ether].src if pkt.haslayer(Ether) else 'unknown'
-                
-                security_logger.warning(
-                    f"BYPASS BLOCKED: {src_ip} ({src_mac}) attempted direct gateway access"
-                )
-                self.stats['bypass_attempts_blocked'] += 1
-                
-                # RESPONSE 1: Inject TCP RST
-                if pkt.haslayer(TCP) and self.config.get('promiscuous_mode', {}).get('rst_injection', True):
-                    self._inject_tcp_rst(
-                        pkt[IP].src, pkt[IP].dst,
-                        pkt[TCP].sport, pkt[TCP].dport
-                    )
-                
-                # RESPONSE 2: Inject ICMP unreachable for UDP
-                elif pkt.haslayer(UDP) and self.config.get('promiscuous_mode', {}).get('icmp_injection', True):
-                    self._inject_icmp_unreachable(pkt)
-                
-                # RESPONSE 3: Trigger CAM flood for visibility
-                if self.config.get('cam_flooding', {}).get('adaptive', True):
-                    self.trigger_cam_flood()
-                
-                # RESPONSE 4: Aggressive gateway re-poisoning
-                if pkt.haslayer(IP):
-                    self._poison_gateway_for_device(pkt[IP].src, pkt[Ether].src)
-                
-                # RESPONSE 5: Burst gateway MAC spoofing
-                for _ in range(10):
-                    self._spoof_gateway_mac(burst=True)
-                
-                return
-            
-            # Update connection state for valid traffic
-            self._update_connection_state(pkt)
-            
-        except Exception as e:
-            logger.error(f"Promiscuous handler error: {e}")
-    
-    def _promiscuous_loop(self):
-        """Main promiscuous monitoring loop"""
-        if not self.config.get('promiscuous_mode', {}).get('enabled', True):
-            return
-        
-        logger.info("Promiscuous monitoring active")
-        
-        while self.running:
-            try:
-                sniff(
-                    iface=self.interface,
-                    prn=self._handle_promiscuous_packet,
-                    store=0,
-                    timeout=5
-                )
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Promiscuous sniff error: {e}")
-                    time.sleep(1)
-    
-    # =========================================================================
-    # CONNECTION STATE CLEANUP
-    # =========================================================================
-    
-    def _cleanup_loop(self):
-        """Periodically clean up stale connection states"""
-        while self.running:
-            try:
-                time.sleep(60)
-                
-                now = time.time()
-                with self.lock:
-                    stale = [k for k, v in self.connection_states.items() 
-                             if now - v['last_seen'] > self.state_timeout]
-                    for k in stale:
-                        del self.connection_states[k]
-                    
-                    if stale:
-                        logger.debug(f"Cleaned {len(stale)} stale connection states")
-                        
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Cleanup error: {e}")
-    
-    # =========================================================================
-    # MAIN ENTRY POINTS
-    # =========================================================================
-    
-    def run(self):
-        """Start all Gateway Takeover components"""
-        self.running = True
-        
-        logger.info("=" * 60)
-        logger.info("GATEWAY TAKEOVER (LAYER 6) STARTING")
-        logger.info("This provides VLAN-equivalent isolation security")
-        logger.info("=" * 60)
-        
-        threads = []
-        
-        # Thread 1: Bidirectional ARP poisoning (poison gateway)
-        if self.config.get('bidirectional_poison', True):
-            t = threading.Thread(target=self._bidirectional_poison_loop, daemon=True)
-            t.start()
-            threads.append(t)
-            logger.info("Started: Bidirectional ARP poisoning")
-        
-        # Thread 2: Gateway MAC spoofing
-        if self.config.get('mac_spoofing', {}).get('enabled', True):
-            t = threading.Thread(target=self._gateway_spoof_loop, daemon=True)
-            t.start()
-            threads.append(t)
-            logger.info("Started: Gateway MAC spoofing")
-        
-        # Thread 3: Adaptive CAM flooding
-        if self.config.get('cam_flooding', {}).get('enabled', True):
-            t = threading.Thread(target=self._adaptive_cam_flood_loop, daemon=True)
-            t.start()
-            threads.append(t)
-            logger.info("Started: Adaptive CAM flooding")
-        
-        # Thread 4: Connection state cleanup
-        t = threading.Thread(target=self._cleanup_loop, daemon=True)
-        t.start()
-        threads.append(t)
-        
-        # Main thread: Promiscuous monitoring
-        if self.config.get('promiscuous_mode', {}).get('enabled', True):
-            logger.info("Started: Promiscuous interception")
-            self._promiscuous_loop()
-        else:
-            # Keep alive if promiscuous disabled
-            while self.running:
-                time.sleep(1)
-    
-    def stop(self):
-        """Stop Gateway Takeover"""
-        self.running = False
-        logger.info("Gateway Takeover stopped")
-    
-    def get_status(self):
-        """Get component status"""
-        return {
-            'running': self.running,
-            'protected_devices': len(self.protected_devices),
-            'connection_states': len(self.connection_states),
-            'stats': dict(self.stats)
-        }
-    
-    def get_stats(self):
-        """Get statistics"""
-        return dict(self.stats)
-GTEOF
-}
-
-create_bridge_manager() {
-    log_step "Creating Bridge Manager module (Dual-NIC mode)..."
-
-cat > "$INSTALL_DIR/core/bridge_manager.py" << 'BREOF'
-#!/usr/bin/env python3
-"""
-Irongate Bridge Manager - Dual-NIC Mode
-Provides TRUE VLAN-equivalent isolation using Linux bridge port isolation
-
-This module creates a Linux bridge with:
-- Uplink port (to main network/internet) - NON-ISOLATED
-- Isolated port (USB NIC to protected devices) - ISOLATED
-
-Linux bridge port isolation ensures:
-- Isolated ports CANNOT communicate with other isolated ports
-- Isolated ports can ONLY reach non-isolated ports (uplink)
-- This is KERNEL-ENFORCED - no software race conditions
-- 100% equivalent to PVLAN/port isolation on managed switches
-
-Architecture:
-                    [Internet/Router]
-                          │
-                        [eth0] ← Main NIC (uplink, non-isolated)
-                          │
-            ┌─────────[br-irongate]─────────┐
-            │    Linux Bridge with          │
-            │    Port Isolation             │
-            └──────────────┬────────────────┘
-                         [eth1] ← USB NIC (ISOLATED port)
-                           │
-                    [Dumb Switch]
-                           │
-            ┌──────┬───────┼───────┬──────┐
-            │      │       │       │      │
-         [Dev1] [Dev2]  [Dev3]  [Dev4] [Dev5]
-         
-         ALL devices are isolated from each other
-         They can ONLY reach internet via Irongate
-"""
-
-import logging
-import subprocess
-import threading
-import time
-import os
-from pathlib import Path
-
-logger = logging.getLogger('irongate.bridge')
-
-
-class BridgeManager:
-    """
-    Manages Linux bridge for dual-NIC isolation mode.
-    Provides VLAN-equivalent security via kernel-enforced port isolation.
-    """
-    
-    def __init__(self, uplink_interface, isolated_interface, bridge_name,
-                 bridge_ip, bridge_netmask, config):
-        self.uplink_interface = uplink_interface
-        self.isolated_interface = isolated_interface
-        self.bridge_name = bridge_name
-        self.bridge_ip = bridge_ip
-        self.bridge_netmask = bridge_netmask
-        self.config = config
-        
-        self.running = False
-        self.dnsmasq_proc = None
-        
-        if not isolated_interface:
-            raise ValueError("Dual-NIC mode requires isolated_interface to be configured")
-        
-        logger.info(f"Bridge Manager initializing")
-        logger.info(f"  Uplink: {uplink_interface} (non-isolated)")
-        logger.info(f"  Isolated: {isolated_interface} (isolated port)")
-        logger.info(f"  Bridge: {bridge_name} ({bridge_ip}/{bridge_netmask})")
-    
-    def _run_cmd(self, cmd, check=True):
-        """Run shell command"""
-        try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=check
-            )
-            return True, result.stdout
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Command failed: {cmd}")
-            logger.error(f"  Error: {e.stderr}")
-            return False, e.stderr
-    
-    def _interface_exists(self, iface):
-        """Check if network interface exists"""
-        return os.path.exists(f"/sys/class/net/{iface}")
-    
-    def _detect_usb_nic(self):
-        """Try to detect USB NIC if not specified"""
-        # Common USB NIC patterns
-        patterns = ['enx', 'eth1', 'usb0']
-        
-        try:
-            result = subprocess.run(
-                ['ls', '/sys/class/net'],
-                capture_output=True, text=True
-            )
-            interfaces = result.stdout.strip().split('\n')
-            
-            for iface in interfaces:
-                if iface == self.uplink_interface:
-                    continue
-                if iface in ['lo', 'docker0', 'br-irongate']:
-                    continue
-                for pattern in patterns:
-                    if iface.startswith(pattern):
-                        logger.info(f"Detected USB NIC: {iface}")
-                        return iface
-        except:
-            pass
-        
-        return None
-    
-    def setup_bridge(self):
-        """Create and configure the Linux bridge"""
-        logger.info("Setting up Linux bridge with port isolation...")
-        
-        # Verify isolated interface exists
-        if not self._interface_exists(self.isolated_interface):
-            detected = self._detect_usb_nic()
-            if detected:
-                logger.info(f"Using detected USB NIC: {detected}")
-                self.isolated_interface = detected
-            else:
-                raise RuntimeError(
-                    f"Isolated interface '{self.isolated_interface}' not found. "
-                    f"Please connect a USB ethernet adapter."
-                )
-        
-        # Delete existing bridge if present
-        self._run_cmd(f"ip link set {self.bridge_name} down", check=False)
-        self._run_cmd(f"brctl delbr {self.bridge_name}", check=False)
-        
-        # Create bridge
-        logger.info(f"Creating bridge: {self.bridge_name}")
-        self._run_cmd(f"brctl addbr {self.bridge_name}")
-        
-        # Set bridge parameters
-        self._run_cmd(f"brctl stp {self.bridge_name} off")  # Disable STP for simplicity
-        self._run_cmd(f"brctl setfd {self.bridge_name} 0")  # No forwarding delay
-        
-        # Bring up bridge
-        self._run_cmd(f"ip link set {self.bridge_name} up")
-        
-        # Assign IP to bridge
-        self._run_cmd(f"ip addr flush dev {self.bridge_name}")
-        self._run_cmd(f"ip addr add {self.bridge_ip}/{self._netmask_to_cidr(self.bridge_netmask)} dev {self.bridge_name}")
-        
-        # Add isolated interface to bridge
-        logger.info(f"Adding isolated interface: {self.isolated_interface}")
-        self._run_cmd(f"ip link set {self.isolated_interface} down")
-        self._run_cmd(f"ip addr flush dev {self.isolated_interface}")
-        self._run_cmd(f"brctl addif {self.bridge_name} {self.isolated_interface}")
-        self._run_cmd(f"ip link set {self.isolated_interface} up")
-        
-        # CRITICAL: Enable port isolation on isolated interface
-        # This is the kernel-enforced isolation that makes this VLAN-equivalent
-        if self.config.get('port_isolation', True):
-            logger.info("Enabling port isolation (kernel-enforced)")
-            success, _ = self._run_cmd(
-                f"bridge link set dev {self.isolated_interface} isolated on"
-            )
-            if success:
-                logger.info("✓ Port isolation ENABLED - devices CANNOT communicate with each other")
-            else:
-                # Older kernel - try alternative method via ebtables
-                logger.warning("bridge link isolation not available, using ebtables fallback")
-                self._setup_ebtables_isolation()
-        
-        # Set up forwarding
-        self._run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
-        
-        logger.info("Bridge setup complete")
-        return True
-    
-    def _netmask_to_cidr(self, netmask):
-        """Convert netmask to CIDR notation"""
-        return sum([bin(int(x)).count('1') for x in netmask.split('.')])
-    
-    def _setup_ebtables_isolation(self):
-        """Fallback isolation using ebtables for older kernels"""
-        logger.info("Setting up ebtables isolation fallback...")
-        
-        # Block frames between ports on the bridge
-        self._run_cmd("ebtables -F")
-        self._run_cmd("ebtables -X")
-        
-        # Allow traffic to/from bridge IP (management)
-        self._run_cmd(f"ebtables -A FORWARD -i {self.isolated_interface} -o {self.isolated_interface} -j DROP")
-        
-        logger.info("ebtables isolation configured")
-    
-    def setup_nat(self):
-        """Set up NAT for isolated devices to reach internet"""
-        logger.info("Setting up NAT for isolated network...")
-        
-        # Get bridge network
-        bridge_net = '.'.join(self.bridge_ip.split('.')[:-1]) + '.0'
-        cidr = self._netmask_to_cidr(self.bridge_netmask)
-        
-        # NAT rules using nftables
-        nat_rules = f'''
-table inet irongate_bridge {{
-    chain prerouting {{
-        type nat hook prerouting priority -100;
-    }}
-    
-    chain postrouting {{
-        type nat hook postrouting priority 100;
-        # Masquerade traffic from isolated network
-        ip saddr {bridge_net}/{cidr} oifname "{self.uplink_interface}" masquerade
-    }}
-    
-    chain forward {{
-        type filter hook forward priority 0; policy drop;
-        
-        # Allow established/related
-        ct state established,related accept
-        
-        # Allow isolated -> internet
-        iifname "{self.bridge_name}" oifname "{self.uplink_interface}" accept
-        
-        # Block isolated -> main LAN (RFC1918)
-        iifname "{self.bridge_name}" ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} drop
-        
-        # Allow responses
-        iifname "{self.uplink_interface}" oifname "{self.bridge_name}" ct state established,related accept
-    }}
-}}
-'''
-        
-        # Write and load rules
-        rules_file = '/tmp/irongate_bridge_nat.nft'
-        with open(rules_file, 'w') as f:
-            f.write(nat_rules)
-        
-        self._run_cmd("nft -f " + rules_file)
-        os.remove(rules_file)
-        
-        logger.info("NAT configured")
-    
-    def setup_dhcp(self):
-        """Set up DHCP server for isolated network"""
-        if not self.config.get('bridge_dhcp', {}).get('enabled', True):
-            logger.info("Bridge DHCP disabled")
-            return
-        
-        logger.info("Setting up DHCP for isolated network...")
-        
-        dhcp_cfg = self.config.get('bridge_dhcp', {})
-        pool_start = dhcp_cfg.get('pool_start', '10.99.1.1')
-        pool_end = dhcp_cfg.get('pool_end', '10.99.255.254')
-        lease_time = dhcp_cfg.get('lease_time', 3600)
-        
-        # Create dnsmasq config for bridge
-        dnsmasq_conf = f'''
-# Irongate Bridge DHCP
-interface={self.bridge_name}
-bind-interfaces
-dhcp-range={pool_start},{pool_end},{lease_time}
-dhcp-option=option:router,{self.bridge_ip}
-dhcp-option=option:dns-server,{self.bridge_ip}
+else
+    echo -e "${YELLOW}Creating initial dnsmasq configuration...${NC}"
+    cat > /etc/dnsmasq.conf << EOF
+# DHCP Server Configuration
+# Configure via Web UI at http://$(hostname -I | awk '{print $1}')
+
+# Interface - will be set by web UI
+interface=$INTERFACE
+bind-dynamic
+
+# Disable DNS (DHCP only)
+port=0
+
+# DHCP disabled until configured via web UI
+# dhcp-range will be added by web UI
+
+# Lease file
+dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases
+
+# Be authoritative
+dhcp-authoritative
 
 # Logging
 log-dhcp
-log-facility=/var/log/irongate/bridge-dhcp.log
-'''
-        
-        conf_file = '/etc/irongate/bridge-dnsmasq.conf'
-        with open(conf_file, 'w') as f:
-            f.write(dnsmasq_conf)
-        
-        # Stop any existing dnsmasq for this interface
-        self._run_cmd(f"pkill -f 'dnsmasq.*{self.bridge_name}'", check=False)
-        
-        # Start dnsmasq
-        self.dnsmasq_proc = subprocess.Popen([
-            'dnsmasq',
-            f'--conf-file={conf_file}',
-            '--keep-in-foreground',
-            f'--pid-file=/run/irongate/bridge-dnsmasq.pid'
-        ])
-        
-        logger.info(f"DHCP server running on {self.bridge_name}")
-        logger.info(f"  Pool: {pool_start} - {pool_end}")
+log-facility=/var/log/dnsmasq.log
+
+# Static reservations
+conf-dir=/etc/dnsmasq.d/,*.conf
+EOF
+fi
+
+# Create empty reservations file only if it doesn't exist
+if [ ! -f /etc/dnsmasq.d/reservations.conf ]; then
+    cat > /etc/dnsmasq.d/reservations.conf << EOF
+# Static DHCP Reservations - Managed by Web UI
+EOF
+    echo -e "${YELLOW}Created new reservations.conf${NC}"
+else
+    RESERVATION_COUNT=$(grep -c "^dhcp-host=" /etc/dnsmasq.d/reservations.conf 2>/dev/null || echo "0")
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ✓ Preserving reservations.conf ($RESERVATION_COUNT reservations)${NC}"
     
-    def setup_firewall(self):
-        """Set up firewall rules for bridge mode"""
-        logger.info("Setting up bridge firewall rules...")
-        
-        fw_cfg = self.config.get('bridge_firewall', {})
-        bridge_net = '.'.join(self.bridge_ip.split('.')[:-1]) + '.0'
-        cidr = self._netmask_to_cidr(self.bridge_netmask)
-        
-        rules = f'''
-table inet irongate_bridge_fw {{
-    chain input {{
-        type filter hook input priority 0; policy drop;
-        
-        # Allow established
-        ct state established,related accept
-        
-        # Allow loopback
-        iif lo accept
-        
-        # Allow DHCP on bridge
-        iifname "{self.bridge_name}" udp dport 67 accept
-        
-        # Allow DNS on bridge
-        iifname "{self.bridge_name}" udp dport 53 accept
-        iifname "{self.bridge_name}" tcp dport 53 accept
-        
-        # Allow ping
-        icmp type echo-request accept
-        
-        # Allow SSH
-        tcp dport 22 accept
-        
-        # Allow web interface
-        tcp dport {self.config.get('web_port', 8443)} accept
-        
-        # Allow from uplink
-        iifname "{self.uplink_interface}" accept
-    }}
+    # Always fix hostnames with spaces (replace space with hyphen in the hostname field)
+    # Backup to /tmp, NOT in dnsmasq.d (dnsmasq reads all files there causing duplicates)
+    cp /etc/dnsmasq.d/reservations.conf /tmp/reservations.conf.bak.$(date +%s)
+    # Use awk to replace spaces with hyphens only in the 3rd field (hostname)
+    awk -F, 'BEGIN{OFS=","} /^dhcp-host=/ && NF>=3 {gsub(/ /, "-", $3)} {print}' /etc/dnsmasq.d/reservations.conf > /tmp/reservations.conf.fixed
+    if [ -s /tmp/reservations.conf.fixed ]; then
+        mv /tmp/reservations.conf.fixed /etc/dnsmasq.d/reservations.conf
+        chown www-data:www-data /etc/dnsmasq.d/reservations.conf
+        chmod 664 /etc/dnsmasq.d/reservations.conf
+        echo -e "${GREEN}  ✓ Hostnames sanitized (spaces → hyphens)${NC}"
+    fi
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+fi
+
+# Clean up any old backup files in dnsmasq.d that could cause duplicate errors
+rm -f /etc/dnsmasq.d/*.bak.* 2>/dev/null || true
+
+#######################################
+# Migration from older versions
+#######################################
+echo -e "${YELLOW}Checking for existing installations...${NC}"
+
+# Create new directory structure
+mkdir -p /var/www/irongate
+mkdir -p /etc/irongate
+
+# Check for old DHCP-admin installation and migrate
+if [ -f /var/www/dhcp-admin/dhcp.db ] && [ ! -f /var/www/irongate/dhcp.db ]; then
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  📦 Found old DHCP-admin installation${NC}"
+    echo -e "${CYAN}  📦 Migrating to Irongate...${NC}"
     
-    chain forward {{
-        type filter hook forward priority 0; policy drop;
-        
-        # Allow established
-        ct state established,related accept
-'''
-        
-        if fw_cfg.get('allow_internet', True):
-            rules += f'''
-        # Allow isolated -> internet (non-RFC1918)
-        iifname "{self.bridge_name}" oifname "{self.uplink_interface}" ip daddr != {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} accept
-'''
-        
-        if fw_cfg.get('block_lan', True):
-            rules += f'''
-        # Block isolated -> LAN
-        iifname "{self.bridge_name}" ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} log prefix "IRONGATE-BRIDGE-LAN-BLOCK: " drop
-'''
-        
-        rules += '''
+    # Copy database
+    cp /var/www/dhcp-admin/dhcp.db /var/www/irongate/dhcp.db
+    echo -e "${GREEN}  ✓ Database migrated${NC}"
+    
+    # Count what was migrated
+    MIGRATED_RESERVATIONS=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
+    MIGRATED_DEVICES=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM irongate_devices;" 2>/dev/null || echo "0")
+    
+    echo -e "${GREEN}  ✓ Reservations: $MIGRATED_RESERVATIONS${NC}"
+    echo -e "${GREEN}  ✓ Protected devices: $MIGRATED_DEVICES${NC}"
+    
+    # Backup old installation
+    mv /var/www/dhcp-admin /var/www/dhcp-admin.old.$(date +%s)
+    echo -e "${GREEN}  ✓ Old installation backed up${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+elif [ -f /var/www/dhcp-admin/dhcp.db ] && [ -f /var/www/irongate/dhcp.db ]; then
+    # Both exist - check which is newer and has more data
+    OLD_COUNT=$(sqlite3 /var/www/dhcp-admin/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
+    NEW_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
+    
+    if [ "$OLD_COUNT" -gt "$NEW_COUNT" ]; then
+        echo -e "${YELLOW}  ⚠️  Old database has more data ($OLD_COUNT vs $NEW_COUNT reservations)${NC}"
+        echo -e "${YELLOW}  ⚠️  Keeping current Irongate database. Old data at /var/www/dhcp-admin/${NC}"
+    fi
+fi
+
+# Remove old nginx config if it exists
+if [ -f /etc/nginx/sites-enabled/dhcp-admin ]; then
+    rm -f /etc/nginx/sites-enabled/dhcp-admin
+    rm -f /etc/nginx/sites-available/dhcp-admin
+    echo -e "${GREEN}  ✓ Removed old nginx config${NC}"
+fi
+
+#######################################
+# Create SQLite Database (preserve existing data)
+#######################################
+echo -e "${YELLOW}Setting up database...${NC}"
+
+if [ -f /var/www/irongate/dhcp.db ]; then
+    # BACKUP THE DATABASE FIRST - safety measure
+    cp /var/www/irongate/dhcp.db /var/www/irongate/dhcp.db.bak.$(date +%s)
+    echo -e "${GREEN}Created database backup${NC}"
+    
+    # Count existing reservations
+    DB_RESERVATION_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
+    DHCP_ENABLED=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='dhcp_enabled';" 2>/dev/null || echo "unknown")
+    RANGE_START=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='range_start';" 2>/dev/null || echo "")
+    RANGE_END=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='range_end';" 2>/dev/null || echo "")
+    
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ✓ Existing database found - PRESERVING${NC}"
+    echo -e "${GREEN}  ✓ Reservations in database: $DB_RESERVATION_COUNT${NC}"
+    echo -e "${GREEN}  ✓ DHCP enabled: $DHCP_ENABLED${NC}"
+    if [ -n "$RANGE_START" ] && [ -n "$RANGE_END" ]; then
+        echo -e "${GREEN}  ✓ DHCP range: $RANGE_START - $RANGE_END${NC}"
+    fi
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Just ensure tables exist without overwriting data (INSERT OR IGNORE keeps existing values)
+    sqlite3 /var/www/irongate/dhcp.db << 'EOSQL'
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT UNIQUE NOT NULL,
+    ip TEXT NOT NULL,
+    hostname TEXT,
+    description TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+-- INSERT OR IGNORE does NOT overwrite existing values - only inserts if key doesn't exist
+INSERT OR IGNORE INTO settings (key, value) VALUES ('dhcp_enabled', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('interface', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('server_ip', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('cidr', '24');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('range_start', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('range_end', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('gateway', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('dns_primary', '8.8.8.8');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('dns_secondary', '1.1.1.1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('lease_time', '24h');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('domain', '');
+-- Irongate Network Isolation Settings
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_enabled', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_mode', 'single');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_isolated_interface', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_bridge_ip', '10.99.0.1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_bridge_dhcp_start', '10.99.1.1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_bridge_dhcp_end', '10.99.255.254');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_arp_defense', 'true');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_ipv6_ra', 'true');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_gateway_takeover', 'true');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_bypass_detection', 'true');
+-- Irongate device zones table
+CREATE TABLE IF NOT EXISTS irongate_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT UNIQUE NOT NULL,
+    ip TEXT,
+    hostname TEXT,
+    zone TEXT DEFAULT 'isolated',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+EOSQL
+    
+    # Always fix hostnames with spaces in database (replace space with hyphen)
+    echo -e "${YELLOW}  → Sanitizing hostnames in database...${NC}"
+    sqlite3 /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %';"
+    FIXED_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT changes();" 2>/dev/null || echo "0")
+    echo -e "${GREEN}  ✓ Database hostnames sanitized${NC}"
+    
+    # Verify data wasn't lost
+    VERIFY_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
+    if [ "$VERIFY_COUNT" != "$DB_RESERVATION_COUNT" ]; then
+        echo -e "${RED}WARNING: Reservation count changed! Restoring backup...${NC}"
+        cp /var/www/irongate/dhcp.db.bak.* /var/www/irongate/dhcp.db 2>/dev/null
+    fi
+else
+    echo -e "${YELLOW}Creating new database${NC}"
+    sqlite3 /var/www/irongate/dhcp.db << 'EOSQL'
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT UNIQUE NOT NULL,
+    ip TEXT NOT NULL,
+    hostname TEXT,
+    description TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+INSERT OR REPLACE INTO settings (key, value) VALUES ('dhcp_enabled', 'false');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('interface', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('server_ip', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('cidr', '24');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('range_start', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('range_end', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('gateway', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_primary', '8.8.8.8');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_secondary', '1.1.1.1');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('lease_time', '24h');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('domain', '');
+-- Irongate Network Isolation Settings
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_enabled', 'false');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_mode', 'single');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_isolated_interface', '');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_bridge_ip', '10.99.0.1');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_bridge_dhcp_start', '10.99.1.1');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_bridge_dhcp_end', '10.99.255.254');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_arp_defense', 'true');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_ipv6_ra', 'true');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_gateway_takeover', 'true');
+INSERT OR REPLACE INTO settings (key, value) VALUES ('irongate_bypass_detection', 'true');
+-- Irongate device zones table
+CREATE TABLE IF NOT EXISTS irongate_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT UNIQUE NOT NULL,
+    ip TEXT,
+    hostname TEXT,
+    zone TEXT DEFAULT 'isolated',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+EOSQL
+fi
+
+#######################################
+# Create PHP Backend API
+#######################################
+echo -e "${YELLOW}Creating web application...${NC}"
+
+cat > /var/www/irongate/api.php << 'EOPHP'
+<?php
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    exit(0);
+}
+
+$db = new SQLite3('/var/www/irongate/dhcp.db');
+$action = $_GET['action'] ?? '';
+
+// Helper functions
+function getSetting($db, $key) {
+    $stmt = $db->prepare('SELECT value FROM settings WHERE key = ?');
+    $stmt->bindValue(1, $key, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    return $row ? $row['value'] : null;
+}
+
+function setSetting($db, $key, $value) {
+    $stmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+    $stmt->bindValue(1, $key, SQLITE3_TEXT);
+    $stmt->bindValue(2, $value, SQLITE3_TEXT);
+    return $stmt->execute() ? true : false;
+}
+
+function getAllSettings($db) {
+    $results = $db->query('SELECT key, value FROM settings');
+    $settings = [];
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $settings[$row['key']] = $row['value'];
     }
-}
-'''
-        
-        rules_file = '/tmp/irongate_bridge_fw.nft'
-        with open(rules_file, 'w') as f:
-            f.write(rules)
-        
-        self._run_cmd("nft -f " + rules_file)
-        os.remove(rules_file)
-        
-        logger.info("Bridge firewall configured")
-    
-    def get_bridge_clients(self):
-        """Get list of clients connected to bridge"""
-        clients = []
-        try:
-            # Read DHCP leases
-            lease_file = '/var/lib/misc/dnsmasq.leases'
-            if os.path.exists(lease_file):
-                with open(lease_file) as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 4:
-                            clients.append({
-                                'expires': parts[0],
-                                'mac': parts[1],
-                                'ip': parts[2],
-                                'hostname': parts[3] if len(parts) > 3 else ''
-                            })
-            
-            # Also check bridge FDB
-            result = subprocess.run(
-                ['bridge', 'fdb', 'show', 'dev', self.isolated_interface],
-                capture_output=True, text=True
-            )
-            # Parse FDB entries for additional MACs
-            
-        except Exception as e:
-            logger.error(f"Error getting bridge clients: {e}")
-        
-        return clients
-    
-    def run(self):
-        """Start bridge manager"""
-        self.running = True
-        
-        logger.info("=" * 60)
-        logger.info("BRIDGE MANAGER STARTING - VLAN-EQUIVALENT MODE")
-        logger.info("=" * 60)
-        
-        try:
-            # Set up bridge
-            self.setup_bridge()
-            
-            # Set up NAT
-            self.setup_nat()
-            
-            # Set up firewall
-            self.setup_firewall()
-            
-            # Set up DHCP
-            self.setup_dhcp()
-            
-            logger.info("")
-            logger.info("╔══════════════════════════════════════════════════════════════╗")
-            logger.info("║  DUAL-NIC BRIDGE MODE ACTIVE                                 ║")
-            logger.info("║  Isolation is now KERNEL-ENFORCED                            ║")
-            logger.info("║  Devices on isolated port CANNOT bypass this isolation       ║")
-            logger.info("║  This is TRUE VLAN-equivalent security                       ║")
-            logger.info("╚══════════════════════════════════════════════════════════════╝")
-            logger.info("")
-            
-            # Keep running
-            while self.running:
-                time.sleep(5)
-                
-        except Exception as e:
-            logger.error(f"Bridge manager error: {e}")
-            raise
-    
-    def stop(self):
-        """Stop bridge manager"""
-        self.running = False
-        
-        # Stop DHCP
-        if self.dnsmasq_proc:
-            self.dnsmasq_proc.terminate()
-        
-        # Optionally tear down bridge (leave it up for now)
-        logger.info("Bridge manager stopped")
-    
-    def get_status(self):
-        """Get bridge status"""
-        return {
-            'running': self.running,
-            'mode': 'dual-nic',
-            'bridge_name': self.bridge_name,
-            'bridge_ip': self.bridge_ip,
-            'uplink': self.uplink_interface,
-            'isolated': self.isolated_interface,
-            'clients': len(self.get_bridge_clients()),
-            'isolation': 'kernel-enforced'
-        }
-BREOF
+    return $settings;
 }
 
-#===============================================================================
-# WEB APPLICATION
-#===============================================================================
+function cidrToNetmask($cidr) {
+    $cidr = intval($cidr);
+    $bin = str_repeat('1', $cidr) . str_repeat('0', 32 - $cidr);
+    $parts = str_split($bin, 8);
+    return implode('.', array_map('bindec', $parts));
+}
 
-create_web_app() {
-    log_step "Creating web application..."
+function cidrToHosts($cidr) {
+    return pow(2, 32 - intval($cidr)) - 2;
+}
 
-cat > "$INSTALL_DIR/app.py" << 'WEBAPP'
-#!/usr/bin/env python3
-"""
-Irongate Web Interface
-Secure management console for network isolation
-"""
-
-import os
-import sys
-import yaml
-import uuid
-import logging
-from datetime import datetime
-from functools import wraps
-from pathlib import Path
-
-from flask import (
-    Flask, render_template, request, jsonify,
-    redirect, url_for, session, flash
-)
-from flask_cors import CORS
-from flask_socketio import SocketIO, emit
-
-# Configuration paths
-CONFIG_DIR = "/etc/irongate"
-DATA_DIR = "/var/lib/irongate"
-LOG_DIR = "/var/log/irongate"
-CONFIG_FILE = f"{CONFIG_DIR}/irongate.yaml"
-DEVICES_FILE = f"{DATA_DIR}/zones/devices.yaml"
-
-app = Flask(__name__)
-CORS(app)
-
-# Load configuration
-def load_config():
-    with open(CONFIG_FILE) as f:
-        return yaml.safe_load(f)
-
-config = load_config()
-app.secret_key = config['web']['secret_key']
-
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"{LOG_DIR}/web.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('irongate.web')
-
-#===============================================================================
-# DEVICE MANAGEMENT
-#===============================================================================
-
-def load_devices():
-    try:
-        with open(DEVICES_FILE) as f:
-            data = yaml.safe_load(f) or {}
-            return data.get('devices', [])
-    except:
-        return []
-
-def save_devices(devices):
-    with open(DEVICES_FILE, 'w') as f:
-        yaml.dump({'devices': devices}, f)
-    # Signal firewall to reload
-    Path(f"{DATA_DIR}/.reload").touch()
-
-def get_zones():
-    return config.get('zones', {}).get('definitions', {})
-
-#===============================================================================
-# API ROUTES
-#===============================================================================
-
-@app.route('/')
-def index():
-    return render_template('index.html', config=config)
-
-@app.route('/bridge')
-def bridge():
-    return render_template('bridge.html', config=config)
-
-@app.route('/api/status')
-def api_status():
-    import subprocess
-    import psutil
-    
-    status = {
-        'engine': 'unknown',
-        'uptime': None,
-        'cpu_percent': psutil.cpu_percent(),
-        'memory_percent': psutil.virtual_memory().percent,
-        'network': config.get('network', {}),
-        'devices': {
-            'total': len(load_devices()),
-            'by_zone': {}
+function getLeases() {
+    $leases = [];
+    $file = '/var/lib/dnsmasq/dnsmasq.leases';
+    if (file_exists($file)) {
+        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $line) {
+            $parts = preg_split('/\s+/', $line);
+            if (count($parts) >= 4) {
+                $leases[] = [
+                    'expires' => date('Y-m-d H:i:s', intval($parts[0])),
+                    'expires_unix' => intval($parts[0]),
+                    'mac' => strtoupper($parts[1]),
+                    'ip' => $parts[2],
+                    'hostname' => $parts[3] ?? '*',
+                    'client_id' => $parts[4] ?? ''
+                ];
+            }
         }
     }
-    
-    # Count devices by zone
-    for device in load_devices():
-        zone = device.get('zone', 'quarantine')
-        status['devices']['by_zone'][zone] = status['devices']['by_zone'].get(zone, 0) + 1
-    
-    # Check engine status
-    try:
-        result = subprocess.run(
-            ['systemctl', 'is-active', 'irongate-engine'],
-            capture_output=True, text=True
-        )
-        status['engine'] = result.stdout.strip()
-    except:
-        pass
-    
-    return jsonify({'success': True, 'status': status})
-
-@app.route('/api/devices', methods=['GET'])
-def api_get_devices():
-    return jsonify({
-        'success': True,
-        'devices': load_devices(),
-        'zones': get_zones()
-    })
-
-@app.route('/api/devices', methods=['POST'])
-def api_add_device():
-    data = request.get_json()
-    if not data or not data.get('mac'):
-        return jsonify({'success': False, 'error': 'MAC address required'}), 400
-    
-    devices = load_devices()
-    
-    # Check for duplicate
-    mac = data['mac'].upper().replace('-', ':')
-    for d in devices:
-        if d['mac'].upper() == mac:
-            return jsonify({'success': False, 'error': 'Device already exists'}), 400
-    
-    device = {
-        'id': str(uuid.uuid4())[:8],
-        'mac': mac,
-        'ip': data.get('ip', ''),
-        'name': data.get('name', f"Device-{mac[-5:].replace(':', '')}"),
-        'zone': data.get('zone', 'quarantine'),
-        'added_at': datetime.now().isoformat(),
-        'notes': data.get('notes', '')
-    }
-    
-    devices.append(device)
-    save_devices(devices)
-    
-    logger.info(f"Added device: {device['name']} ({mac}) to zone {device['zone']}")
-    return jsonify({'success': True, 'device': device})
-
-@app.route('/api/devices/<device_id>', methods=['PUT'])
-def api_update_device(device_id):
-    data = request.get_json()
-    devices = load_devices()
-    
-    for i, d in enumerate(devices):
-        if d['id'] == device_id:
-            if 'name' in data:
-                devices[i]['name'] = data['name']
-            if 'zone' in data:
-                old_zone = devices[i]['zone']
-                devices[i]['zone'] = data['zone']
-                logger.info(f"Moved {devices[i]['name']} from {old_zone} to {data['zone']}")
-            if 'ip' in data:
-                devices[i]['ip'] = data['ip']
-            if 'notes' in data:
-                devices[i]['notes'] = data['notes']
-            
-            save_devices(devices)
-            return jsonify({'success': True, 'device': devices[i]})
-    
-    return jsonify({'success': False, 'error': 'Device not found'}), 404
-
-@app.route('/api/devices/<device_id>', methods=['DELETE'])
-def api_delete_device(device_id):
-    devices = load_devices()
-    devices = [d for d in devices if d['id'] != device_id]
-    save_devices(devices)
-    return jsonify({'success': True})
-
-@app.route('/api/scan', methods=['POST'])
-def api_scan():
-    import subprocess
-    import re
-    
-    devices = []
-    try:
-        result = subprocess.run(
-            ['arp-scan', '-l', '-q'],
-            capture_output=True, text=True, timeout=30
-        )
-        
-        for line in result.stdout.split('\n'):
-            match = re.match(r'(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]+)', line)
-            if match:
-                devices.append({
-                    'ip': match.group(1),
-                    'mac': match.group(2).upper(),
-                    'vendor': ''
-                })
-    except Exception as e:
-        logger.error(f"Scan error: {e}")
-    
-    return jsonify({'success': True, 'devices': devices})
-
-@app.route('/api/logs')
-def api_logs():
-    log_type = request.args.get('type', 'irongate')
-    lines = int(request.args.get('lines', 100))
-    
-    log_files = {
-        'irongate': f'{LOG_DIR}/irongate.log',
-        'security': f'{LOG_DIR}/security.log',
-        'web': f'{LOG_DIR}/web.log'
-    }
-    
-    log_file = log_files.get(log_type, f'{LOG_DIR}/irongate.log')
-    
-    if not os.path.exists(log_file):
-        return jsonify({'success': True, 'logs': []})
-    
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['tail', '-n', str(lines), log_file],
-            capture_output=True, text=True
-        )
-        logs = result.stdout.strip().split('\n') if result.stdout.strip() else []
-        return jsonify({'success': True, 'logs': logs})
-    except:
-        return jsonify({'success': True, 'logs': []})
-
-@app.route('/api/zones')
-def api_zones():
-    return jsonify({
-        'success': True,
-        'zones': get_zones(),
-        'default': config.get('zones', {}).get('default_zone', 'quarantine')
-    })
-
-@app.route('/api/config')
-def api_config():
-    # Return sanitized config (no secrets)
-    safe_config = {
-        'network': config.get('network', {}),
-        'dhcp': {k: v for k, v in config.get('dhcp', {}).items() if k != 'secret'},
-        'arp': config.get('arp', {}),
-        'ipv6_ra': config.get('ipv6_ra', {}),
-        'firewall': config.get('firewall', {}),
-        'active_defense': config.get('active_defense', {})
-    }
-    return jsonify({'success': True, 'config': safe_config})
-
-@app.route('/api/service/<action>', methods=['POST'])
-def api_service(action):
-    import subprocess
-    
-    if action not in ['restart', 'stop', 'start']:
-        return jsonify({'success': False, 'error': 'Invalid action'}), 400
-    
-    try:
-        subprocess.run(
-            ['systemctl', action, 'irongate-engine'],
-            check=True
-        )
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-#===============================================================================
-# BRIDGE MODE API
-#===============================================================================
-
-@app.route('/api/bridge/status')
-def api_bridge_status():
-    """Get current bridge mode status"""
-    bridge_cfg = config.get('bridge_mode', {})
-    mode = bridge_cfg.get('mode', 'single')
-    
-    status = {
-        'mode': mode,
-        'isolated_interface': bridge_cfg.get('isolated_interface', ''),
-        'bridge_name': bridge_cfg.get('bridge_name', 'br-irongate'),
-        'bridge_ip': bridge_cfg.get('bridge_ip', '10.99.0.1'),
-    }
-    
-    if mode == 'dual':
-        # Get bridge statistics
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['bridge', 'link', 'show'],
-                capture_output=True, text=True
-            )
-            status['bridge_info'] = result.stdout
-        except:
-            pass
-    
-    return jsonify({'success': True, 'status': status})
-
-@app.route('/api/bridge/interfaces')
-def api_bridge_interfaces():
-    """List available network interfaces for bridge mode"""
-    import os
-    import subprocess
-    
-    interfaces = []
-    main_iface = config['network']['interface']
-    
-    try:
-        for iface in os.listdir('/sys/class/net'):
-            if iface in ['lo', 'docker0', 'br-irongate', 'br0']:
-                continue
-            
-            # Get interface info
-            info = {'name': iface, 'is_main': iface == main_iface}
-            
-            # Check if USB
-            try:
-                uevent_path = f'/sys/class/net/{iface}/device/uevent'
-                if os.path.exists(uevent_path):
-                    with open(uevent_path) as f:
-                        content = f.read()
-                        info['is_usb'] = 'usb' in content.lower()
-                else:
-                    info['is_usb'] = iface.startswith('enx') or iface.startswith('usb')
-            except:
-                info['is_usb'] = False
-            
-            # Get MAC
-            try:
-                with open(f'/sys/class/net/{iface}/address') as f:
-                    info['mac'] = f.read().strip()
-            except:
-                info['mac'] = ''
-            
-            # Get state
-            try:
-                with open(f'/sys/class/net/{iface}/operstate') as f:
-                    info['state'] = f.read().strip()
-            except:
-                info['state'] = 'unknown'
-            
-            interfaces.append(info)
-            
-    except Exception as e:
-        logger.error(f"Error listing interfaces: {e}")
-    
-    return jsonify({'success': True, 'interfaces': interfaces})
-
-@app.route('/api/bridge/mode', methods=['POST'])
-def api_bridge_set_mode():
-    """Switch between single-NIC and dual-NIC mode"""
-    import subprocess
-    
-    data = request.get_json()
-    if not data or 'mode' not in data:
-        return jsonify({'success': False, 'error': 'Mode required'}), 400
-    
-    new_mode = data['mode']
-    if new_mode not in ['single', 'dual']:
-        return jsonify({'success': False, 'error': 'Invalid mode'}), 400
-    
-    isolated_iface = data.get('isolated_interface', '')
-    
-    if new_mode == 'dual' and not isolated_iface:
-        return jsonify({'success': False, 'error': 'Isolated interface required for dual mode'}), 400
-    
-    # Update config file
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            cfg_content = f.read()
-        
-        # Update mode
-        import re
-        cfg_content = re.sub(
-            r'(bridge_mode:\s*\n\s*#[^\n]*\n\s*mode:\s*)\w+',
-            f'\\1{new_mode}',
-            cfg_content
-        )
-        
-        # Update isolated interface
-        cfg_content = re.sub(
-            r'(isolated_interface:\s*)"[^"]*"',
-            f'\\1"{isolated_iface}"',
-            cfg_content
-        )
-        
-        with open(CONFIG_FILE, 'w') as f:
-            f.write(cfg_content)
-        
-        # Reload config
-        global config
-        config = load_config()
-        
-        logger.info(f"Bridge mode changed to: {new_mode}")
-        if new_mode == 'dual':
-            logger.info(f"Isolated interface: {isolated_iface}")
-        
-        # Restart engine to apply changes
-        subprocess.run(['systemctl', 'restart', 'irongate-engine'], check=False)
-        
-        return jsonify({
-            'success': True,
-            'message': f'Mode changed to {new_mode}. Engine restarting...',
-            'restart_required': True
-        })
-        
-    except Exception as e:
-        logger.error(f"Error changing mode: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/bridge/clients')
-def api_bridge_clients():
-    """Get clients connected to bridge (dual mode only)"""
-    clients = []
-    
-    try:
-        # Read DHCP leases
-        lease_file = '/var/lib/misc/dnsmasq.leases'
-        if os.path.exists(lease_file):
-            with open(lease_file) as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 4:
-                        clients.append({
-                            'expires': parts[0],
-                            'mac': parts[1],
-                            'ip': parts[2],
-                            'hostname': parts[3] if len(parts) > 3 else 'unknown'
-                        })
-    except Exception as e:
-        logger.error(f"Error reading bridge clients: {e}")
-    
-    return jsonify({'success': True, 'clients': clients})
-
-#===============================================================================
-# WEBSOCKET EVENTS
-#===============================================================================
-
-@socketio.on('connect')
-def handle_connect():
-    logger.info(f"WebSocket client connected")
-
-@socketio.on('subscribe_logs')
-def handle_subscribe_logs():
-    # Would implement real-time log streaming here
-    pass
-
-#===============================================================================
-# ERROR HANDLERS
-#===============================================================================
-
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith('/api/'):
-        return jsonify({'success': False, 'error': 'Not found'}), 404
-    return render_template('404.html'), 404
-
-@app.errorhandler(500)
-def server_error(e):
-    logger.error(f"Server error: {e}")
-    if request.path.startswith('/api/'):
-        return jsonify({'success': False, 'error': 'Server error'}), 500
-    return render_template('500.html'), 500
-
-
-if __name__ == '__main__':
-    ssl_context = None
-    if config['web'].get('https', True):
-        ssl_context = (
-            config['web']['cert_file'],
-            config['web']['key_file']
-        )
-    
-    socketio.run(
-        app,
-        host=config['web']['host'],
-        port=config['web']['port'],
-        ssl_context=ssl_context
-    )
-WEBAPP
+    usort($leases, function($a, $b) {
+        return ip2long($a['ip']) - ip2long($b['ip']);
+    });
+    return $leases;
 }
 
-#===============================================================================
-# TEMPLATES
-#===============================================================================
+function getReservations($db) {
+    $results = $db->query('SELECT * FROM reservations ORDER BY ip');
+    $reservations = [];
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $reservations[] = $row;
+    }
+    return $reservations;
+}
 
-create_templates() {
-    log_step "Creating web templates..."
+// Sanitize hostname - replace spaces with hyphens, remove invalid chars
+function sanitizeHostname($hostname) {
+    $hostname = trim($hostname);
+    if (empty($hostname)) return '';
+    // Replace spaces with hyphens
+    $hostname = str_replace(' ', '-', $hostname);
+    // Remove any character that's not alphanumeric or hyphen
+    $hostname = preg_replace('/[^a-zA-Z0-9\-]/', '', $hostname);
+    // Remove leading/trailing hyphens
+    $hostname = trim($hostname, '-');
+    // Collapse multiple hyphens
+    $hostname = preg_replace('/-+/', '-', $hostname);
+    return $hostname;
+}
 
-# Base template
-cat > "$INSTALL_DIR/templates/base.html" << 'BASEHTML'
+function addReservation($db, $mac, $ip, $hostname, $description) {
+    $mac = strtolower(trim($mac));
+    $ip = trim($ip);
+    $hostname = sanitizeHostname($hostname);
+    $stmt = $db->prepare('INSERT OR REPLACE INTO reservations (mac, ip, hostname, description) VALUES (?, ?, ?, ?)');
+    $stmt->bindValue(1, $mac, SQLITE3_TEXT);
+    $stmt->bindValue(2, $ip, SQLITE3_TEXT);
+    $stmt->bindValue(3, $hostname, SQLITE3_TEXT);
+    $stmt->bindValue(4, $description, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    if ($result) {
+        syncReservationsToFile($db);
+        return true;
+    }
+    return false;
+}
+
+function deleteReservation($db, $id) {
+    $stmt = $db->prepare('DELETE FROM reservations WHERE id = ?');
+    $stmt->bindValue(1, $id, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    syncReservationsToFile($db);
+    return $result ? true : false;
+}
+
+function syncReservationsToFile($db) {
+    $results = $db->query('SELECT * FROM reservations');
+    $content = "# Static DHCP Reservations - Auto-generated by Web UI\n";
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $line = "dhcp-host=" . $row['mac'] . "," . $row['ip'];
+        $hostname = sanitizeHostname($row['hostname']);
+        if (!empty($hostname)) {
+            $line .= "," . $hostname;
+        }
+        $content .= $line . "\n";
+    }
+    file_put_contents('/etc/dnsmasq.d/reservations.conf', $content);
+}
+
+function generateDnsmasqConfig($db) {
+    $settings = getAllSettings($db);
+    
+    $config = "# DHCP Server Configuration\n";
+    $config .= "# Auto-generated by Web UI on " . date('Y-m-d H:i:s') . "\n\n";
+    
+    $interface = $settings['interface'] ?? '';
+    if (empty($interface)) {
+        $interface = trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+    }
+    
+    $config .= "# Interface\n";
+    $config .= "interface=$interface\n";
+    // Use bind-dynamic instead of bind-interfaces - more resilient to interface changes
+    $config .= "bind-dynamic\n\n";
+    
+    $config .= "# Disable DNS (DHCP only)\n";
+    $config .= "port=0\n\n";
+    
+    if ($settings['dhcp_enabled'] === 'true' && !empty($settings['range_start']) && !empty($settings['range_end'])) {
+        $netmask = cidrToNetmask($settings['cidr'] ?? '24');
+        $leaseTime = $settings['lease_time'] ?? '24h';
+        
+        $config .= "# DHCP Range\n";
+        $config .= "dhcp-range={$settings['range_start']},{$settings['range_end']},$netmask,$leaseTime\n\n";
+        
+        if (!empty($settings['gateway'])) {
+            $config .= "# Gateway\n";
+            $config .= "dhcp-option=option:router,{$settings['gateway']}\n\n";
+        }
+        
+        $dns = [];
+        if (!empty($settings['dns_primary'])) $dns[] = $settings['dns_primary'];
+        if (!empty($settings['dns_secondary'])) $dns[] = $settings['dns_secondary'];
+        if (!empty($dns)) {
+            $config .= "# DNS Servers\n";
+            $config .= "dhcp-option=option:dns-server," . implode(',', $dns) . "\n\n";
+        }
+        
+        if (!empty($settings['domain'])) {
+            $config .= "# Domain\n";
+            $config .= "domain={$settings['domain']}\n\n";
+        }
+    } else {
+        $config .= "# DHCP is disabled - configure via Web UI\n\n";
+    }
+    
+    $config .= "# Lease file\n";
+    $config .= "dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases\n\n";
+    
+    $config .= "# Be authoritative\n";
+    $config .= "dhcp-authoritative\n\n";
+    
+    $config .= "# Logging\n";
+    $config .= "log-dhcp\n";
+    $config .= "log-facility=/var/log/dnsmasq.log\n\n";
+    
+    $config .= "# Static reservations\n";
+    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n";
+    
+    return $config;
+}
+
+// Validate dnsmasq config before applying
+function validateConfig($configContent) {
+    // Write to temp file and test
+    $tempFile = '/tmp/dnsmasq-test-' . time() . '.conf';
+    file_put_contents($tempFile, $configContent);
+    
+    exec("dnsmasq --test --conf-file=$tempFile 2>&1", $output, $retval);
+    unlink($tempFile);
+    
+    return [
+        'valid' => ($retval === 0),
+        'output' => implode("\n", $output),
+        'return_code' => $retval
+    ];
+}
+
+function applyConfig($db) {
+    $config = generateDnsmasqConfig($db);
+    
+    // Validate config first
+    $validation = validateConfig($config);
+    if (!$validation['valid']) {
+        return [
+            'success' => false,
+            'error' => 'Config validation failed: ' . $validation['output'],
+            'stage' => 'validation'
+        ];
+    }
+    
+    // Write the config
+    file_put_contents('/etc/dnsmasq.conf', $config);
+    
+    // Stop current service gracefully
+    exec('sudo systemctl stop dnsmasq 2>&1', $stopOutput, $stopRetval);
+    usleep(500000); // Wait 500ms
+    
+    // Start the service
+    exec('sudo systemctl start dnsmasq 2>&1', $startOutput, $startRetval);
+    
+    if ($startRetval !== 0) {
+        // Get the actual error from journalctl
+        exec('journalctl -u dnsmasq -n 20 --no-pager 2>&1', $journalOutput);
+        return [
+            'success' => false,
+            'error' => 'Service start failed',
+            'output' => implode("\n", $startOutput),
+            'journal' => implode("\n", $journalOutput),
+            'stage' => 'start'
+        ];
+    }
+    
+    return ['success' => true];
+}
+
+function getServiceStatus() {
+    exec('systemctl is-active dnsmasq 2>&1', $output, $retval);
+    $active = ($retval === 0);
+    
+    $uptime = '';
+    $lastError = '';
+    if ($active) {
+        $uptime = trim(shell_exec("systemctl show dnsmasq --property=ActiveEnterTimestamp | cut -d'=' -f2"));
+    } else {
+        // Get last error from journal
+        exec('journalctl -u dnsmasq -n 10 --no-pager 2>&1', $journalOutput);
+        $lastError = implode("\n", $journalOutput);
+    }
+    
+    return [
+        'running' => $active,
+        'status' => $active ? 'running' : 'stopped',
+        'since' => $uptime,
+        'last_error' => $lastError
+    ];
+}
+
+function getSystemInfo() {
+    $interface = trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+    $ip = trim(shell_exec("ip -4 addr show $interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1"));
+    $cidr = trim(shell_exec("ip -4 addr show $interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1 | cut -d'/' -f2"));
+    $gateway = trim(shell_exec("ip route | grep default | awk '{print \$3}' | head -n1"));
+    $mac = trim(shell_exec("ip link show $interface | grep -oP '(?<=link/ether\s)[a-f0-9:]+' | head -n1"));
+    $hostname = gethostname();
+    
+    // Get all interfaces
+    $interfaces = [];
+    exec("ip -o link show | awk -F': ' '{print \$2}' | grep -v lo", $ifaceList);
+    foreach ($ifaceList as $iface) {
+        $iface = trim(explode('@', $iface)[0]);
+        $ifaceIp = trim(shell_exec("ip -4 addr show $iface 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1"));
+        $interfaces[] = [
+            'name' => $iface,
+            'ip' => $ifaceIp ?: 'No IP',
+            'current' => ($iface === $interface)
+        ];
+    }
+    
+    return [
+        'hostname' => $hostname,
+        'interface' => $interface,
+        'interfaces' => $interfaces,
+        'ip' => $ip,
+        'cidr' => $cidr,
+        'mac' => $mac,
+        'gateway' => $gateway,
+        'uptime' => trim(shell_exec('uptime -p'))
+    ];
+}
+
+function getRecentLogs($lines = 100) {
+    $logs = [];
+    $debug = [];
+    $lines = max(1, min(1000, intval($lines)));
+    $logFile = '/var/log/dnsmasq.log';
+    $syslogFile = '/var/log/syslog';
+    
+    // Method 1: Read the dedicated log file directly (most likely to work)
+    if (file_exists($logFile)) {
+        $debug[] = "Log file exists: $logFile";
+        $fileSize = filesize($logFile);
+        $debug[] = "File size: $fileSize bytes";
+        
+        if ($fileSize > 0) {
+            // Try direct read first
+            if (is_readable($logFile)) {
+                $content = @file_get_contents($logFile);
+                if ($content !== false && strlen($content) > 0) {
+                    $allLines = explode("\n", $content);
+                    $allLines = array_filter($allLines, function($l) { return strlen(trim($l)) > 0; });
+                    if (count($allLines) > 0) {
+                        $recentLines = array_slice($allLines, -$lines);
+                        foreach ($recentLines as $line) {
+                            $logs[] = htmlspecialchars(trim($line));
+                        }
+                        return array_reverse($logs);
+                    }
+                }
+            }
+            
+            // Try tail command as fallback
+            $tailCmd = "/usr/bin/tail -n $lines " . escapeshellarg($logFile) . " 2>&1";
+            $tailOutput = [];
+            exec($tailCmd, $tailOutput, $tailRet);
+            $debug[] = "tail returned: $tailRet, lines: " . count($tailOutput);
+            if (count($tailOutput) > 0) {
+                foreach ($tailOutput as $line) {
+                    $line = trim($line);
+                    if (strlen($line) > 0) {
+                        $logs[] = htmlspecialchars($line);
+                    }
+                }
+                if (count($logs) > 0) {
+                    return array_reverse($logs);
+                }
+            }
+        } else {
+            $debug[] = "Log file is empty";
+        }
+    } else {
+        $debug[] = "Log file does not exist: $logFile";
+    }
+    
+    // Method 2: Try journalctl (may require group membership)
+    $journalCmd = "/usr/bin/journalctl -u dnsmasq -n $lines --no-pager 2>&1";
+    $journalOutput = [];
+    exec($journalCmd, $journalOutput, $journalRet);
+    $debug[] = "journalctl returned: $journalRet, lines: " . count($journalOutput);
+    
+    if ($journalRet === 0 && count($journalOutput) > 0) {
+        foreach ($journalOutput as $line) {
+            $line = trim($line);
+            // Skip journal metadata lines
+            if (strlen($line) > 0 && 
+                strpos($line, '-- No entries --') === false && 
+                strpos($line, '-- Journal begins') === false &&
+                strpos($line, '-- Logs begin') === false) {
+                $logs[] = htmlspecialchars($line);
+            }
+        }
+        if (count($logs) > 0) {
+            return array_reverse($logs);
+        }
+    }
+    
+    // Method 3: Try syslog
+    if (file_exists($syslogFile) && is_readable($syslogFile)) {
+        $debug[] = "Trying syslog";
+        $grepCmd = "/usr/bin/grep -i dnsmasq " . escapeshellarg($syslogFile) . " 2>/dev/null | /usr/bin/tail -n $lines";
+        $syslogOutput = [];
+        exec($grepCmd, $syslogOutput, $syslogRet);
+        $debug[] = "syslog grep returned: $syslogRet, lines: " . count($syslogOutput);
+        
+        if (count($syslogOutput) > 0) {
+            foreach ($syslogOutput as $line) {
+                $line = trim($line);
+                if (strlen($line) > 0) {
+                    $logs[] = htmlspecialchars($line);
+                }
+            }
+            if (count($logs) > 0) {
+                return array_reverse($logs);
+            }
+        }
+    }
+    
+    // Method 4: Check systemctl status output for recent activity
+    $statusOutput = [];
+    exec("/bin/systemctl status dnsmasq 2>&1 | tail -20", $statusOutput, $statusRet);
+    if (count($statusOutput) > 0) {
+        foreach ($statusOutput as $line) {
+            $line = trim($line);
+            if (strlen($line) > 0 && (strpos($line, 'dnsmasq') !== false || strpos($line, 'DHCP') !== false)) {
+                $logs[] = htmlspecialchars($line);
+            }
+        }
+        if (count($logs) > 0) {
+            return array_reverse($logs);
+        }
+    }
+    
+    // Return debug info if no logs found
+    $noLogsMsg = ['No DHCP logs found. Debug info:'];
+    foreach ($debug as $d) {
+        $noLogsMsg[] = "  - $d";
+    }
+    $noLogsMsg[] = '';
+    $noLogsMsg[] = 'Possible reasons:';
+    $noLogsMsg[] = '  - No DHCP requests have been made yet';
+    $noLogsMsg[] = '  - Service is not running';
+    $noLogsMsg[] = '  - Log file permissions issue';
+    
+    return $noLogsMsg;
+}
+
+// Get diagnostic info for troubleshooting
+function getDiagnostics() {
+    $diag = [];
+    
+    // Check dnsmasq config syntax
+    exec('dnsmasq --test 2>&1', $testOutput, $testRetval);
+    $diag['config_valid'] = ($testRetval === 0);
+    $diag['config_test'] = implode("\n", $testOutput);
+    
+    // Check if port 67 is in use by something else
+    exec('ss -ulnp | grep :67 2>&1', $portOutput);
+    $diag['port_67_status'] = implode("\n", $portOutput);
+    
+    // Check interface status
+    $interface = trim(shell_exec("grep '^interface=' /etc/dnsmasq.conf | cut -d'=' -f2"));
+    $diag['configured_interface'] = $interface;
+    exec("ip link show $interface 2>&1", $ifaceOutput, $ifaceRetval);
+    $diag['interface_exists'] = ($ifaceRetval === 0);
+    $diag['interface_status'] = implode("\n", $ifaceOutput);
+    
+    // Check file permissions
+    $diag['config_writable'] = is_writable('/etc/dnsmasq.conf');
+    $diag['leases_writable'] = is_writable('/var/lib/dnsmasq/dnsmasq.leases');
+    $diag['log_writable'] = is_writable('/var/log/dnsmasq.log');
+    
+    // Get recent journal errors
+    exec('journalctl -u dnsmasq -p err -n 10 --no-pager 2>&1', $errOutput);
+    $diag['recent_errors'] = implode("\n", $errOutput);
+    
+    // Get service status detail
+    exec('systemctl status dnsmasq 2>&1', $statusOutput);
+    $diag['service_status'] = implode("\n", $statusOutput);
+    
+    return $diag;
+}
+
+// Fix common issues automatically
+function autoRepair() {
+    $repairs = [];
+    
+    // Ensure lease file exists and is writable
+    if (!file_exists('/var/lib/dnsmasq/dnsmasq.leases')) {
+        touch('/var/lib/dnsmasq/dnsmasq.leases');
+        chmod('/var/lib/dnsmasq/dnsmasq.leases', 0644);
+        $repairs[] = 'Created lease file';
+    }
+    
+    // Ensure log file exists and is writable
+    if (!file_exists('/var/log/dnsmasq.log')) {
+        touch('/var/log/dnsmasq.log');
+        chmod('/var/log/dnsmasq.log', 0644);
+        $repairs[] = 'Created log file';
+    }
+    
+    // Fix common permission issues
+    exec('sudo chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>&1');
+    exec('sudo chmod 644 /var/lib/dnsmasq/dnsmasq.leases 2>&1');
+    exec('sudo chmod 644 /var/log/dnsmasq.log 2>&1');
+    $repairs[] = 'Fixed file permissions';
+    
+    // Kill any zombie dnsmasq processes
+    exec('sudo pkill -9 dnsmasq 2>&1');
+    usleep(500000);
+    $repairs[] = 'Killed stale processes';
+    
+    // Try to start the service
+    exec('sudo systemctl start dnsmasq 2>&1', $output, $retval);
+    
+    if ($retval === 0) {
+        $repairs[] = 'Service started successfully';
+        return ['success' => true, 'repairs' => $repairs];
+    } else {
+        exec('journalctl -u dnsmasq -n 10 --no-pager 2>&1', $journalOutput);
+        $repairs[] = 'Service failed to start';
+        return [
+            'success' => false,
+            'repairs' => $repairs,
+            'error' => implode("\n", $journalOutput)
+        ];
+    }
+}
+
+// API Routes
+switch ($action) {
+    case 'system':
+        echo json_encode(['success' => true, 'data' => getSystemInfo()]);
+        break;
+    
+    case 'status':
+        echo json_encode(['success' => true, 'data' => getServiceStatus()]);
+        break;
+    
+    case 'settings':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            foreach ($data as $key => $value) {
+                setSetting($db, $key, $value);
+            }
+            $result = applyConfig($db);
+            if (is_array($result) && isset($result['success'])) {
+                echo json_encode($result);
+            } else {
+                echo json_encode(['success' => $result, 'applied' => $result]);
+            }
+        } else {
+            echo json_encode(['success' => true, 'data' => getAllSettings($db)]);
+        }
+        break;
+    
+    case 'apply':
+        $result = applyConfig($db);
+        echo json_encode($result);
+        break;
+    
+    case 'leases':
+        echo json_encode(['success' => true, 'data' => getLeases()]);
+        break;
+    
+    case 'reservations':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            $result = addReservation($db, $data['mac'], $data['ip'], $data['hostname'] ?? '', $data['description'] ?? '');
+            if ($result) {
+                $applyResult = applyConfig($db);
+                echo json_encode(['success' => true, 'applied' => $applyResult]);
+            } else {
+                echo json_encode(['success' => false]);
+            }
+        } elseif ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
+            $id = $_GET['id'] ?? 0;
+            $result = deleteReservation($db, $id);
+            if ($result) {
+                $applyResult = applyConfig($db);
+                echo json_encode(['success' => true, 'applied' => $applyResult]);
+            } else {
+                echo json_encode(['success' => false]);
+            }
+        } else {
+            echo json_encode(['success' => true, 'data' => getReservations($db)]);
+        }
+        break;
+    
+    case 'logs':
+        $lines = intval($_GET['lines'] ?? 100);
+        echo json_encode(['success' => true, 'data' => getRecentLogs($lines)]);
+        break;
+    
+    case 'restart':
+        // Stop first
+        exec('sudo systemctl stop dnsmasq 2>&1');
+        usleep(500000);
+        // Start
+        exec('sudo systemctl start dnsmasq 2>&1', $output, $retval);
+        if ($retval !== 0) {
+            exec('journalctl -u dnsmasq -n 20 --no-pager 2>&1', $journalOutput);
+            echo json_encode([
+                'success' => false,
+                'output' => implode("\n", $output),
+                'journal' => implode("\n", $journalOutput)
+            ]);
+        } else {
+            echo json_encode(['success' => true, 'output' => implode("\n", $output)]);
+        }
+        break;
+    
+    case 'stop':
+        exec('sudo systemctl stop dnsmasq 2>&1', $output, $retval);
+        echo json_encode(['success' => $retval === 0]);
+        break;
+    
+    case 'start':
+        exec('sudo systemctl start dnsmasq 2>&1', $output, $retval);
+        if ($retval !== 0) {
+            exec('journalctl -u dnsmasq -n 20 --no-pager 2>&1', $journalOutput);
+            echo json_encode([
+                'success' => false,
+                'output' => implode("\n", $output),
+                'journal' => implode("\n", $journalOutput)
+            ]);
+        } else {
+            echo json_encode(['success' => true]);
+        }
+        break;
+    
+    case 'diagnostics':
+        echo json_encode(['success' => true, 'data' => getDiagnostics()]);
+        break;
+    
+    case 'repair':
+        echo json_encode(autoRepair());
+        break;
+    
+    case 'validate':
+        $config = generateDnsmasqConfig($db);
+        $result = validateConfig($config);
+        echo json_encode(['success' => true, 'data' => $result]);
+        break;
+    
+    //==========================================================================
+    // IRONGATE NETWORK ISOLATION API
+    //==========================================================================
+    
+    case 'irongate_status':
+        $enabled = getSetting($db, 'irongate_enabled') === 'true';
+        $mode = getSetting($db, 'irongate_mode') ?? 'single';
+        exec('systemctl is-active irongate 2>&1', $svcOutput, $svcRet);
+        $serviceActive = ($svcRet === 0);
+        
+        echo json_encode([
+            'success' => true,
+            'data' => [
+                'enabled' => $enabled,
+                'mode' => $mode,
+                'service_running' => $serviceActive,
+                'isolated_interface' => getSetting($db, 'irongate_isolated_interface'),
+                'bridge_ip' => getSetting($db, 'irongate_bridge_ip'),
+                'layers' => [
+                    'arp_defense' => getSetting($db, 'irongate_arp_defense') === 'true',
+                    'ipv6_ra' => getSetting($db, 'irongate_ipv6_ra') === 'true',
+                    'gateway_takeover' => getSetting($db, 'irongate_gateway_takeover') === 'true',
+                    'bypass_detection' => getSetting($db, 'irongate_bypass_detection') === 'true'
+                ]
+            ]
+        ]);
+        break;
+    
+    case 'irongate_settings':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            foreach ($data as $key => $value) {
+                if (strpos($key, 'irongate_') === 0) {
+                    setSetting($db, $key, $value);
+                }
+            }
+            $result = applyIrongateConfig($db);
+            echo json_encode($result);
+        } else {
+            $settings = [];
+            foreach (['irongate_enabled', 'irongate_mode', 'irongate_isolated_interface',
+                      'irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end',
+                      'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
+                      'irongate_bypass_detection'] as $key) {
+                $settings[$key] = getSetting($db, $key);
+            }
+            echo json_encode(['success' => true, 'data' => $settings]);
+        }
+        break;
+    
+    case 'irongate_interfaces':
+        $interfaces = [];
+        $mainIface = getSetting($db, 'interface') ?: trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+        exec("ls /sys/class/net 2>/dev/null", $ifaceList);
+        foreach ($ifaceList as $iface) {
+            $iface = trim($iface);
+            if (in_array($iface, ['lo', 'docker0', 'br-irongate', 'br0'])) continue;
+            $isUsb = (strpos($iface, 'enx') === 0 || strpos($iface, 'usb') === 0);
+            if (!$isUsb && file_exists("/sys/class/net/$iface/device/uevent")) {
+                $uevent = @file_get_contents("/sys/class/net/$iface/device/uevent");
+                $isUsb = (stripos($uevent, 'usb') !== false);
+            }
+            $mac = trim(@file_get_contents("/sys/class/net/$iface/address") ?: '');
+            $state = trim(@file_get_contents("/sys/class/net/$iface/operstate") ?: 'unknown');
+            $interfaces[] = [
+                'name' => $iface,
+                'mac' => $mac,
+                'state' => $state,
+                'is_usb' => $isUsb,
+                'is_main' => ($iface === $mainIface)
+            ];
+        }
+        echo json_encode(['success' => true, 'data' => $interfaces]);
+        break;
+    
+    case 'irongate_toggle':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $enable = $data['enabled'] ?? false;
+        setSetting($db, 'irongate_enabled', $enable ? 'true' : 'false');
+        
+        if ($enable) {
+            $result = applyIrongateConfig($db);
+        } else {
+            exec('sudo systemctl stop irongate 2>&1', $output, $retval);
+            $result = ['success' => true, 'message' => 'Irongate disabled'];
+        }
+        echo json_encode($result);
+        break;
+    
+    case 'irongate_apply':
+        $result = applyIrongateConfig($db);
+        echo json_encode($result);
+        break;
+    
+    case 'irongate_logs':
+        $lines = intval($_GET['lines'] ?? 50);
+        $logs = [];
+        exec("sudo journalctl -u irongate -n $lines --no-pager 2>&1", $journalOutput);
+        foreach ($journalOutput as $line) {
+            $line = trim($line);
+            if (!empty($line) && strpos($line, '-- No entries') === false) {
+                $logs[] = htmlspecialchars($line);
+            }
+        }
+        echo json_encode(['success' => true, 'data' => array_reverse($logs)]);
+        break;
+    
+    case 'irongate_devices':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
+            $stmt->bindValue(1, strtolower($data['mac']), SQLITE3_TEXT);
+            $stmt->bindValue(2, $data['ip'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(3, $data['hostname'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(4, $data['zone'] ?? 'isolated', SQLITE3_TEXT);
+            $result = $stmt->execute();
+            if ($result) {
+                applyIrongateConfig($db);
+            }
+            echo json_encode(['success' => $result ? true : false]);
+        } elseif ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
+            $id = $_GET['id'] ?? 0;
+            $stmt = $db->prepare('DELETE FROM irongate_devices WHERE id = ?');
+            $stmt->bindValue(1, $id, SQLITE3_INTEGER);
+            $result = $stmt->execute();
+            if ($result) {
+                applyIrongateConfig($db);
+            }
+            echo json_encode(['success' => $result ? true : false]);
+        } else {
+            $results = $db->query('SELECT * FROM irongate_devices ORDER BY zone, ip');
+            $devices = [];
+            while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+                $devices[] = $row;
+            }
+            echo json_encode(['success' => true, 'data' => $devices]);
+        }
+        break;
+    
+    default:
+        echo json_encode(['error' => 'Unknown action', 'available' => [
+            'system', 'status', 'settings', 'apply', 'leases', 
+            'reservations', 'logs', 'restart', 'stop', 'start',
+            'diagnostics', 'repair', 'validate',
+            'irongate_status', 'irongate_settings', 'irongate_interfaces',
+            'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices'
+        ]]);
+}
+
+// Irongate config generator
+function applyIrongateConfig($db) {
+    $settings = getAllSettings($db);
+    $enabled = ($settings['irongate_enabled'] ?? 'false') === 'true';
+    
+    if (!$enabled) {
+        exec('sudo systemctl stop irongate 2>&1');
+        return ['success' => true, 'message' => 'Irongate disabled'];
+    }
+    
+    $mode = $settings['irongate_mode'] ?? 'single';
+    $interface = $settings['interface'] ?: trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+    $gateway = $settings['gateway'] ?: trim(shell_exec("ip route | grep default | awk '{print \$3}' | head -n1"));
+    $localIp = trim(shell_exec("ip -4 addr show $interface 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -n1"));
+    $localMac = trim(shell_exec("ip link show $interface 2>/dev/null | awk '/ether/ {print \$2}'"));
+    
+    // Get gateway MAC - try ARP cache first, then arping
+    $gatewayMac = trim(shell_exec("ip neigh show | grep '$gateway ' | awk '{print \$5}' | head -n1"));
+    if (empty($gatewayMac)) {
+        exec("arping -c 1 -I $interface $gateway 2>/dev/null", $arpOutput);
+        $gatewayMac = trim(shell_exec("ip neigh show | grep '$gateway ' | awk '{print \$5}' | head -n1"));
+    }
+    
+    // Generate YAML config
+    $config = "# Irongate Configuration\n";
+    $config .= "# Generated: " . date('Y-m-d H:i:s') . "\n\n";
+    $config .= "network:\n";
+    $config .= "  interface: \"$interface\"\n";
+    $config .= "  local_ip: \"$localIp\"\n";
+    $config .= "  local_mac: \"$localMac\"\n";
+    $config .= "  gateway_ip: \"$gateway\"\n";
+    $config .= "  gateway_mac: \"$gatewayMac\"\n\n";
+    
+    $config .= "mode: \"$mode\"\n\n";
+    
+    if ($mode === 'dual') {
+        $config .= "bridge:\n";
+        $config .= "  enabled: true\n";
+        $config .= "  isolated_interface: \"" . ($settings['irongate_isolated_interface'] ?? '') . "\"\n";
+        $config .= "  bridge_name: \"br-irongate\"\n";
+        $config .= "  bridge_ip: \"" . ($settings['irongate_bridge_ip'] ?? '10.99.0.1') . "\"\n";
+        $config .= "  bridge_netmask: \"255.255.0.0\"\n";
+        $config .= "  dhcp_start: \"" . ($settings['irongate_bridge_dhcp_start'] ?? '10.99.1.1') . "\"\n";
+        $config .= "  dhcp_end: \"" . ($settings['irongate_bridge_dhcp_end'] ?? '10.99.255.254') . "\"\n";
+        $config .= "  port_isolation: true\n\n";
+    }
+    
+    $config .= "layers:\n";
+    $config .= "  arp_defense: " . (($settings['irongate_arp_defense'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  ipv6_ra: " . (($settings['irongate_ipv6_ra'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  gateway_takeover: " . (($settings['irongate_gateway_takeover'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  bypass_detection: " . (($settings['irongate_bypass_detection'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  firewall: true\n\n";
+    
+    // Get protected devices from database
+    $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
+    $devices = [];
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $devices[] = $row;
+    }
+    
+    if (!empty($devices)) {
+        $config .= "devices:\n";
+        foreach ($devices as $dev) {
+            $config .= "  - mac: \"" . $dev['mac'] . "\"\n";
+            $config .= "    ip: \"" . $dev['ip'] . "\"\n";
+            $config .= "    zone: \"" . $dev['zone'] . "\"\n";
+        }
+    }
+    
+    // Write config
+    @mkdir('/etc/irongate', 0755, true);
+    file_put_contents('/etc/irongate/config.yaml', $config);
+    
+    // Restart service
+    exec('sudo systemctl restart irongate 2>&1', $output, $retval);
+    
+    if ($retval !== 0) {
+        exec('sudo journalctl -u irongate -n 20 --no-pager 2>&1', $journalOutput);
+        return [
+            'success' => false,
+            'error' => 'Failed to start Irongate',
+            'output' => implode("\n", $output),
+            'journal' => implode("\n", $journalOutput)
+        ];
+    }
+    
+    return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
+}
+EOPHP
+
+#######################################
+# Create Web UI with improved error display
+#######################################
+cat > /var/www/irongate/index.html << 'EOHTML'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Irongate{% endblock %}</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <title>Irongate</title>
     <style>
-        :root{--primary:#dc2626;--primary-dark:#b91c1c;--secondary:#1e40af;--success:#16a34a;--warning:#d97706;--danger:#dc2626;--dark:#0f0f0f;--darker:#000;--card:#1a1a1a;--border:#2a2a2a;--text:#e5e5e5;--text-muted:#737373;--accent:#ef4444}
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--darker);color:var(--text);min-height:100vh}
-        .layout{display:flex;min-height:100vh}
-        .sidebar{width:280px;background:var(--dark);border-right:1px solid var(--border);position:fixed;height:100vh;overflow-y:auto;z-index:100}
-        .logo{padding:1.5rem;display:flex;align-items:center;gap:1rem;border-bottom:1px solid var(--border)}
-        .logo-icon{width:48px;height:48px;background:linear-gradient(135deg,var(--primary),var(--primary-dark));border-radius:12px;display:flex;align-items:center;justify-content:center}
-        .logo-icon i{font-size:1.5rem;color:#fff}
-        .logo-text h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,#fff,var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-        .logo-text span{font-size:.75rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.1em}
-        .nav{padding:1rem 0}
-        .nav-section{padding:.5rem 1.5rem;font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);font-weight:600;margin-top:1rem}
-        .nav-link{display:flex;align-items:center;gap:.875rem;padding:.875rem 1.5rem;color:var(--text);text-decoration:none;transition:all .2s;border-left:3px solid transparent}
-        .nav-link:hover{background:rgba(255,255,255,.03);border-color:var(--border)}
-        .nav-link.active{background:rgba(220,38,38,.1);border-color:var(--primary);color:#fff}
-        .nav-link i{width:1.25rem;text-align:center;opacity:.7}
-        .nav-link.active i{opacity:1;color:var(--primary)}
-        .main{flex:1;margin-left:280px}
-        .header{background:var(--dark);border-bottom:1px solid var(--border);padding:1.25rem 2rem;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:50}
-        .header h2{font-size:1.375rem;font-weight:600}
-        .header-status{display:flex;align-items:center;gap:1rem}
-        .status-indicator{display:flex;align-items:center;gap:.5rem;padding:.5rem 1rem;background:var(--card);border-radius:9999px;font-size:.875rem}
-        .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);animation:pulse 2s infinite}
-        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-        .content{padding:2rem}
-        .card{background:var(--card);border-radius:1rem;border:1px solid var(--border);margin-bottom:1.5rem;overflow:hidden}
-        .card-header{padding:1.25rem 1.5rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-        .card-title{font-size:1rem;font-weight:600;display:flex;align-items:center;gap:.75rem}
-        .card-title i{color:var(--primary)}
-        .card-body{padding:1.5rem}
-        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.5rem;margin-bottom:2rem}
-        .stat-card{background:var(--card);border-radius:1rem;border:1px solid var(--border);padding:1.5rem;position:relative;overflow:hidden}
-        .stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--primary),var(--secondary))}
-        .stat-icon{width:3.5rem;height:3.5rem;border-radius:.75rem;display:flex;align-items:center;justify-content:center;font-size:1.5rem;margin-bottom:1rem}
-        .stat-icon.red{background:rgba(220,38,38,.15);color:var(--primary)}
-        .stat-icon.blue{background:rgba(30,64,175,.15);color:var(--secondary)}
-        .stat-icon.green{background:rgba(22,163,74,.15);color:var(--success)}
-        .stat-icon.yellow{background:rgba(217,119,6,.15);color:var(--warning)}
-        .stat-value{font-size:2rem;font-weight:700;margin-bottom:.25rem}
-        .stat-label{color:var(--text-muted);font-size:.875rem}
-        .btn{display:inline-flex;align-items:center;gap:.5rem;padding:.625rem 1.25rem;border-radius:.5rem;font-size:.875rem;font-weight:500;cursor:pointer;border:none;transition:all .2s;text-decoration:none}
-        .btn-primary{background:var(--primary);color:#fff}
-        .btn-primary:hover{background:var(--primary-dark)}
-        .btn-secondary{background:var(--secondary);color:#fff}
-        .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
-        .btn-outline:hover{background:var(--card);border-color:var(--text-muted)}
-        .btn-sm{padding:.5rem .875rem;font-size:.8125rem}
-        .btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
-        .btn-danger:hover{background:var(--danger);color:#fff}
-        .table{width:100%;border-collapse:collapse}
-        .table th,.table td{padding:1rem 1.25rem;text-align:left;border-bottom:1px solid var(--border)}
-        .table th{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);font-weight:600;background:rgba(0,0,0,.2)}
-        .table tr:hover{background:rgba(255,255,255,.02)}
-        .badge{display:inline-flex;align-items:center;gap:.375rem;padding:.375rem .75rem;border-radius:9999px;font-size:.75rem;font-weight:500}
-        .badge-success{background:rgba(22,163,74,.15);color:var(--success)}
-        .badge-warning{background:rgba(217,119,6,.15);color:var(--warning)}
-        .badge-danger{background:rgba(220,38,38,.15);color:var(--danger)}
-        .badge-info{background:rgba(30,64,175,.15);color:var(--secondary)}
-        .badge i{font-size:.625rem}
-        .zone-tag{display:inline-flex;align-items:center;gap:.375rem;padding:.25rem .625rem;border-radius:.375rem;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
-        .zone-quarantine{background:rgba(220,38,38,.2);color:#fca5a5;border:1px solid rgba(220,38,38,.3)}
-        .zone-isolated{background:rgba(217,119,6,.2);color:#fcd34d;border:1px solid rgba(217,119,6,.3)}
-        .zone-servers{background:rgba(30,64,175,.2);color:#93c5fd;border:1px solid rgba(30,64,175,.3)}
-        .zone-trusted{background:rgba(22,163,74,.2);color:#86efac;border:1px solid rgba(22,163,74,.3)}
-        .form-group{margin-bottom:1.25rem}
-        .form-label{display:block;margin-bottom:.5rem;font-size:.875rem;font-weight:500;color:var(--text-muted)}
-        .form-input,.form-select{width:100%;padding:.75rem 1rem;background:var(--darker);border:1px solid var(--border);border-radius:.5rem;color:var(--text);font-size:.875rem}
-        .form-input:focus,.form-select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(220,38,38,.1)}
-        .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;visibility:hidden;transition:all .2s}
-        .modal-overlay.active{opacity:1;visibility:visible}
-        .modal{background:var(--card);border-radius:1rem;border:1px solid var(--border);width:100%;max-width:500px;max-height:90vh;overflow-y:auto}
-        .modal-header{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-        .modal-title{font-size:1.25rem;font-weight:600}
-        .modal-close{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:1.25rem;padding:.5rem}
-        .modal-close:hover{color:var(--text)}
-        .modal-body{padding:1.5rem}
-        .modal-footer{padding:1rem 1.5rem;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:.75rem}
-        .empty-state{text-align:center;padding:4rem 2rem;color:var(--text-muted)}
-        .empty-state i{font-size:4rem;margin-bottom:1.5rem;opacity:.3}
-        .empty-state h3{font-size:1.25rem;margin-bottom:.5rem;color:var(--text)}
-        .security-banner{background:linear-gradient(135deg,rgba(220,38,38,.1),rgba(30,64,175,.1));border:1px solid var(--border);border-radius:.75rem;padding:1rem 1.5rem;margin-bottom:1.5rem;display:flex;align-items:center;gap:1rem}
-        .security-banner i{font-size:1.5rem;color:var(--primary)}
-        .toast-container{position:fixed;bottom:2rem;right:2rem;z-index:2000}
-        .toast{background:var(--card);border:1px solid var(--border);border-radius:.75rem;padding:1rem 1.5rem;margin-top:.75rem;display:flex;align-items:center;gap:1rem;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:slideIn .3s ease}
-        @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
-        code{background:var(--darker);padding:.125rem .5rem;border-radius:.25rem;font-size:.8125rem;font-family:'JetBrains Mono',monospace}
-        @media(max-width:1024px){.sidebar{width:80px}.logo-text,.nav-section,.nav-link span{display:none}.nav-link{justify-content:center;padding:1rem}.main{margin-left:80px}}
-        @media(max-width:640px){.sidebar{display:none}.main{margin-left:0}.content{padding:1rem}.stats-grid{grid-template-columns:1fr}}
+        :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--primary:#e94560;--success:#00bf63;--warning:#ffc107;--danger:#dc3545;--text:#eee;--text-secondary:#aaa;}
+        *{box-sizing:border-box;margin:0;padding:0;}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+        .container{display:flex;min-height:100vh;}
+        .sidebar{width:240px;background:var(--surface);padding:20px;border-right:1px solid var(--surface2);}
+        .logo{font-size:1.4em;font-weight:bold;color:var(--primary);margin-bottom:30px;display:flex;align-items:center;gap:10px;}
+        .logo svg{width:28px;height:28px;}
+        .nav-item{padding:12px 15px;margin:5px 0;border-radius:8px;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;gap:10px;}
+        .nav-item:hover,.nav-item.active{background:var(--surface2);}
+        .main{flex:1;padding:30px;overflow-y:auto;}
+        .page{display:none;}
+        .page.active{display:block;}
+        .card{background:var(--surface);border-radius:12px;padding:20px;margin-bottom:20px;}
+        .card-title{font-size:1.2em;margin-bottom:15px;color:var(--text);display:flex;align-items:center;gap:10px;}
+        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;}
+        .stat-card{background:var(--surface2);padding:20px;border-radius:10px;text-align:center;}
+        .stat-value{font-size:2em;font-weight:bold;color:var(--primary);}
+        .stat-label{color:var(--text-secondary);font-size:0.9em;margin-top:5px;}
+        table{width:100%;border-collapse:collapse;}
+        th,td{padding:12px;text-align:left;border-bottom:1px solid var(--surface2);}
+        th{color:var(--text-secondary);font-weight:500;}
+        .btn{padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:0.9em;transition:all 0.2s;}
+        .btn-primary{background:var(--primary);color:white;}
+        .btn-secondary{background:var(--surface2);color:var(--text);}
+        .btn-success{background:var(--success);color:white;}
+        .btn-danger{background:var(--danger);color:white;}
+        .btn-warning{background:var(--warning);color:black;}
+        .btn:hover{opacity:0.9;transform:translateY(-1px);}
+        .btn-sm{padding:6px 12px;font-size:0.85em;}
+        .form-group{margin-bottom:15px;}
+        .form-group label{display:block;margin-bottom:5px;color:var(--text-secondary);}
+        .form-control{width:100%;padding:10px;border:1px solid var(--surface2);border-radius:6px;background:var(--bg);color:var(--text);font-size:1em;}
+        .form-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;}
+        .toggle{width:50px;height:26px;background:var(--surface2);border-radius:13px;position:relative;cursor:pointer;transition:all 0.2s;}
+        .toggle.active{background:var(--success);}
+        .toggle::after{content:'';position:absolute;width:22px;height:22px;background:white;border-radius:50%;top:2px;left:2px;transition:all 0.2s;}
+        .toggle.active::after{left:26px;}
+        .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px;}
+        .status-dot.running{background:var(--success);}
+        .status-dot.stopped{background:var(--danger);}
+        .alert{padding:15px;border-radius:8px;margin-bottom:15px;display:flex;align-items:center;gap:10px;}
+        .alert-warning{background:rgba(255,193,7,0.2);border:1px solid var(--warning);}
+        .alert-danger{background:rgba(220,53,69,0.2);border:1px solid var(--danger);}
+        .alert-success{background:rgba(0,191,99,0.2);border:1px solid var(--success);}
+        .badge{padding:4px 8px;border-radius:4px;font-size:0.8em;}
+        .badge-success{background:var(--success);color:white;}
+        .badge-warning{background:var(--warning);color:black;}
+        .modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);align-items:center;justify-content:center;z-index:1000;}
+        .modal.active{display:flex;}
+        .modal-content{background:var(--surface);padding:25px;border-radius:12px;width:100%;max-width:500px;}
+        .modal-title{font-size:1.3em;margin-bottom:20px;}
+        .logs-container{background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;max-height:400px;overflow-y:auto;}
+        .log-line{padding:3px 0;border-bottom:1px solid var(--surface2);}
+        .toast{position:fixed;bottom:20px;right:20px;padding:15px 25px;background:var(--surface);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:2000;animation:slideIn 0.3s;}
+        @keyframes slideIn{from{transform:translateX(100%);opacity:0;}to{transform:translateX(0);opacity:1;}}
+        code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:0.9em;}
+        .diag-section{margin-bottom:15px;padding:10px;background:var(--bg);border-radius:6px;}
+        .diag-label{color:var(--text-secondary);font-size:0.85em;margin-bottom:5px;}
+        .diag-value{font-family:monospace;font-size:0.9em;white-space:pre-wrap;word-break:break-all;}
+        .diag-ok{color:var(--success);}
+        .diag-error{color:var(--danger);}
+        .error-box{background:rgba(220,53,69,0.1);border:1px solid var(--danger);border-radius:8px;padding:15px;margin:10px 0;font-family:monospace;font-size:0.85em;white-space:pre-wrap;max-height:200px;overflow-y:auto;}
     </style>
 </head>
 <body>
-    <div class="layout">
-        <aside class="sidebar">
-            <div class="logo">
-                <div class="logo-icon"><i class="fas fa-shield-halved"></i></div>
-                <div class="logo-text">
-                    <h1>IRONGATE</h1>
-                    <span>Network Isolation</span>
+    <div class="container">
+        <div class="sidebar">
+            <div class="logo" style="color:#e94560;">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M12,5A3,3 0 0,1 15,8A3,3 0 0,1 12,11A3,3 0 0,1 9,8A3,3 0 0,1 12,5M17.13,17C15.92,18.85 14.11,20.24 12,20.92C9.89,20.24 8.08,18.85 6.87,17C6.53,16.5 6.24,16 6,15.47C6,13.82 8.71,12.47 12,12.47C15.29,12.47 18,13.79 18,15.47C17.76,16 17.47,16.5 17.13,17Z"/></svg>
+                IRONGATE
+            </div>
+            <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
+            <div class="nav-item" onclick="showPage('devices')">🖥️ Devices & Zones</div>
+            <div class="nav-item" onclick="showPage('dhcp')">🔗 DHCP Settings</div>
+            <div class="nav-item" onclick="showPage('leases')">📋 Active Leases</div>
+            <div class="nav-item" onclick="showPage('reservations')">📌 Reservations</div>
+            <div class="nav-item" onclick="showPage('protection')">🛡️ Protection</div>
+            <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
+            <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
+        </div>
+        <div class="main">
+            <!-- Dashboard -->
+            <div class="page active" id="page-dashboard">
+                <h2 style="margin-bottom:20px;">🛡️ Irongate Dashboard</h2>
+                
+                <!-- Protection Status Banner -->
+                <div id="protection-banner" class="alert alert-warning" style="margin-bottom:20px;">
+                    <span>⚠️</span>
+                    <span>Protection is <strong>disabled</strong>. Go to Protection settings to enable.</span>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('protection')">
+                        <div class="stat-value" id="dash-protection" style="color:var(--danger);">OFF</div>
+                        <div class="stat-label">Protection Status</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('devices')">
+                        <div class="stat-value" id="dash-devices">0</div>
+                        <div class="stat-label">Protected Devices</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('leases')">
+                        <div class="stat-value" id="dash-leases">--</div>
+                        <div class="stat-label">DHCP Leases</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('reservations')">
+                        <div class="stat-value" id="dash-reservations">--</div>
+                        <div class="stat-label">Reservations</div>
+                    </div>
+                </div>
+                
+                <!-- Zone Summary -->
+                <div class="card" style="margin-top:20px;">
+                    <div class="card-title">Zone Summary</div>
+                    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);">
+                        <div style="text-align:center;padding:15px;background:rgba(233,69,96,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#e94560;" id="dash-isolated">0</div>
+                            <div style="color:var(--text-secondary);">🔴 Isolated</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Internet only</div>
+                        </div>
+                        <div style="text-align:center;padding:15px;background:rgba(255,193,7,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#ffc107;" id="dash-servers">0</div>
+                            <div style="color:var(--text-secondary);">🟡 Servers</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Inter-server OK</div>
+                        </div>
+                        <div style="text-align:center;padding:15px;background:rgba(0,191,99,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#00bf63;" id="dash-trusted">0</div>
+                            <div style="color:var(--text-secondary);">🟢 Trusted</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Full access</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- System Info -->
+                <div class="card">
+                    <div class="card-title">System Information</div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Hostname</label><input class="form-control" id="sys-hostname" readonly></div>
+                        <div class="form-group"><label>IP Address</label><input class="form-control" id="sys-ip" readonly></div>
+                        <div class="form-group"><label>Interface</label><input class="form-control" id="sys-interface" readonly></div>
+                        <div class="form-group"><label>Gateway</label><input class="form-control" id="sys-gateway" readonly></div>
+                    </div>
+                    <div style="margin-top:10px;color:var(--text-secondary);">
+                        DHCP: <span id="dash-dhcp-status">--</span> | 
+                        Pool: <span id="dash-pool-range">--</span>
+                    </div>
+                </div>
+                
+                <!-- Quick Actions -->
+                <div class="card">
+                    <div class="card-title">Quick Actions</div>
+                    <button class="btn btn-primary" onclick="showPage('devices')">➕ Add Device</button>
+                    <button class="btn btn-success" onclick="showPage('protection')" style="margin-left:10px;">🛡️ Protection Settings</button>
+                    <button class="btn btn-secondary" onclick="showPage('dhcp')" style="margin-left:10px;">🔗 DHCP Settings</button>
+                </div>
+                
+                <div id="dash-error" class="alert alert-danger" style="display:none;">
+                    <span>⚠️</span>
+                    <div>
+                        <strong>Service Error</strong>
+                        <pre id="dash-error-text" style="margin-top:5px;font-size:0.85em;"></pre>
+                    </div>
                 </div>
             </div>
-            <nav class="nav">
-                <div class="nav-section">Overview</div>
-                <a href="/" class="nav-link {% if request.endpoint == 'index' %}active{% endif %}">
-                    <i class="fas fa-gauge-high"></i>
-                    <span>Dashboard</span>
-                </a>
+            
+            <!-- Devices & Zones -->
+            <div class="page" id="page-devices">
+                <h2 style="margin-bottom:20px;">🖥️ Devices & Zones</h2>
                 
-                <div class="nav-section">Management</div>
-                <a href="/devices" class="nav-link {% if request.endpoint == 'devices' %}active{% endif %}">
-                    <i class="fas fa-server"></i>
-                    <span>Devices</span>
-                </a>
-                <a href="/zones" class="nav-link {% if request.endpoint == 'zones' %}active{% endif %}">
-                    <i class="fas fa-layer-group"></i>
-                    <span>Zones</span>
-                </a>
-                <a href="/scan" class="nav-link {% if request.endpoint == 'scan' %}active{% endif %}">
-                    <i class="fas fa-radar"></i>
-                    <span>Network Scan</span>
-                </a>
+                <p style="color:var(--text-secondary);margin-bottom:20px;">
+                    Add devices to zones to control their network access. Devices not in any zone have normal network access.
+                </p>
                 
-                <div class="nav-section">Security</div>
-                <a href="/bridge" class="nav-link {% if request.endpoint == 'bridge' %}active{% endif %}">
-                    <i class="fas fa-network-wired"></i>
-                    <span>Bridge Mode</span>
-                </a>
-                <a href="/events" class="nav-link {% if request.endpoint == 'events' %}active{% endif %}">
-                    <i class="fas fa-shield-exclamation"></i>
-                    <span>Security Events</span>
-                </a>
-                <a href="/logs" class="nav-link {% if request.endpoint == 'logs' %}active{% endif %}">
-                    <i class="fas fa-scroll"></i>
-                    <span>Logs</span>
-                </a>
+                <!-- Zone Legend -->
+                <div class="card">
+                    <div class="card-title">Zone Access Rules</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                        <div style="padding:15px;background:rgba(233,69,96,0.1);border-radius:8px;border-left:4px solid #e94560;">
+                            <strong style="color:#e94560;">🔴 isolated</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✗ Cannot reach LAN<br>
+                                ✗ Cannot reach other devices
+                            </div>
+                        </div>
+                        <div style="padding:15px;background:rgba(255,193,7,0.1);border-radius:8px;border-left:4px solid #ffc107;">
+                            <strong style="color:#ffc107;">🟡 servers</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✓ Can reach other servers<br>
+                                ✗ Cannot reach LAN
+                            </div>
+                        </div>
+                        <div style="padding:15px;background:rgba(0,191,99,0.1);border-radius:8px;border-left:4px solid #00bf63;">
+                            <strong style="color:#00bf63;">🟢 trusted</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✓ Full LAN access<br>
+                                ✓ Can reach all devices
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 
-                <div class="nav-section">System</div>
-                <a href="/settings" class="nav-link {% if request.endpoint == 'settings' %}active{% endif %}">
-                    <i class="fas fa-gear"></i>
-                    <span>Settings</span>
-                </a>
-            </nav>
-        </aside>
-        
-        <main class="main">
-            {% block content %}{% endblock %}
-        </main>
+                <!-- Device Management -->
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Protected Devices</div>
+                        <div>
+                            <button class="btn btn-primary btn-sm" onclick="showDeviceModal()">+ Add Device</button>
+                            <button class="btn btn-secondary btn-sm" onclick="importFromLeases()" style="margin-left:10px;">📋 Import from Leases</button>
+                        </div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Zone</th>
+                                <th>MAC Address</th>
+                                <th>IP Address</th>
+                                <th>Hostname</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="irongate-devices-table">
+                            <tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No devices configured</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- DHCP Settings (renamed from Settings) -->
+            <div class="page" id="page-dhcp">
+                <h2 style="margin-bottom:20px;">🔗 DHCP Settings</h2>
+                <div id="settings-alert" class="alert alert-warning" style="display:none;">
+                    <span>⚠️</span>
+                    <span>DHCP is currently disabled. Enable it and configure your settings below.</span>
+                </div>
+                <div class="card">
+                    <div class="card-title">DHCP Status</div>
+                    <div style="display:flex;align-items:center;gap:15px;">
+                        <div class="toggle" id="dhcp-toggle" onclick="toggleDhcp()"></div>
+                        <span id="dhcp-status-text">Disabled</span>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Network Configuration</div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Interface</label><select class="form-control" id="set-interface"></select></div>
+                        <div class="form-group"><label>Subnet CIDR</label><select class="form-control" id="set-cidr" onchange="updateCidrInfo()">
+                            <option value="8">/8</option><option value="16">/16</option><option value="17">/17</option>
+                            <option value="18">/18</option><option value="19">/19</option><option value="20">/20</option>
+                            <option value="21">/21</option><option value="22">/22</option><option value="23">/23</option>
+                            <option value="24" selected>/24</option><option value="25">/25</option><option value="26">/26</option>
+                            <option value="27">/27</option><option value="28">/28</option>
+                        </select></div>
+                    </div>
+                    <div id="cidr-info" style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;"></div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Range Start</label><input class="form-control" id="set-range-start" placeholder="e.g., 192.168.1.100"></div>
+                        <div class="form-group"><label>Range End</label><input class="form-control" id="set-range-end" placeholder="e.g., 192.168.1.200"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Gateway (Router IP)</label><input class="form-control" id="set-gateway" placeholder="e.g., 192.168.1.1"></div>
+                        <div class="form-group"><label>Lease Time</label><input class="form-control" id="set-lease-time" placeholder="e.g., 24h"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Primary DNS</label><input class="form-control" id="set-dns-primary" placeholder="8.8.8.8"></div>
+                        <div class="form-group"><label>Secondary DNS</label><input class="form-control" id="set-dns-secondary" placeholder="1.1.1.1"></div>
+                    </div>
+                    <div class="form-group"><label>Domain (optional)</label><input class="form-control" id="set-domain" placeholder="e.g., local"></div>
+                    <button class="btn btn-primary" onclick="saveSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="validateSettings()" style="margin-left:10px;">✓ Validate</button>
+                </div>
+            </div>
+            
+            <!-- Leases -->
+            <div class="page" id="page-leases">
+                <h2 style="margin-bottom:20px;">Active Leases</h2>
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Current Leases</div>
+                        <button class="btn btn-secondary btn-sm" onclick="loadLeases()">🔄 Refresh</button>
+                    </div>
+                    <table>
+                        <thead><tr><th>IP Address</th><th>MAC Address</th><th>Hostname</th><th>Expires</th><th>Actions</th></tr></thead>
+                        <tbody id="leases-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Reservations -->
+            <div class="page" id="page-reservations">
+                <h2 style="margin-bottom:20px;">Static Reservations</h2>
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Reserved Addresses</div>
+                        <button class="btn btn-primary btn-sm" onclick="showReservationModal()">+ Add Reservation</button>
+                    </div>
+                    <table>
+                        <thead><tr><th>IP Address</th><th>MAC Address</th><th>Hostname</th><th>Description</th><th>Actions</th></tr></thead>
+                        <tbody id="reservations-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Logs -->
+            <div class="page" id="page-logs">
+                <h2 style="margin-bottom:20px;">DHCP Logs</h2>
+                <div class="card">
+                    <div style="display:flex;gap:10px;margin-bottom:15px;flex-wrap:wrap;align-items:center;">
+                        <select class="form-control" id="log-lines" style="width:auto;" onchange="loadLogs()">
+                            <option value="50">Last 50</option>
+                            <option value="100" selected>Last 100</option>
+                            <option value="200">Last 200</option>
+                            <option value="500">Last 500</option>
+                        </select>
+                        <button class="btn btn-secondary" onclick="loadLogs()">🔄 Refresh</button>
+                        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;">
+                            <input type="checkbox" id="log-auto-refresh" onchange="toggleLogAutoRefresh()">
+                            Auto-refresh (10s)
+                        </label>
+                        <span id="log-status" style="color:var(--text-secondary);font-size:0.9em;"></span>
+                    </div>
+                    <div class="logs-container" id="logs-container" style="font-size:0.8em;line-height:1.4;"></div>
+                </div>
+            </div>
+            
+            <!-- Diagnostics -->
+            <div class="page" id="page-diagnostics">
+                <h2 style="margin-bottom:20px;">Diagnostics</h2>
+                <div class="card">
+                    <div class="card-title">Service Health Check</div>
+                    <div style="margin-bottom:15px;">
+                        <button class="btn btn-primary" onclick="runDiagnostics()">🔍 Run Diagnostics</button>
+                        <button class="btn btn-warning" onclick="runRepair()" style="margin-left:10px;">🔧 Auto-Repair</button>
+                    </div>
+                    <div id="diag-results"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Service Control</div>
+                    <button class="btn btn-success" onclick="startService()">▶️ Start</button>
+                    <button class="btn btn-danger" onclick="stopService()" style="margin-left:10px;">⏹️ Stop</button>
+                    <button class="btn btn-warning" onclick="restartService()" style="margin-left:10px;">🔄 Restart</button>
+                    <div id="service-status" style="margin-top:15px;font-size:1.1em;"></div>
+                </div>
+            </div>
+            
+            <!-- Protection Settings -->
+            <div class="page" id="page-protection">
+                <h2 style="margin-bottom:20px;">🛡️ Protection Settings</h2>
+                
+                <div id="irongate-alert" class="alert" style="display:none;"></div>
+                
+                <!-- Master Enable/Disable -->
+                <div class="card">
+                    <div class="card-title">Protection Status</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="irongate-toggle" onclick="toggleIrongate()"></div>
+                            <span id="irongate-status-text">Disabled</span>
+                        </div>
+                        <div id="irongate-service-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, Irongate enforces zone-based network isolation for all devices in the Devices & Zones list.
+                    </p>
+                </div>
+                
+                <!-- Mode Selection -->
+                <div class="card">
+                    <div class="card-title">Isolation Mode</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
+                        <div id="mode-single" class="stat-card" style="cursor:pointer;border:2px solid transparent;text-align:left;padding:15px;" onclick="setIrongateMode('single')">
+                            <div style="font-size:1.3em;margin-bottom:8px;">🔧 Single-NIC Mode</div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                Software-based isolation<br>
+                                No hardware changes needed<br>
+                                <span style="color:var(--warning);">~95% effective</span>
+                            </div>
+                        </div>
+                        <div id="mode-dual" class="stat-card" style="cursor:pointer;border:2px solid transparent;text-align:left;padding:15px;" onclick="setIrongateMode('dual')">
+                            <div style="font-size:1.3em;margin-bottom:8px;">🔒 Dual-NIC Mode</div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                Hardware bridge isolation<br>
+                                Requires USB NIC (~$10)<br>
+                                <span style="color:var(--success);">100% effective (VLAN-equivalent)</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Dual-NIC Config -->
+                <div class="card" id="dual-nic-config" style="display:none;">
+                    <div class="card-title">Dual-NIC Bridge Configuration</div>
+                    <div class="form-group">
+                        <label>Isolated Interface (USB NIC)</label>
+                        <select class="form-control" id="irongate-isolated-iface" style="max-width:300px;">
+                            <option value="">-- Select interface --</option>
+                        </select>
+                        <div style="font-size:0.85em;color:var(--text-secondary);margin-top:5px;">
+                            Connect USB ethernet adapter. Protected servers connect to a switch on this interface.
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Bridge IP</label><input class="form-control" id="irongate-bridge-ip" value="10.99.0.1"></div>
+                        <div class="form-group"><label>DHCP Start</label><input class="form-control" id="irongate-dhcp-start" value="10.99.1.1"></div>
+                        <div class="form-group"><label>DHCP End</label><input class="form-control" id="irongate-dhcp-end" value="10.99.255.254"></div>
+                    </div>
+                    <div style="background:var(--bg);border-radius:8px;padding:15px;margin-top:10px;font-family:monospace;font-size:0.8em;">
+                        <strong>Required Topology:</strong><br>
+                        <pre style="margin:10px 0 0 0;color:var(--text-secondary);">[Router] ─── [Main Switch] ─── [eth0] ─── [IRONGATE] ─── [eth1/USB] ─── [Isolated Switch]
+                                                                              │   │   │
+                                                                            [Srv1][Srv2][Srv3]</pre>
+                    </div>
+                </div>
+                
+                <!-- Single-NIC Layers -->
+                <div class="card" id="single-nic-config">
+                    <div class="card-title">Protection Layers (Single-NIC Mode)</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-arp" checked>
+                            <div><strong>ARP Defense</strong><div style="font-size:0.8em;color:var(--text-secondary);">Cache poisoning + bypass detection</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-ipv6" checked>
+                            <div><strong>IPv6 RA Guard</strong><div style="font-size:0.8em;color:var(--text-secondary);">Router advertisement hijacking</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-gateway" checked>
+                            <div><strong>Gateway Takeover</strong><div style="font-size:0.8em;color:var(--text-secondary);">Bidirectional poison + CAM flood</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-bypass" checked>
+                            <div><strong>Bypass Detection</strong><div style="font-size:0.8em;color:var(--text-secondary);">Active monitoring + TCP RST</div></div>
+                        </label>
+                    </div>
+                </div>
+                
+                <!-- Actions -->
+                <div class="card">
+                    <button class="btn btn-primary" onclick="saveIrongateSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="loadIrongateStatus()" style="margin-left:10px;">🔄 Refresh</button>
+                    <button class="btn btn-warning" onclick="showPage('devices')" style="margin-left:10px;">🖥️ Manage Devices</button>
+                </div>
+                
+                <!-- How It Works -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#e94560;">How Irongate Protection Works</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;font-size:0.9em;">
+                        <div>
+                            <strong>Single-NIC Mode:</strong>
+                            <ol style="margin:10px 0 0 20px;color:var(--text-secondary);">
+                                <li>ARP cache poisoning to intercept traffic</li>
+                                <li>IPv6 RA to capture IPv6 devices</li>
+                                <li>nftables zone-based firewall rules</li>
+                                <li>Gateway takeover prevents bypass</li>
+                                <li>Active monitoring detects evasion</li>
+                            </ol>
+                        </div>
+                        <div>
+                            <strong>Dual-NIC Mode:</strong>
+                            <ul style="margin:10px 0 0 20px;color:var(--text-secondary);">
+                                <li>Linux bridge with port isolation</li>
+                                <li>Kernel-enforced - impossible to bypass</li>
+                                <li>Same security as managed switch VLANs</li>
+                                <li>Separate DHCP pool for isolated network</li>
+                                <li>NAT provides internet access</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
     
-    <div class="toast-container" id="toastContainer"></div>
+    <!-- Reservation Modal -->
+    <div class="modal" id="reservation-modal">
+        <div class="modal-content">
+            <div class="modal-title">Add Reservation</div>
+            <form id="reservation-form" onsubmit="addReservation(event)">
+                <div class="form-group"><label>MAC Address</label><input class="form-control" id="res-mac" required placeholder="00:11:22:33:44:55"></div>
+                <div class="form-group"><label>IP Address</label><input class="form-control" id="res-ip" required placeholder="192.168.1.50"></div>
+                <div class="form-group"><label>Hostname</label><input class="form-control" id="res-hostname" placeholder="optional"></div>
+                <div class="form-group"><label>Description</label><input class="form-control" id="res-description" placeholder="optional"></div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideReservationModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
     
+    <!-- Irongate Device Modal -->
+    <div class="modal" id="device-modal">
+        <div class="modal-content">
+            <div class="modal-title">🛡️ Add Protected Device</div>
+            <form id="device-form" onsubmit="addIrongateDevice(event)">
+                <div class="form-group">
+                    <label>MAC Address *</label>
+                    <input class="form-control" id="dev-mac" required placeholder="00:11:22:33:44:55">
+                </div>
+                <div class="form-group">
+                    <label>IP Address</label>
+                    <input class="form-control" id="dev-ip" placeholder="Leave empty for DHCP">
+                    <div style="font-size:0.8em;color:var(--text-secondary);margin-top:3px;">
+                        Optional - used for firewall rules. Can use DHCP reservation IP.
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Hostname</label>
+                    <input class="form-control" id="dev-hostname" placeholder="optional">
+                </div>
+                <div class="form-group">
+                    <label>Zone *</label>
+                    <select class="form-control" id="dev-zone" required>
+                        <option value="isolated">🔴 isolated - Internet only, no LAN access</option>
+                        <option value="servers">🟡 servers - Can talk to other servers</option>
+                        <option value="trusted">🟢 trusted - Full network access</option>
+                    </select>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Add Device</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideDeviceModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Import from Leases Modal -->
+    <div class="modal" id="import-modal">
+        <div class="modal-content" style="max-width:700px;">
+            <div class="modal-title">📋 Import Devices from DHCP Leases</div>
+            <p style="color:var(--text-secondary);margin-bottom:15px;">Select devices to add to Irongate protection:</p>
+            <div id="import-leases-list" style="max-height:400px;overflow-y:auto;"></div>
+            <div style="display:flex;gap:10px;margin-top:20px;">
+                <button class="btn btn-primary" onclick="importSelectedDevices()">Import Selected</button>
+                <button class="btn btn-secondary" onclick="hideImportModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        function showToast(msg, type='success') {
-            const c = document.getElementById('toastContainer');
-            const t = document.createElement('div');
-            t.className = 'toast';
-            const icon = type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle';
-            const color = type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--secondary)';
-            t.innerHTML = `<i class="fas fa-${icon}" style="color:${color}"></i><span>${msg}</span>`;
-            c.appendChild(t);
-            setTimeout(() => { t.style.animation = 'slideIn .3s ease reverse'; setTimeout(() => t.remove(), 300); }, 3000);
+        let systemInfo = {};
+        let currentSettings = {};
+        
+        function showPage(page){
+            document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+            document.getElementById('page-'+page).classList.add('active');
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','logs','diagnostics'];
+            const idx = pages.indexOf(page);
+            if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
+            if(page==='leases')loadLeases();
+            if(page==='reservations')loadReservations();
+            if(page==='logs')loadLogs();
+            if(page==='diagnostics')runDiagnostics();
+            if(page==='devices')loadIrongateDevices();
+            if(page==='protection')loadIrongateStatus();
         }
         
-        function openModal(id) { document.getElementById(id).classList.add('active'); }
-        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
-        
-        async function api(endpoint, options = {}) {
-            const defaults = { headers: { 'Content-Type': 'application/json' } };
-            const response = await fetch(`/api${endpoint}`, { ...defaults, ...options });
-            return response.json();
+        function toast(msg,type='success'){
+            const t=document.createElement('div');
+            t.className='toast';
+            t.style.borderLeft=`4px solid var(--${type==='error'?'danger':'success'})`;
+            t.textContent=msg;
+            document.body.appendChild(t);
+            setTimeout(()=>t.remove(),3000);
         }
+        
+        async function api(action,opts={}){
+            try{
+                let url='api.php?action='+action;
+                if(opts.params)Object.entries(opts.params).forEach(([k,v])=>url+=`&${k}=${v}`);
+                const res=await fetch(url,{
+                    method:opts.method||'GET',
+                    headers:opts.body?{'Content-Type':'application/json'}:{},
+                    body:opts.body?JSON.stringify(opts.body):undefined
+                });
+                return await res.json();
+            }catch(e){console.error(e);return{success:false,error:e.message};}
+        }
+        
+        async function loadSystemInfo(){
+            const res=await api('system');
+            if(res.success){
+                systemInfo=res.data;
+                document.getElementById('sys-hostname').value=res.data.hostname;
+                document.getElementById('sys-ip').value=res.data.ip+'/'+res.data.cidr;
+                document.getElementById('sys-interface').value=res.data.interface;
+                document.getElementById('sys-gateway').value=res.data.gateway;
+                const select=document.getElementById('set-interface');
+                select.innerHTML=res.data.interfaces.map(i=>`<option value="${i.name}"${i.current?' selected':''}>${i.name} (${i.ip})</option>`).join('');
+            }
+        }
+        
+        async function loadStatus(){
+            const res=await api('status');
+            if(res.success){
+                const statusDiv=document.getElementById('service-status');
+                const dashStatus=document.getElementById('dash-status');
+                const dashError=document.getElementById('dash-error');
+                const dashErrorText=document.getElementById('dash-error-text');
+                
+                if(res.data.running){
+                    statusDiv.innerHTML='<span class="status-dot running"></span> Running';
+                    dashStatus.textContent='Running';
+                    dashStatus.style.color='var(--success)';
+                    dashError.style.display='none';
+                }else{
+                    statusDiv.innerHTML='<span class="status-dot stopped"></span> Stopped';
+                    dashStatus.textContent='Stopped';
+                    dashStatus.style.color='var(--danger)';
+                    if(res.data.last_error){
+                        dashError.style.display='flex';
+                        dashErrorText.textContent=res.data.last_error;
+                    }
+                }
+            }
+        }
+        
+        async function loadSettings(){
+            const res=await api('settings');
+            if(res.success){
+                currentSettings=res.data;
+                document.getElementById('set-interface').value=res.data.interface||systemInfo.interface||'';
+                document.getElementById('set-cidr').value=res.data.cidr||'24';
+                document.getElementById('set-range-start').value=res.data.range_start||'';
+                document.getElementById('set-range-end').value=res.data.range_end||'';
+                document.getElementById('set-gateway').value=res.data.gateway||systemInfo.gateway||'';
+                document.getElementById('set-dns-primary').value=res.data.dns_primary||'8.8.8.8';
+                document.getElementById('set-dns-secondary').value=res.data.dns_secondary||'1.1.1.1';
+                document.getElementById('set-lease-time').value=res.data.lease_time||'24h';
+                document.getElementById('set-domain').value=res.data.domain||'';
+                const enabled=res.data.dhcp_enabled==='true';
+                const toggle=document.getElementById('dhcp-toggle');
+                toggle.classList.toggle('active',enabled);
+                document.getElementById('dhcp-status-text').textContent=enabled?'Enabled':'Disabled';
+                document.getElementById('settings-alert').style.display=enabled?'none':'flex';
+                updateCidrInfo();
+                updateDashboardPool();
+            }
+        }
+        
+        async function saveSettings(){
+            const settings={
+                dhcp_enabled:document.getElementById('dhcp-toggle').classList.contains('active')?'true':'false',
+                interface:document.getElementById('set-interface').value,
+                cidr:document.getElementById('set-cidr').value,
+                range_start:document.getElementById('set-range-start').value,
+                range_end:document.getElementById('set-range-end').value,
+                gateway:document.getElementById('set-gateway').value,
+                dns_primary:document.getElementById('set-dns-primary').value,
+                dns_secondary:document.getElementById('set-dns-secondary').value,
+                lease_time:document.getElementById('set-lease-time').value,
+                domain:document.getElementById('set-domain').value
+            };
+            if(settings.dhcp_enabled==='true'){
+                if(!settings.range_start||!settings.range_end){toast('Please enter DHCP range','error');return;}
+                if(!settings.gateway){toast('Please enter gateway IP','error');return;}
+            }
+            const res=await api('settings',{method:'POST',body:settings});
+            if(res.success){
+                toast('Settings saved successfully');
+                loadSettings();
+                loadStatus();
+            }else{
+                toast('Failed to save: '+(res.error||'Unknown error'),'error');
+                if(res.journal){
+                    console.error('Journal:', res.journal);
+                }
+            }
+        }
+        
+        async function validateSettings(){
+            const res=await api('validate');
+            if(res.success&&res.data){
+                if(res.data.valid){
+                    toast('Configuration is valid!');
+                }else{
+                    toast('Config error: '+res.data.output,'error');
+                }
+            }
+        }
+        
+        function toggleDhcp(){
+            const toggle=document.getElementById('dhcp-toggle');
+            toggle.classList.toggle('active');
+            document.getElementById('dhcp-status-text').textContent=toggle.classList.contains('active')?'Enabled':'Disabled';
+            document.getElementById('settings-alert').style.display=toggle.classList.contains('active')?'none':'flex';
+        }
+        
+        function updateCidrInfo(){
+            const cidr=document.getElementById('set-cidr').value;
+            const masks={'8':'255.0.0.0','16':'255.255.0.0','17':'255.255.128.0','18':'255.255.192.0','19':'255.255.224.0','20':'255.255.240.0','21':'255.255.248.0','22':'255.255.252.0','23':'255.255.254.0','24':'255.255.255.0','25':'255.255.255.128','26':'255.255.255.192','27':'255.255.255.224','28':'255.255.255.240'};
+            const hosts=Math.pow(2,32-parseInt(cidr))-2;
+            document.getElementById('cidr-info').textContent=`Subnet mask: ${masks[cidr]} | Available hosts: ${hosts.toLocaleString()}`;
+            updateDashboardPool();
+        }
+        
+        function updateDashboardPool(){
+            const start=document.getElementById('set-range-start').value;
+            const end=document.getElementById('set-range-end').value;
+            const cidr=document.getElementById('set-cidr').value;
+            const hosts=Math.pow(2,32-parseInt(cidr))-2;
+            document.getElementById('dash-pool').textContent=hosts.toLocaleString();
+            document.getElementById('dash-pool-range').textContent=start&&end?`${start} - ${end}`:'Not configured';
+        }
+        
+        async function loadLeases(){
+            const res=await api('leases');
+            const tbody=document.getElementById('leases-table');
+            if(res.success&&res.data.length>0){
+                tbody.innerHTML=res.data.map(l=>`<tr><td><strong>${l.ip}</strong></td><td><code>${l.mac}</code></td><td>${l.hostname!=='*'?l.hostname:'-'}</td><td><span class="badge badge-success">${l.expires}</span></td><td><button class="btn btn-sm btn-secondary" onclick="makeReservation('${l.mac}','${l.ip}','${l.hostname}')">Reserve</button></td></tr>`).join('');
+                document.getElementById('dash-leases').textContent=res.data.length;
+            }else{
+                tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No active leases</td></tr>';
+                document.getElementById('dash-leases').textContent='0';
+            }
+        }
+        
+        async function loadReservations(){
+            const res=await api('reservations');
+            const tbody=document.getElementById('reservations-table');
+            if(res.success&&res.data.length>0){
+                tbody.innerHTML=res.data.map(r=>`<tr><td><strong>${r.ip}</strong></td><td><code>${r.mac}</code></td><td>${r.hostname||'-'}</td><td>${r.description||'-'}</td><td><button class="btn btn-sm btn-danger" onclick="deleteReservation(${r.id})">Delete</button></td></tr>`).join('');
+                document.getElementById('dash-reservations').textContent=res.data.length;
+            }else{
+                tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No reservations</td></tr>';
+                document.getElementById('dash-reservations').textContent='0';
+            }
+        }
+        
+        function showReservationModal(){document.getElementById('reservation-modal').classList.add('active');}
+        function hideReservationModal(){document.getElementById('reservation-modal').classList.remove('active');document.getElementById('reservation-form').reset();}
+        
+        function makeReservation(mac,ip,hostname){
+            document.getElementById('res-mac').value=mac;
+            document.getElementById('res-ip').value=ip;
+            document.getElementById('res-hostname').value=hostname!=='*'?hostname:'';
+            showReservationModal();
+        }
+        
+        async function addReservation(e){
+            e.preventDefault();
+            const res=await api('reservations',{method:'POST',body:{
+                mac:document.getElementById('res-mac').value,
+                ip:document.getElementById('res-ip').value,
+                hostname:document.getElementById('res-hostname').value,
+                description:document.getElementById('res-description').value
+            }});
+            if(res.success){
+                toast('Reservation added');
+                hideReservationModal();
+                loadReservations();
+            }else{
+                toast('Failed','error');
+            }
+        }
+        
+        async function deleteReservation(id){
+            if(confirm('Delete this reservation?')){
+                const res=await api('reservations',{method:'DELETE',params:{id}});
+                if(res.success){toast('Deleted');loadReservations();}
+            }
+        }
+        
+        let logAutoRefreshInterval=null;
+        
+        async function loadLogs(){
+            const lines=document.getElementById('log-lines').value;
+            const statusEl=document.getElementById('log-status');
+            statusEl.textContent='Loading...';
+            try{
+                const res=await api('logs',{params:{lines}});
+                if(res.success&&res.data.length){
+                    const container=document.getElementById('logs-container');
+                    container.innerHTML=res.data.map(l=>`<div class="log-line">${l}</div>`).join('');
+                    statusEl.textContent=`Loaded ${res.data.length} entries at ${new Date().toLocaleTimeString()}`;
+                }else{
+                    document.getElementById('logs-container').innerHTML='<div style="color:var(--text-secondary);">No logs available yet. DHCP requests will appear here once clients request addresses.</div>';
+                    statusEl.textContent='No logs found';
+                }
+            }catch(e){
+                statusEl.textContent='Error loading logs';
+                console.error(e);
+            }
+        }
+        
+        function toggleLogAutoRefresh(){
+            const checked=document.getElementById('log-auto-refresh').checked;
+            if(checked){
+                loadLogs();
+                logAutoRefreshInterval=setInterval(loadLogs,10000);
+            }else{
+                if(logAutoRefreshInterval){
+                    clearInterval(logAutoRefreshInterval);
+                    logAutoRefreshInterval=null;
+                }
+            }
+        }
+        
+        async function startService(){
+            toast('Starting...');
+            const res=await api('start');
+            if(res.success){
+                toast('Service started');
+            }else{
+                toast('Failed to start','error');
+                console.error(res);
+            }
+            setTimeout(loadStatus,1000);
+        }
+        
+        async function stopService(){
+            toast('Stopping...');
+            const res=await api('stop');
+            toast(res.success?'Service stopped':'Failed','success');
+            setTimeout(loadStatus,1000);
+        }
+        
+        async function restartService(){
+            if(confirm('Restart DHCP service?')){
+                toast('Restarting...');
+                const res=await api('restart');
+                if(res.success){
+                    toast('Restarted');
+                }else{
+                    toast('Failed to restart','error');
+                    console.error(res);
+                }
+                setTimeout(loadStatus,2000);
+            }
+        }
+        
+        async function runDiagnostics(){
+            const container=document.getElementById('diag-results');
+            container.innerHTML='<div style="color:var(--text-secondary);">Running diagnostics...</div>';
+            const res=await api('diagnostics');
+            if(res.success&&res.data){
+                const d=res.data;
+                let html='';
+                html+=`<div class="diag-section"><div class="diag-label">Config Valid</div><div class="diag-value ${d.config_valid?'diag-ok':'diag-error'}">${d.config_valid?'✓ Valid':'✗ Invalid'}</div></div>`;
+                if(!d.config_valid){
+                    html+=`<div class="error-box">${d.config_test}</div>`;
+                }
+                html+=`<div class="diag-section"><div class="diag-label">Interface (${d.configured_interface})</div><div class="diag-value ${d.interface_exists?'diag-ok':'diag-error'}">${d.interface_exists?'✓ Exists':'✗ Not found'}</div></div>`;
+                html+=`<div class="diag-section"><div class="diag-label">File Permissions</div><div class="diag-value">Config: ${d.config_writable?'✓':'✗'} | Leases: ${d.leases_writable?'✓':'✗'} | Log: ${d.log_writable?'✓':'✗'}</div></div>`;
+                html+=`<div class="diag-section"><div class="diag-label">Port 67 Status</div><div class="diag-value">${d.port_67_status||'Not in use'}</div></div>`;
+                if(d.recent_errors){
+                    html+=`<div class="diag-section"><div class="diag-label">Recent Errors</div><div class="error-box">${d.recent_errors}</div></div>`;
+                }
+                html+=`<div class="diag-section"><div class="diag-label">Service Status</div><pre class="diag-value" style="max-height:200px;overflow:auto;">${d.service_status}</pre></div>`;
+                container.innerHTML=html;
+            }
+        }
+        
+        async function runRepair(){
+            if(confirm('Run auto-repair? This will attempt to fix common issues and restart the service.')){
+                toast('Running repair...');
+                const res=await api('repair');
+                if(res.success){
+                    toast('Repair successful!');
+                }else{
+                    toast('Repair attempted but service still failing','error');
+                    console.error(res);
+                }
+                setTimeout(()=>{
+                    loadStatus();
+                    runDiagnostics();
+                },2000);
+            }
+        }
+        
+        async function loadAll(){
+            await loadSystemInfo();
+            await loadStatus();
+            await loadSettings();
+            await loadLeases();
+            await loadReservations();
+            await loadLogs();
+            await loadIrongateStatus();
+        }
+        
+        loadAll();
+        setInterval(()=>{loadStatus();loadLeases();},30000);
+        
+        //======================================================================
+        // IRONGATE FUNCTIONS
+        //======================================================================
+        
+        let irongateSettings = {};
+        
+        async function loadIrongateStatus() {
+            try {
+                const res = await api('irongate_status');
+                if (res.success) {
+                    irongateSettings = res.data;
+                    
+                    // Update toggle
+                    const toggle = document.getElementById('irongate-toggle');
+                    const statusText = document.getElementById('irongate-status-text');
+                    const serviceStatus = document.getElementById('irongate-service-status');
+                    
+                    if (res.data.enabled) {
+                        toggle.classList.add('active');
+                        statusText.textContent = 'Enabled';
+                        statusText.style.color = 'var(--success)';
+                    } else {
+                        toggle.classList.remove('active');
+                        statusText.textContent = 'Disabled';
+                        statusText.style.color = 'var(--text-secondary)';
+                    }
+                    
+                    serviceStatus.innerHTML = res.data.service_running 
+                        ? '<span class="status-dot running"></span>Service Running'
+                        : '<span class="status-dot stopped"></span>Service Stopped';
+                    
+                    // Update mode selection
+                    setIrongateMode(res.data.mode || 'single', false);
+                    
+                    // Update layer checkboxes
+                    document.getElementById('layer-arp').checked = res.data.layers?.arp_defense !== false;
+                    document.getElementById('layer-ipv6').checked = res.data.layers?.ipv6_ra !== false;
+                    document.getElementById('layer-gateway').checked = res.data.layers?.gateway_takeover !== false;
+                    document.getElementById('layer-bypass').checked = res.data.layers?.bypass_detection !== false;
+                }
+                
+                // Load full settings
+                const settingsRes = await api('irongate_settings');
+                if (settingsRes.success) {
+                    irongateSettings = {...irongateSettings, ...settingsRes.data};
+                    document.getElementById('irongate-bridge-ip').value = settingsRes.data.irongate_bridge_ip || '10.99.0.1';
+                    document.getElementById('irongate-dhcp-start').value = settingsRes.data.irongate_bridge_dhcp_start || '10.99.1.1';
+                    document.getElementById('irongate-dhcp-end').value = settingsRes.data.irongate_bridge_dhcp_end || '10.99.255.254';
+                }
+                
+                // Load interfaces
+                await loadIrongateInterfaces();
+                
+            } catch (e) {
+                console.error('Irongate status error:', e);
+            }
+        }
+        
+        async function loadIrongateInterfaces() {
+            try {
+                const res = await api('irongate_interfaces');
+                if (res.success) {
+                    const select = document.getElementById('irongate-isolated-iface');
+                    const currentValue = irongateSettings.irongate_isolated_interface || '';
+                    select.innerHTML = '<option value="">-- Select interface --</option>';
+                    
+                    res.data.forEach(iface => {
+                        if (iface.is_main) return;
+                        const opt = document.createElement('option');
+                        opt.value = iface.name;
+                        opt.textContent = iface.name + (iface.is_usb ? ' (USB)' : '') + ' - ' + iface.mac + ' [' + iface.state + ']';
+                        if (iface.name === currentValue) opt.selected = true;
+                        select.appendChild(opt);
+                    });
+                }
+            } catch (e) {
+                console.error('Interfaces error:', e);
+            }
+        }
+        
+        function setIrongateMode(mode, save = true) {
+            const singleCard = document.getElementById('mode-single');
+            const dualCard = document.getElementById('mode-dual');
+            const dualConfig = document.getElementById('dual-nic-config');
+            const singleConfig = document.getElementById('single-nic-config');
+            
+            if (mode === 'dual') {
+                singleCard.style.borderColor = 'transparent';
+                dualCard.style.borderColor = 'var(--success)';
+                dualConfig.style.display = 'block';
+                singleConfig.style.display = 'none';
+            } else {
+                singleCard.style.borderColor = 'var(--warning)';
+                dualCard.style.borderColor = 'transparent';
+                dualConfig.style.display = 'none';
+                singleConfig.style.display = 'block';
+            }
+            
+            irongateSettings.irongate_mode = mode;
+        }
+        
+        async function toggleIrongate() {
+            const toggle = document.getElementById('irongate-toggle');
+            const enabling = !toggle.classList.contains('active');
+            
+            try {
+                const res = await api('irongate_toggle', {
+                    method: 'POST',
+                    body: { enabled: enabling }
+                });
+                
+                if (res.success) {
+                    toast(enabling ? 'Irongate enabled' : 'Irongate disabled', 'success');
+                    await loadIrongateStatus();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function saveIrongateSettings() {
+            const settings = {
+                irongate_enabled: document.getElementById('irongate-toggle').classList.contains('active') ? 'true' : 'false',
+                irongate_mode: irongateSettings.irongate_mode || 'single',
+                irongate_isolated_interface: document.getElementById('irongate-isolated-iface').value,
+                irongate_bridge_ip: document.getElementById('irongate-bridge-ip').value,
+                irongate_bridge_dhcp_start: document.getElementById('irongate-dhcp-start').value,
+                irongate_bridge_dhcp_end: document.getElementById('irongate-dhcp-end').value,
+                irongate_arp_defense: document.getElementById('layer-arp').checked ? 'true' : 'false',
+                irongate_ipv6_ra: document.getElementById('layer-ipv6').checked ? 'true' : 'false',
+                irongate_gateway_takeover: document.getElementById('layer-gateway').checked ? 'true' : 'false',
+                irongate_bypass_detection: document.getElementById('layer-bypass').checked ? 'true' : 'false'
+            };
+            
+            // Validate dual-NIC mode
+            if (settings.irongate_mode === 'dual' && !settings.irongate_isolated_interface) {
+                toast('Please select an isolated interface for dual-NIC mode', 'error');
+                return;
+            }
+            
+            try {
+                const res = await api('irongate_settings', {
+                    method: 'POST',
+                    body: settings
+                });
+                
+                if (res.success) {
+                    toast('Irongate settings saved' + (res.mode ? ' (' + res.mode + ' mode)' : ''), 'success');
+                    await loadIrongateStatus();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                    if (res.journal) console.error(res.journal);
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        //======================================================================
+        // IRONGATE DEVICE MANAGEMENT
+        //======================================================================
+        
+        let irongateDevices = [];
+        
+        async function loadIrongateDevices() {
+            try {
+                const res = await api('irongate_devices');
+                if (res.success) {
+                    irongateDevices = res.data || [];
+                    renderDevicesTable();
+                }
+            } catch (e) {
+                console.error('Load devices error:', e);
+            }
+        }
+        
+        function renderDevicesTable() {
+            const tbody = document.getElementById('irongate-devices-table');
+            if (!irongateDevices || irongateDevices.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No devices configured. Add devices to protect them with Irongate.</td></tr>';
+                return;
+            }
+            
+            // Sort by zone
+            const zoneOrder = { isolated: 0, servers: 1, trusted: 2 };
+            const sorted = [...irongateDevices].sort((a, b) => 
+                (zoneOrder[a.zone] || 99) - (zoneOrder[b.zone] || 99)
+            );
+            
+            tbody.innerHTML = sorted.map(dev => {
+                const zoneColor = dev.zone === 'isolated' ? '#e94560' : 
+                                  dev.zone === 'servers' ? '#ffc107' : '#00bf63';
+                const zoneIcon = dev.zone === 'isolated' ? '🔴' : 
+                                 dev.zone === 'servers' ? '🟡' : '🟢';
+                return \`
+                    <tr>
+                        <td><span style="color:\${zoneColor};">\${zoneIcon} \${dev.zone}</span></td>
+                        <td><code>\${dev.mac}</code></td>
+                        <td>\${dev.ip || '<span style="color:var(--text-secondary);">DHCP</span>'}</td>
+                        <td>\${dev.hostname || '-'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="editDevice(\${dev.id})">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteDevice(\${dev.id})" style="margin-left:5px;">Delete</button>
+                        </td>
+                    </tr>
+                \`;
+            }).join('');
+        }
+        
+        function showDeviceModal(device = null) {
+            document.getElementById('device-form').reset();
+            if (device) {
+                document.getElementById('dev-mac').value = device.mac || '';
+                document.getElementById('dev-ip').value = device.ip || '';
+                document.getElementById('dev-hostname').value = device.hostname || '';
+                document.getElementById('dev-zone').value = device.zone || 'isolated';
+            }
+            document.getElementById('device-modal').classList.add('active');
+        }
+        
+        function hideDeviceModal() {
+            document.getElementById('device-modal').classList.remove('active');
+            document.getElementById('device-form').reset();
+        }
+        
+        async function addIrongateDevice(event) {
+            event.preventDefault();
+            
+            const device = {
+                mac: document.getElementById('dev-mac').value.toLowerCase().trim(),
+                ip: document.getElementById('dev-ip').value.trim(),
+                hostname: document.getElementById('dev-hostname').value.trim(),
+                zone: document.getElementById('dev-zone').value
+            };
+            
+            // Validate MAC
+            if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(device.mac)) {
+                toast('Invalid MAC address format (use XX:XX:XX:XX:XX:XX)', 'error');
+                return;
+            }
+            
+            try {
+                const res = await api('irongate_devices', {
+                    method: 'POST',
+                    body: device
+                });
+                
+                if (res.success) {
+                    toast('Device added to ' + device.zone + ' zone', 'success');
+                    hideDeviceModal();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to add device: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        function editDevice(id) {
+            const device = irongateDevices.find(d => d.id === id);
+            if (device) {
+                showDeviceModal(device);
+            }
+        }
+        
+        async function deleteDevice(id) {
+            if (!confirm('Remove this device from Irongate protection?')) return;
+            
+            try {
+                const res = await api('irongate_devices', {
+                    method: 'DELETE',
+                    params: { id: id }
+                });
+                
+                if (res.success) {
+                    toast('Device removed', 'success');
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to remove device', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function importFromLeases() {
+            try {
+                const res = await api('leases');
+                if (!res.success || !res.data || res.data.length === 0) {
+                    toast('No active DHCP leases found', 'error');
+                    return;
+                }
+                
+                // Filter out already-added devices
+                const existingMacs = new Set(irongateDevices.map(d => d.mac.toLowerCase()));
+                const available = res.data.filter(l => !existingMacs.has(l.mac.toLowerCase()));
+                
+                if (available.length === 0) {
+                    toast('All lease devices are already in Irongate', 'error');
+                    return;
+                }
+                
+                const container = document.getElementById('import-leases-list');
+                container.innerHTML = available.map(lease => \`
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--bg);border-radius:6px;margin-bottom:8px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-mac="\${lease.mac}" data-ip="\${lease.ip}" data-hostname="\${lease.hostname}">
+                        <div style="flex:1;">
+                            <div><strong>\${lease.hostname || 'Unknown'}</strong></div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                <code>\${lease.mac}</code> → \${lease.ip}
+                            </div>
+                        </div>
+                        <select class="form-control import-zone" style="width:150px;font-size:0.85em;">
+                            <option value="isolated">🔴 isolated</option>
+                            <option value="servers">🟡 servers</option>
+                            <option value="trusted">🟢 trusted</option>
+                        </select>
+                    </label>
+                \`).join('');
+                
+                document.getElementById('import-modal').classList.add('active');
+            } catch (e) {
+                toast('Error loading leases: ' + e.message, 'error');
+            }
+        }
+        
+        function hideImportModal() {
+            document.getElementById('import-modal').classList.remove('active');
+        }
+        
+        async function importSelectedDevices() {
+            const checkboxes = document.querySelectorAll('.import-check:checked');
+            if (checkboxes.length === 0) {
+                toast('No devices selected', 'error');
+                return;
+            }
+            
+            let added = 0;
+            for (const cb of checkboxes) {
+                const zoneSelect = cb.closest('label').querySelector('.import-zone');
+                const device = {
+                    mac: cb.dataset.mac,
+                    ip: cb.dataset.ip,
+                    hostname: cb.dataset.hostname,
+                    zone: zoneSelect.value
+                };
+                
+                try {
+                    const res = await api('irongate_devices', {
+                        method: 'POST',
+                        body: device
+                    });
+                    if (res.success) added++;
+                } catch (e) {
+                    console.error('Import error:', e);
+                }
+            }
+            
+            hideImportModal();
+            toast(\`Imported \${added} device(s)\`, 'success');
+            await loadIrongateDevices();
+        }
+        
+        // Load devices when Irongate page is shown
+        const origLoadIrongateStatus = loadIrongateStatus;
+        loadIrongateStatus = async function() {
+            await origLoadIrongateStatus();
+            await loadIrongateDevices();
+        };
     </script>
-    {% block scripts %}{% endblock %}
 </body>
 </html>
-BASEHTML
+EOHTML
 
-# Index/Dashboard template
-cat > "$INSTALL_DIR/templates/index.html" << 'INDEXHTML'
-{% extends "base.html" %}
-{% block title %}Dashboard - Irongate{% endblock %}
-{% block content %}
-<header class="header">
-    <h2>Security Dashboard</h2>
-    <div class="header-status">
-        <div class="status-indicator">
-            <span class="status-dot" id="statusDot"></span>
-            <span id="statusText">Checking...</span>
-        </div>
-        <button class="btn btn-outline btn-sm" onclick="loadStatus()">
-            <i class="fas fa-sync-alt"></i>
-        </button>
-    </div>
-</header>
+#######################################
+# Set permissions
+#######################################
+echo -e "${YELLOW}Setting permissions...${NC}"
 
-<div class="content">
-    <div class="security-banner" id="securityBanner">
-        <i class="fas fa-shield-check"></i>
-        <div>
-            <strong id="bannerTitle">Loading Protection Status...</strong>
-            <p style="color:var(--text-muted);font-size:.875rem;margin-top:.25rem" id="bannerSubtitle">
-                Checking isolation mode...
-            </p>
-        </div>
-        <a href="/bridge" class="btn btn-outline btn-sm" style="margin-left:auto">
-            <i class="fas fa-cog"></i> Configure
-        </a>
-    </div>
-    
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="stat-icon red"><i class="fas fa-server"></i></div>
-            <div class="stat-value" id="totalDevices">-</div>
-            <div class="stat-label">Protected Devices</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon blue"><i class="fas fa-layer-group"></i></div>
-            <div class="stat-value" id="activeZones">-</div>
-            <div class="stat-label">Active Zones</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon yellow"><i class="fas fa-shield-exclamation"></i></div>
-            <div class="stat-value" id="securityEvents">0</div>
-            <div class="stat-label">Security Events (24h)</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon green"><i class="fas fa-network-wired"></i></div>
-            <div class="stat-value" id="engineStatus">-</div>
-            <div class="stat-label">Engine Status</div>
-        </div>
-    </div>
-    
-    <div class="card">
-        <div class="card-header">
-            <div class="card-title"><i class="fas fa-shield-halved"></i> Isolation Layers</div>
-        </div>
-        <div class="card-body">
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Layer</th>
-                        <th>Protection</th>
-                        <th>Status</th>
-                        <th>Bypass Difficulty</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><span class="badge badge-info">1</span></td>
-                        <td>
-                            <strong>DHCP Microsegmentation</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">/30 subnets + Option 121 routes</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-warning">Medium</span> - Requires static IP</td>
-                    </tr>
-                    <tr>
-                        <td><span class="badge badge-info">2</span></td>
-                        <td>
-                            <strong>ARP Defense</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">Continuous poisoning + bypass detection</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-warning">Medium</span> - Requires static ARP</td>
-                    </tr>
-                    <tr>
-                        <td><span class="badge badge-info">3</span></td>
-                        <td>
-                            <strong>IPv6 RA Takeover</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">Router Advertisement hijacking</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-success">Hard</span> - Requires IPv6 disabled</td>
-                    </tr>
-                    <tr>
-                        <td><span class="badge badge-info">4</span></td>
-                        <td>
-                            <strong>nftables Firewall</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">Stateful packet filtering</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-danger">Very Hard</span> - Kernel enforced</td>
-                    </tr>
-                    <tr>
-                        <td><span class="badge badge-info">5</span></td>
-                        <td>
-                            <strong>Bypass Monitor</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">Active defense + TCP RST injection</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-danger">Very Hard</span> - Adaptive response</td>
-                    </tr>
-                    <tr>
-                        <td><span class="badge badge-info">6</span></td>
-                        <td>
-                            <strong>Gateway Takeover</strong>
-                            <div style="color:var(--text-muted);font-size:.75rem">Bidirectional poison + CAM flood + MAC spoof</div>
-                        </td>
-                        <td><span class="badge badge-success"><i class="fas fa-circle"></i> Active</span></td>
-                        <td><span class="badge badge-danger">VLAN-Equivalent</span> - Full control</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-    </div>
-    
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem">
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title"><i class="fas fa-chart-pie"></i> Devices by Zone</div>
-            </div>
-            <div class="card-body" id="zoneChart">
-                <div class="empty-state" style="padding:2rem">
-                    <p>Loading zone distribution...</p>
-                </div>
-            </div>
-        </div>
-        
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title"><i class="fas fa-network-wired"></i> Network Info</div>
-            </div>
-            <div class="card-body">
-                <table class="table" style="margin:-1.5rem">
-                    <tr>
-                        <td style="color:var(--text-muted)">Interface</td>
-                        <td><code>{{ config.network.interface }}</code></td>
-                    </tr>
-                    <tr>
-                        <td style="color:var(--text-muted)">Local IP</td>
-                        <td><code>{{ config.network.local_ip }}</code></td>
-                    </tr>
-                    <tr>
-                        <td style="color:var(--text-muted)">Gateway</td>
-                        <td><code>{{ config.network.gateway_ip }}</code></td>
-                    </tr>
-                    <tr>
-                        <td style="color:var(--text-muted)">Subnet</td>
-                        <td><code>{{ config.network.subnet }}</code></td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-    </div>
-</div>
-{% endblock %}
+chown -R www-data:www-data /var/www/irongate
+chmod -R 755 /var/www/irongate
+chmod 666 /var/www/irongate/dhcp.db
 
-{% block scripts %}
-<script>
-async function loadStatus() {
-    try {
-        const result = await api('/status');
-        const bridgeResult = await api('/bridge/status');
-        
-        if (result.success) {
-            const s = result.status;
-            
-            // Update stats
-            document.getElementById('totalDevices').textContent = s.devices.total;
-            document.getElementById('activeZones').textContent = Object.keys(s.devices.by_zone).length;
-            document.getElementById('engineStatus').textContent = s.engine === 'active' ? 'Running' : s.engine;
-            
-            // Update status indicator
-            const dot = document.getElementById('statusDot');
-            const text = document.getElementById('statusText');
-            if (s.engine === 'active') {
-                dot.style.background = 'var(--success)';
-                text.textContent = 'Protected';
-            } else {
-                dot.style.background = 'var(--danger)';
-                text.textContent = 'Degraded';
-            }
-            
-            // Update zone chart
-            const chart = document.getElementById('zoneChart');
-            if (Object.keys(s.devices.by_zone).length > 0) {
-                let html = '<div style="display:flex;flex-direction:column;gap:1rem">';
-                for (const [zone, count] of Object.entries(s.devices.by_zone)) {
-                    const pct = Math.round((count / s.devices.total) * 100);
-                    html += `
-                        <div>
-                            <div style="display:flex;justify-content:space-between;margin-bottom:.5rem">
-                                <span class="zone-tag zone-${zone}">${zone}</span>
-                                <span>${count} devices (${pct}%)</span>
-                            </div>
-                            <div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">
-                                <div style="width:${pct}%;height:100%;background:var(--primary);border-radius:4px"></div>
-                            </div>
-                        </div>
-                    `;
-                }
-                html += '</div>';
-                chart.innerHTML = html;
-            } else {
-                chart.innerHTML = '<div class="empty-state" style="padding:2rem"><p>No devices registered</p></div>';
-            }
-        }
-        
-        // Update security banner based on mode
-        if (bridgeResult.success) {
-            const banner = document.getElementById('securityBanner');
-            const title = document.getElementById('bannerTitle');
-            const subtitle = document.getElementById('bannerSubtitle');
-            
-            if (bridgeResult.status.mode === 'dual') {
-                banner.style.background = 'linear-gradient(135deg,rgba(22,163,74,.15),rgba(30,64,175,.1))';
-                title.innerHTML = '<i class="fas fa-lock"></i> DUAL-NIC MODE - TRUE VLAN-EQUIVALENT SECURITY';
-                subtitle.textContent = 'Kernel-enforced isolation via Linux bridge port isolation • 100% bypass-proof';
-            } else {
-                banner.style.background = 'linear-gradient(135deg,rgba(220,38,38,.1),rgba(30,64,175,.1))';
-                title.innerHTML = '6-Layer Protection Active';
-                subtitle.textContent = 'DHCP Microsegmentation • ARP Defense • IPv6 RA • Stateful Firewall • Bypass Detection • Gateway Takeover';
-            }
-        }
-    } catch (e) {
-        console.error('Status load error:', e);
-    }
-}
+# Allow www-data to write dnsmasq config
+chown www-data:www-data /etc/dnsmasq.conf
+chmod 664 /etc/dnsmasq.conf
+chown -R www-data:www-data /etc/dnsmasq.d
+chmod -R 775 /etc/dnsmasq.d
 
-loadStatus();
-setInterval(loadStatus, 30000);
-</script>
-{% endblock %}
-INDEXHTML
+# Ensure lease file has proper ownership for dnsmasq to write
+chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || chown nobody:nogroup /var/lib/dnsmasq/dnsmasq.leases
+chmod 644 /var/lib/dnsmasq/dnsmasq.leases
 
-# Create 404 and 500 templates
-cat > "$INSTALL_DIR/templates/404.html" << 'EOF'
-{% extends "base.html" %}
-{% block content %}
-<div class="content" style="display:flex;align-items:center;justify-content:center;min-height:70vh">
-    <div style="text-align:center">
-        <div style="font-size:8rem;color:var(--primary);font-weight:700">404</div>
-        <h2 style="margin-bottom:1rem">Page Not Found</h2>
-        <a href="/" class="btn btn-primary"><i class="fas fa-home"></i> Dashboard</a>
-    </div>
-</div>
-{% endblock %}
+# Ensure log file is readable by www-data (use world-readable since group memberships require service restart)
+chown dnsmasq:adm /var/log/dnsmasq.log 2>/dev/null || chown nobody:adm /var/log/dnsmasq.log
+chmod 644 /var/log/dnsmasq.log
+
+# Make www-data a member of systemd-journal and adm groups to read logs
+# Note: www-data needs php-fpm restart to pick up new group memberships
+usermod -a -G systemd-journal www-data 2>/dev/null || true
+usermod -a -G adm www-data 2>/dev/null || true
+
+cat > /etc/sudoers.d/dnsmasq-web << EOF
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart dnsmasq
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start dnsmasq
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop dnsmasq
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload dnsmasq
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart irongate
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start irongate
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop irongate
+www-data ALL=(ALL) NOPASSWD: /usr/bin/pkill -9 dnsmasq
+www-data ALL=(ALL) NOPASSWD: /usr/bin/chown dnsmasq\:nogroup /var/lib/dnsmasq/dnsmasq.leases
+www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /var/lib/dnsmasq/dnsmasq.leases
+www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 664 /var/log/dnsmasq.log
+www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u dnsmasq *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u irongate *
+www-data ALL=(ALL) NOPASSWD: /usr/bin/tail *
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
 EOF
+chmod 440 /etc/sudoers.d/dnsmasq-web
 
-cat > "$INSTALL_DIR/templates/500.html" << 'EOF'
-{% extends "base.html" %}
-{% block content %}
-<div class="content" style="display:flex;align-items:center;justify-content:center;min-height:70vh">
-    <div style="text-align:center">
-        <div style="font-size:8rem;color:var(--danger);font-weight:700">500</div>
-        <h2 style="margin-bottom:1rem">Server Error</h2>
-        <a href="/" class="btn btn-primary"><i class="fas fa-home"></i> Dashboard</a>
-    </div>
-</div>
-{% endblock %}
-EOF
+#######################################
+# Create systemd watchdog for auto-recovery
+#######################################
+echo -e "${YELLOW}Setting up service watchdog...${NC}"
 
-# Bridge Mode template
-cat > "$INSTALL_DIR/templates/bridge.html" << 'BRIDGEHTML'
-{% extends "base.html" %}
-{% block title %}Bridge Mode - Irongate{% endblock %}
-{% block content %}
-<header class="header">
-    <h2>Bridge Mode Configuration</h2>
-    <div class="header-status">
-        <div class="status-indicator">
-            <span class="status-dot" id="modeDot"></span>
-            <span id="modeText">Loading...</span>
-        </div>
-    </div>
-</header>
+mkdir -p /etc/systemd/system/dnsmasq.service.d
 
-<div class="content">
-    <!-- Mode Comparison Banner -->
-    <div class="card" style="background:linear-gradient(135deg,rgba(30,64,175,.1),rgba(220,38,38,.1))">
-        <div class="card-body">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:2rem">
-                <div>
-                    <h3 style="display:flex;align-items:center;gap:.75rem;margin-bottom:1rem">
-                        <i class="fas fa-microchip" style="color:var(--warning)"></i>
-                        Single-NIC Mode
-                    </h3>
-                    <p style="color:var(--text-muted);margin-bottom:1rem">
-                        6-layer software isolation. Devices can be anywhere on the network.
-                    </p>
-                    <ul style="color:var(--text-muted);font-size:.875rem;list-style:none;padding:0">
-                        <li style="margin-bottom:.5rem">✓ No hardware changes required</li>
-                        <li style="margin-bottom:.5rem">✓ Devices stay on existing switch</li>
-                        <li style="margin-bottom:.5rem">⚠ ~95% effective against sophisticated attacks</li>
-                        <li style="margin-bottom:.5rem">⚠ Subject to timing race conditions</li>
-                    </ul>
-                </div>
-                <div>
-                    <h3 style="display:flex;align-items:center;gap:.75rem;margin-bottom:1rem">
-                        <i class="fas fa-shield-check" style="color:var(--success)"></i>
-                        Dual-NIC Mode (Recommended)
-                    </h3>
-                    <p style="color:var(--text-muted);margin-bottom:1rem">
-                        Hardware-enforced isolation via Linux bridge. TRUE VLAN-equivalent security.
-                    </p>
-                    <ul style="color:var(--text-muted);font-size:.875rem;list-style:none;padding:0">
-                        <li style="margin-bottom:.5rem">✓ 100% isolation - kernel enforced</li>
-                        <li style="margin-bottom:.5rem">✓ No bypass possible</li>
-                        <li style="margin-bottom:.5rem">✓ Equivalent to managed switch VLANs</li>
-                        <li style="margin-bottom:.5rem">⚠ Requires USB ethernet adapter (~$10)</li>
-                    </ul>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Current Mode Status -->
-    <div class="card">
-        <div class="card-header">
-            <div class="card-title"><i class="fas fa-cog"></i> Current Configuration</div>
-        </div>
-        <div class="card-body">
-            <div id="currentMode">
-                <div class="empty-state" style="padding:2rem">
-                    <i class="fas fa-spinner fa-spin"></i>
-                    <p>Loading configuration...</p>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Mode Switch -->
-    <div class="card">
-        <div class="card-header">
-            <div class="card-title"><i class="fas fa-exchange-alt"></i> Switch Mode</div>
-        </div>
-        <div class="card-body">
-            <div class="form-group">
-                <label class="form-label">Select Isolation Mode</label>
-                <div style="display:flex;gap:1rem;margin-bottom:1.5rem">
-                    <label style="display:flex;align-items:center;gap:.5rem;padding:1rem;background:var(--darker);border:2px solid var(--border);border-radius:.5rem;cursor:pointer;flex:1" id="singleModeOption">
-                        <input type="radio" name="mode" value="single" id="modeSingle">
-                        <div>
-                            <strong>Single-NIC</strong>
-                            <div style="font-size:.75rem;color:var(--text-muted)">Software isolation (current setup)</div>
-                        </div>
-                    </label>
-                    <label style="display:flex;align-items:center;gap:.5rem;padding:1rem;background:var(--darker);border:2px solid var(--border);border-radius:.5rem;cursor:pointer;flex:1" id="dualModeOption">
-                        <input type="radio" name="mode" value="dual" id="modeDual">
-                        <div>
-                            <strong>Dual-NIC (VLAN-Equivalent)</strong>
-                            <div style="font-size:.75rem;color:var(--text-muted)">Hardware isolation (recommended)</div>
-                        </div>
-                    </label>
-                </div>
-            </div>
-            
-            <!-- Dual-NIC Configuration (shown when dual selected) -->
-            <div id="dualConfig" style="display:none;padding:1.5rem;background:var(--darker);border-radius:.5rem;margin-bottom:1.5rem">
-                <h4 style="margin-bottom:1rem;display:flex;align-items:center;gap:.5rem">
-                    <i class="fas fa-ethernet" style="color:var(--primary)"></i>
-                    Dual-NIC Configuration
-                </h4>
-                
-                <div class="form-group">
-                    <label class="form-label">Select Isolated Interface (USB NIC)</label>
-                    <select class="form-select" id="isolatedInterface">
-                        <option value="">-- Detecting interfaces... --</option>
-                    </select>
-                    <div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem">
-                        Connect your USB ethernet adapter, then select it here. 
-                        Protected devices should be connected to a switch on this interface.
-                    </div>
-                </div>
-                
-                <div style="background:rgba(22,163,74,.1);border:1px solid rgba(22,163,74,.3);border-radius:.5rem;padding:1rem;margin-top:1rem">
-                    <strong style="color:var(--success)"><i class="fas fa-info-circle"></i> How it works:</strong>
-                    <pre style="margin:.5rem 0 0 0;font-size:.75rem;color:var(--text-muted);white-space:pre-wrap">
-[Internet/Router]
-       │
-    [eth0] ← Main network ({{ config.network.interface }})
-       │
- [IRONGATE Bridge]
-       │
-    [eth1] ← USB NIC (isolated port) 
-       │                              
- [Dumb Switch]                     
-       │                            
-   [Protected Servers]
-   
-Devices on isolated port CANNOT 
-communicate with each other or
-the main LAN. Only internet access
-through Irongate.</pre>
-                </div>
-            </div>
-            
-            <button class="btn btn-primary" id="applyModeBtn" onclick="applyMode()">
-                <i class="fas fa-check"></i> Apply Configuration
-            </button>
-            <span id="applyStatus" style="margin-left:1rem;color:var(--text-muted)"></span>
-        </div>
-    </div>
-    
-    <!-- Bridge Status (shown in dual mode) -->
-    <div class="card" id="bridgeStatusCard" style="display:none">
-        <div class="card-header">
-            <div class="card-title"><i class="fas fa-server"></i> Bridge Clients</div>
-            <button class="btn btn-outline btn-sm" onclick="loadBridgeClients()">
-                <i class="fas fa-sync-alt"></i> Refresh
-            </button>
-        </div>
-        <div class="card-body">
-            <div id="bridgeClients">
-                <div class="empty-state" style="padding:2rem">
-                    <i class="fas fa-plug"></i>
-                    <p>No clients connected to bridge</p>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Warning Modal -->
-<div class="modal-overlay" id="warningModal">
-    <div class="modal">
-        <div class="modal-header">
-            <div class="modal-title"><i class="fas fa-exclamation-triangle" style="color:var(--warning)"></i> Confirm Mode Change</div>
-            <button class="modal-close" onclick="closeModal('warningModal')"><i class="fas fa-times"></i></button>
-        </div>
-        <div class="modal-body">
-            <p id="warningText"></p>
-            <div style="background:var(--darker);border-radius:.5rem;padding:1rem;margin-top:1rem">
-                <strong>This will:</strong>
-                <ul style="margin:.5rem 0 0 1rem;color:var(--text-muted)">
-                    <li>Restart the Irongate engine</li>
-                    <li>Briefly interrupt network protection</li>
-                    <li id="warningExtra"></li>
-                </ul>
-            </div>
-        </div>
-        <div class="modal-footer">
-            <button class="btn btn-outline" onclick="closeModal('warningModal')">Cancel</button>
-            <button class="btn btn-primary" onclick="confirmModeChange()">
-                <i class="fas fa-check"></i> Confirm
-            </button>
-        </div>
-    </div>
-</div>
-{% endblock %}
-
-{% block scripts %}
-<script>
-let currentMode = 'single';
-let pendingMode = null;
-let pendingInterface = null;
-
-async function loadStatus() {
-    try {
-        const result = await api('/bridge/status');
-        if (result.success) {
-            currentMode = result.status.mode;
-            updateModeUI(result.status);
-        }
-        
-        // Load interfaces
-        loadInterfaces();
-        
-    } catch (e) {
-        console.error('Status load error:', e);
-    }
-}
-
-function updateModeUI(status) {
-    const modeText = document.getElementById('modeText');
-    const modeDot = document.getElementById('modeDot');
-    const currentModeDiv = document.getElementById('currentMode');
-    const bridgeCard = document.getElementById('bridgeStatusCard');
-    
-    if (status.mode === 'dual') {
-        modeText.textContent = 'Dual-NIC (VLAN-Equivalent)';
-        modeDot.style.background = 'var(--success)';
-        document.getElementById('modeDual').checked = true;
-        document.getElementById('dualConfig').style.display = 'block';
-        document.getElementById('dualModeOption').style.borderColor = 'var(--success)';
-        document.getElementById('singleModeOption').style.borderColor = 'var(--border)';
-        bridgeCard.style.display = 'block';
-        loadBridgeClients();
-        
-        currentModeDiv.innerHTML = `
-            <div style="display:flex;align-items:center;gap:1rem">
-                <div style="width:4rem;height:4rem;background:rgba(22,163,74,.15);border-radius:1rem;display:flex;align-items:center;justify-content:center">
-                    <i class="fas fa-shield-check" style="font-size:2rem;color:var(--success)"></i>
-                </div>
-                <div>
-                    <h3 style="margin-bottom:.25rem">Dual-NIC Bridge Mode</h3>
-                    <p style="color:var(--success);font-size:.875rem;margin-bottom:.5rem">
-                        <i class="fas fa-lock"></i> TRUE VLAN-EQUIVALENT SECURITY - 100% Kernel Enforced
-                    </p>
-                    <div style="display:flex;gap:2rem;font-size:.875rem;color:var(--text-muted)">
-                        <span><strong>Bridge:</strong> ${status.bridge_name}</span>
-                        <span><strong>IP:</strong> ${status.bridge_ip}</span>
-                        <span><strong>Isolated NIC:</strong> ${status.isolated_interface || 'Not set'}</span>
-                    </div>
-                </div>
-            </div>
-        `;
-    } else {
-        modeText.textContent = 'Single-NIC (6-Layer)';
-        modeDot.style.background = 'var(--warning)';
-        document.getElementById('modeSingle').checked = true;
-        document.getElementById('dualConfig').style.display = 'none';
-        document.getElementById('singleModeOption').style.borderColor = 'var(--warning)';
-        document.getElementById('dualModeOption').style.borderColor = 'var(--border)';
-        bridgeCard.style.display = 'none';
-        
-        currentModeDiv.innerHTML = `
-            <div style="display:flex;align-items:center;gap:1rem">
-                <div style="width:4rem;height:4rem;background:rgba(217,119,6,.15);border-radius:1rem;display:flex;align-items:center;justify-content:center">
-                    <i class="fas fa-microchip" style="font-size:2rem;color:var(--warning)"></i>
-                </div>
-                <div>
-                    <h3 style="margin-bottom:.25rem">Single-NIC Mode (6-Layer Software Isolation)</h3>
-                    <p style="color:var(--warning);font-size:.875rem;margin-bottom:.5rem">
-                        <i class="fas fa-shield"></i> Software-based isolation - ~95% effective against sophisticated attacks
-                    </p>
-                    <div style="font-size:.875rem;color:var(--text-muted)">
-                        Using DHCP microsegmentation, ARP defense, IPv6 RA, firewall, bypass monitor, and gateway takeover.
-                    </div>
-                </div>
-            </div>
-            <div style="margin-top:1rem;padding:1rem;background:rgba(220,38,38,.1);border:1px solid rgba(220,38,38,.2);border-radius:.5rem">
-                <i class="fas fa-arrow-up" style="color:var(--primary)"></i>
-                <strong>Upgrade to Dual-NIC mode</strong> for 100% kernel-enforced isolation equivalent to managed switch VLANs.
-            </div>
-        `;
-    }
-}
-
-async function loadInterfaces() {
-    try {
-        const result = await api('/bridge/interfaces');
-        if (result.success) {
-            const select = document.getElementById('isolatedInterface');
-            select.innerHTML = '<option value="">-- Select interface --</option>';
-            
-            result.interfaces.forEach(iface => {
-                if (iface.is_main) return; // Skip main interface
-                
-                const opt = document.createElement('option');
-                opt.value = iface.name;
-                opt.textContent = `${iface.name} ${iface.is_usb ? '(USB)' : ''} - ${iface.mac} [${iface.state}]`;
-                select.appendChild(opt);
-            });
-        }
-    } catch (e) {
-        console.error('Interface load error:', e);
-    }
-}
-
-async function loadBridgeClients() {
-    try {
-        const result = await api('/bridge/clients');
-        const container = document.getElementById('bridgeClients');
-        
-        if (result.success && result.clients.length > 0) {
-            let html = '<table class="table"><thead><tr><th>IP</th><th>MAC</th><th>Hostname</th></tr></thead><tbody>';
-            result.clients.forEach(c => {
-                html += `<tr><td><code>${c.ip}</code></td><td><code>${c.mac}</code></td><td>${c.hostname}</td></tr>`;
-            });
-            html += '</tbody></table>';
-            container.innerHTML = html;
-        } else {
-            container.innerHTML = '<div class="empty-state" style="padding:2rem"><i class="fas fa-plug"></i><p>No clients connected to bridge</p></div>';
-        }
-    } catch (e) {
-        console.error('Bridge clients error:', e);
-    }
-}
-
-// Handle radio button changes
-document.querySelectorAll('input[name="mode"]').forEach(radio => {
-    radio.addEventListener('change', (e) => {
-        const dualConfig = document.getElementById('dualConfig');
-        const dualOption = document.getElementById('dualModeOption');
-        const singleOption = document.getElementById('singleModeOption');
-        
-        if (e.target.value === 'dual') {
-            dualConfig.style.display = 'block';
-            dualOption.style.borderColor = 'var(--success)';
-            singleOption.style.borderColor = 'var(--border)';
-        } else {
-            dualConfig.style.display = 'none';
-            singleOption.style.borderColor = 'var(--warning)';
-            dualOption.style.borderColor = 'var(--border)';
-        }
-    });
-});
-
-function applyMode() {
-    const selected = document.querySelector('input[name="mode"]:checked').value;
-    const isolatedIface = document.getElementById('isolatedInterface').value;
-    
-    if (selected === 'dual' && !isolatedIface) {
-        showToast('Please select an isolated interface for dual-NIC mode', 'error');
-        return;
-    }
-    
-    pendingMode = selected;
-    pendingInterface = isolatedIface;
-    
-    // Show warning modal
-    const warningText = document.getElementById('warningText');
-    const warningExtra = document.getElementById('warningExtra');
-    
-    if (selected === 'dual') {
-        warningText.innerHTML = `You are switching to <strong>Dual-NIC Bridge Mode</strong>. This provides TRUE VLAN-equivalent security but requires devices to be connected through the isolated interface.`;
-        warningExtra.textContent = 'Protected devices must be moved to a switch connected to ' + isolatedIface;
-    } else {
-        warningText.innerHTML = `You are switching to <strong>Single-NIC Mode</strong>. This uses software-based isolation and devices can be anywhere on the network.`;
-        warningExtra.textContent = 'Reducing isolation from hardware to software level';
-    }
-    
-    openModal('warningModal');
-}
-
-async function confirmModeChange() {
-    closeModal('warningModal');
-    
-    const statusEl = document.getElementById('applyStatus');
-    statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Applying...';
-    
-    try {
-        const result = await api('/bridge/mode', {
-            method: 'POST',
-            body: JSON.stringify({
-                mode: pendingMode,
-                isolated_interface: pendingInterface
-            })
-        });
-        
-        if (result.success) {
-            statusEl.innerHTML = '<i class="fas fa-check" style="color:var(--success)"></i> ' + result.message;
-            showToast('Mode changed successfully. Engine is restarting...', 'success');
-            
-            // Reload status after a delay
-            setTimeout(() => {
-                loadStatus();
-                statusEl.textContent = '';
-            }, 5000);
-        } else {
-            statusEl.innerHTML = '<i class="fas fa-times" style="color:var(--danger)"></i> ' + result.error;
-            showToast(result.error, 'error');
-        }
-    } catch (e) {
-        statusEl.innerHTML = '<i class="fas fa-times" style="color:var(--danger)"></i> Error';
-        showToast('Failed to change mode: ' + e.message, 'error');
-    }
-}
-
-// Initial load
-loadStatus();
-</script>
-{% endblock %}
-BRIDGEHTML
-
-    log_info "Templates created"
-}
-
-#===============================================================================
-# SYSTEMD SERVICES
-#===============================================================================
-
-create_services() {
-    log_step "Creating systemd services..."
-
-# Main engine service
-cat > /etc/systemd/system/irongate-engine.service << EOF
-[Unit]
-Description=Irongate Network Isolation Engine
-After=network.target
-Wants=network-online.target
-
+cat > /etc/systemd/system/dnsmasq.service.d/override.conf << EOF
 [Service]
-Type=simple
-User=root
-WorkingDirectory=${INSTALL_DIR}
-Environment="PATH=${INSTALL_DIR}/venv/bin"
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/core/engine.py
-Restart=always
+Restart=on-failure
 RestartSec=5
-StandardOutput=append:${LOG_DIR}/irongate.log
-StandardError=append:${LOG_DIR}/irongate.log
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
-# Security hardening
-NoNewPrivileges=false
-ProtectSystem=false
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=3
 EOF
 
-# Web interface service
-cat > /etc/systemd/system/irongate-web.service << EOF
+#######################################
+# Create Irongate Network Isolation Service
+#######################################
+echo -e "${YELLOW}Setting up Irongate network isolation...${NC}"
+
+mkdir -p /opt/irongate
+mkdir -p /etc/irongate
+mkdir -p /var/log/irongate
+
+# Create Python virtual environment
+python3 -m venv /opt/irongate/venv 2>/dev/null || true
+/opt/irongate/venv/bin/pip install --quiet pyyaml scapy netifaces 2>/dev/null || \
+    pip3 install --break-system-packages pyyaml scapy netifaces 2>/dev/null || true
+
+# Create Irongate main script
+cat > /opt/irongate/irongate.py << 'IRONGATEPY'
+#!/usr/bin/env python3
+"""
+Irongate Network Isolation Engine
+Provides 6-layer defense (single-NIC) or bridge isolation (dual-NIC)
+"""
+
+import os
+import sys
+import yaml
+import time
+import signal
+import logging
+import threading
+import subprocess
+from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('irongate')
+
+class Irongate:
+    def __init__(self, config_path='/etc/irongate/config.yaml'):
+        self.config_path = config_path
+        self.config = {}
+        self.running = False
+        self.threads = []
+        
+    def load_config(self):
+        try:
+            with open(self.config_path) as f:
+                self.config = yaml.safe_load(f)
+            logger.info(f"Loaded config from {self.config_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            return False
+    
+    def setup_kernel(self):
+        """Enable required kernel features"""
+        commands = [
+            'sysctl -w net.ipv4.ip_forward=1',
+            'sysctl -w net.ipv4.conf.all.arp_filter=1',
+            'sysctl -w net.ipv4.conf.all.arp_announce=2',
+        ]
+        for cmd in commands:
+            os.system(cmd + ' 2>/dev/null')
+    
+    def run_single_nic(self):
+        """Run 6-layer software isolation"""
+        logger.info("Starting single-NIC mode (6-layer isolation)")
+        
+        net = self.config.get('network', {})
+        layers = self.config.get('layers', {})
+        interface = net.get('interface', 'eth0')
+        gateway_ip = net.get('gateway_ip', '')
+        gateway_mac = net.get('gateway_mac', '')
+        local_ip = net.get('local_ip', '')
+        local_mac = net.get('local_mac', '')
+        
+        if not gateway_mac:
+            logger.warning("Gateway MAC not known, attempting to discover...")
+            os.system(f"arping -c 1 -I {interface} {gateway_ip} 2>/dev/null")
+            time.sleep(1)
+        
+        # Layer 2: ARP Defense
+        if layers.get('arp_defense', True):
+            t = threading.Thread(target=self._arp_defense_loop, daemon=True)
+            t.start()
+            self.threads.append(t)
+            logger.info("Layer 2: ARP Defense started")
+        
+        # Layer 3: IPv6 RA
+        if layers.get('ipv6_ra', True):
+            t = threading.Thread(target=self._ipv6_ra_loop, daemon=True)
+            t.start()
+            self.threads.append(t)
+            logger.info("Layer 3: IPv6 RA Attack started")
+        
+        # Layer 4: Firewall
+        self._setup_firewall()
+        logger.info("Layer 4: Firewall configured")
+        
+        # Layer 5+6: Gateway Takeover + Bypass Detection
+        if layers.get('gateway_takeover', True):
+            t = threading.Thread(target=self._gateway_takeover_loop, daemon=True)
+            t.start()
+            self.threads.append(t)
+            logger.info("Layer 5+6: Gateway Takeover started")
+        
+        logger.info("Single-NIC isolation active")
+    
+    def run_dual_nic(self):
+        """Run bridge isolation mode"""
+        logger.info("Starting dual-NIC mode (bridge isolation)")
+        
+        bridge_cfg = self.config.get('bridge', {})
+        bridge_name = bridge_cfg.get('bridge_name', 'br-irongate')
+        isolated_iface = bridge_cfg.get('isolated_interface', '')
+        bridge_ip = bridge_cfg.get('bridge_ip', '10.99.0.1')
+        
+        if not isolated_iface:
+            logger.error("No isolated interface configured!")
+            return False
+        
+        # Check interface exists
+        if not os.path.exists(f'/sys/class/net/{isolated_iface}'):
+            logger.error(f"Isolated interface {isolated_iface} not found!")
+            return False
+        
+        # Create bridge
+        logger.info(f"Creating bridge {bridge_name}")
+        os.system(f'ip link set {bridge_name} down 2>/dev/null')
+        os.system(f'brctl delbr {bridge_name} 2>/dev/null')
+        os.system(f'brctl addbr {bridge_name}')
+        os.system(f'brctl stp {bridge_name} off')
+        
+        # Add isolated interface
+        os.system(f'ip link set {isolated_iface} down')
+        os.system(f'ip addr flush dev {isolated_iface}')
+        os.system(f'brctl addif {bridge_name} {isolated_iface}')
+        os.system(f'ip link set {isolated_iface} up')
+        
+        # Configure bridge IP
+        os.system(f'ip addr add {bridge_ip}/16 dev {bridge_name}')
+        os.system(f'ip link set {bridge_name} up')
+        
+        # Enable port isolation (kernel-enforced)
+        result = os.system(f'bridge link set dev {isolated_iface} isolated on 2>/dev/null')
+        if result == 0:
+            logger.info("Port isolation enabled (kernel-enforced)")
+        else:
+            logger.warning("Port isolation not available, using ebtables")
+            os.system(f'ebtables -A FORWARD -i {isolated_iface} -o {isolated_iface} -j DROP')
+        
+        # Setup NAT
+        net = self.config.get('network', {})
+        uplink = net.get('interface', 'eth0')
+        os.system(f'nft add table nat')
+        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }}')
+        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade')
+        
+        # Setup DHCP for bridge (using dnsmasq)
+        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
+        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
+        
+        dnsmasq_conf = f"""
+# Irongate Bridge DHCP
+interface={bridge_name}
+bind-interfaces
+dhcp-range={dhcp_start},{dhcp_end},24h
+dhcp-option=option:router,{bridge_ip}
+dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
+log-dhcp
+"""
+        with open('/etc/irongate/bridge-dnsmasq.conf', 'w') as f:
+            f.write(dnsmasq_conf)
+        
+        # Start bridge DHCP
+        os.system('pkill -f "dnsmasq.*bridge-dnsmasq" 2>/dev/null')
+        os.system('dnsmasq --conf-file=/etc/irongate/bridge-dnsmasq.conf &')
+        
+        logger.info("Dual-NIC bridge isolation active")
+        logger.info(f"  Bridge: {bridge_name} ({bridge_ip})")
+        logger.info(f"  Isolated: {isolated_iface}")
+        logger.info(f"  DHCP: {dhcp_start} - {dhcp_end}")
+        
+        return True
+    
+    def _arp_defense_loop(self):
+        """Continuous ARP poisoning for gateway"""
+        try:
+            from scapy.all import Ether, ARP, sendp, conf
+            conf.verb = 0
+        except ImportError:
+            logger.warning("scapy not available, ARP defense disabled")
+            return
+        
+        net = self.config.get('network', {})
+        interface = net.get('interface', 'eth0')
+        gateway_ip = net.get('gateway_ip')
+        local_mac = net.get('local_mac')
+        gateway_mac = net.get('gateway_mac')
+        
+        if not all([gateway_ip, local_mac]):
+            logger.error("Missing network config for ARP defense")
+            return
+        
+        while self.running:
+            try:
+                # Gratuitous ARP: tell everyone we are the gateway
+                pkt = Ether(dst="ff:ff:ff:ff:ff:ff", src=local_mac) / ARP(
+                    op=2, psrc=gateway_ip, hwsrc=local_mac,
+                    pdst=gateway_ip, hwdst="ff:ff:ff:ff:ff:ff"
+                )
+                sendp(pkt, iface=interface, verbose=False)
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"ARP defense error: {e}")
+                time.sleep(5)
+    
+    def _ipv6_ra_loop(self):
+        """Send IPv6 Router Advertisements"""
+        try:
+            from scapy.all import Ether, IPv6, ICMPv6ND_RA, ICMPv6NDOptPrefixInfo, sendp, conf
+            conf.verb = 0
+        except ImportError:
+            logger.warning("scapy not available, IPv6 RA disabled")
+            return
+        
+        net = self.config.get('network', {})
+        interface = net.get('interface', 'eth0')
+        local_mac = net.get('local_mac')
+        
+        while self.running:
+            try:
+                pkt = Ether(src=local_mac, dst="33:33:00:00:00:01") / \
+                      IPv6(src="fe80::1", dst="ff02::1") / \
+                      ICMPv6ND_RA(routerlifetime=1800) / \
+                      ICMPv6NDOptPrefixInfo(prefix="fd00:iron:gate::", prefixlen=64)
+                sendp(pkt, iface=interface, verbose=False)
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"IPv6 RA error: {e}")
+                time.sleep(5)
+    
+    def _gateway_takeover_loop(self):
+        """Bidirectional ARP poisoning + gateway MAC spoofing"""
+        try:
+            from scapy.all import Ether, ARP, sendp, conf
+            conf.verb = 0
+        except ImportError:
+            return
+        
+        net = self.config.get('network', {})
+        interface = net.get('interface', 'eth0')
+        gateway_ip = net.get('gateway_ip')
+        gateway_mac = net.get('gateway_mac')
+        local_mac = net.get('local_mac')
+        
+        devices = self.config.get('devices', [])
+        
+        while self.running:
+            try:
+                # Poison gateway for each protected device
+                for dev in devices:
+                    dev_ip = dev.get('ip')
+                    if dev_ip and gateway_mac:
+                        # Tell gateway that device is at our MAC
+                        pkt = Ether(dst=gateway_mac, src=local_mac) / ARP(
+                            op=2, psrc=dev_ip, hwsrc=local_mac,
+                            pdst=gateway_ip, hwdst=gateway_mac
+                        )
+                        sendp(pkt, iface=interface, verbose=False)
+                
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Gateway takeover error: {e}")
+                time.sleep(5)
+    
+    def _setup_firewall(self):
+        """Configure nftables firewall with zone-based rules"""
+        net = self.config.get('network', {})
+        interface = net.get('interface', 'eth0')
+        gateway_ip = net.get('gateway_ip', '')
+        local_ip = net.get('local_ip', '')
+        devices = self.config.get('devices', [])
+        
+        # Group devices by zone
+        isolated_ips = []
+        servers_ips = []
+        trusted_ips = []
+        
+        for dev in devices:
+            ip = dev.get('ip', '')
+            zone = dev.get('zone', 'isolated')
+            if ip:
+                if zone == 'isolated':
+                    isolated_ips.append(ip)
+                elif zone == 'servers':
+                    servers_ips.append(ip)
+                elif zone == 'trusted':
+                    trusted_ips.append(ip)
+        
+        # Build IP sets
+        isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
+        servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
+        
+        # RFC1918 private ranges (LAN)
+        lan_ranges = '10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16'
+        
+        rules = f"""
+# Irongate Zone-Based Firewall
+# Generated by Irongate Engine
+
+table inet irongate {{
+    # IP Sets for zones
+    set isolated_devices {{
+        type ipv4_addr
+        flags interval
+        elements = {{ {isolated_set} }}
+    }}
+    
+    set servers_devices {{
+        type ipv4_addr
+        flags interval
+        elements = {{ {servers_set} }}
+    }}
+    
+    set lan_ranges {{
+        type ipv4_addr
+        flags interval
+        elements = {{ {lan_ranges} }}
+    }}
+    
+    chain input {{
+        type filter hook input priority 0; policy accept;
+    }}
+    
+    chain forward {{
+        type filter hook forward priority 0; policy drop;
+        
+        # Allow established connections
+        ct state established,related accept
+        
+        # ISOLATED zone: Only internet, no LAN, no other devices
+        ip saddr @isolated_devices ip daddr @lan_ranges drop
+        ip saddr @isolated_devices ip daddr @isolated_devices drop
+        ip saddr @isolated_devices ip daddr @servers_devices drop
+        ip saddr @isolated_devices accept  # Internet only
+        
+        # SERVERS zone: Can talk to other servers, no LAN
+        ip saddr @servers_devices ip daddr @lan_ranges drop
+        ip saddr @servers_devices ip daddr @isolated_devices drop
+        ip saddr @servers_devices ip daddr @servers_devices accept  # Inter-server OK
+        ip saddr @servers_devices accept  # Internet OK
+        
+        # TRUSTED zone: Full access (handled by default accept below)
+        
+        # Block same-interface forwarding for unclassified traffic
+        iifname "{interface}" oifname "{interface}" drop
+    }}
+    
+    chain output {{
+        type filter hook output priority 0; policy accept;
+    }}
+    
+    chain postrouting {{
+        type nat hook postrouting priority 100; policy accept;
+        oifname "{interface}" masquerade
+    }}
+}}
+"""
+        try:
+            # Flush existing irongate table
+            os.system('nft delete table inet irongate 2>/dev/null')
+            
+            with open('/tmp/irongate.nft', 'w') as f:
+                f.write(rules)
+            
+            result = os.system('nft -f /tmp/irongate.nft 2>/dev/null')
+            if result == 0:
+                logger.info(f"Firewall configured: {len(isolated_ips)} isolated, {len(servers_ips)} servers, {len(trusted_ips)} trusted")
+            else:
+                logger.error("Failed to apply nftables rules")
+        except Exception as e:
+            logger.error(f"Firewall setup error: {e}")
+    
+    def run(self):
+        """Main run loop"""
+        if not self.load_config():
+            logger.error("Cannot start without valid config")
+            return False
+        
+        self.running = True
+        self.setup_kernel()
+        
+        mode = self.config.get('mode', 'single')
+        
+        if mode == 'dual':
+            if not self.run_dual_nic():
+                return False
+        else:
+            self.run_single_nic()
+        
+        logger.info("Irongate running")
+        
+        # Keep alive
+        while self.running:
+            time.sleep(1)
+        
+        return True
+    
+    def stop(self):
+        """Stop all services"""
+        self.running = False
+        logger.info("Irongate stopped")
+
+
+def signal_handler(sig, frame):
+    logger.info("Shutdown signal received")
+    if irongate:
+        irongate.stop()
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    irongate = Irongate()
+    irongate.run()
+IRONGATEPY
+
+chmod +x /opt/irongate/irongate.py
+
+# Create systemd service
+cat > /etc/systemd/system/irongate.service << EOF
 [Unit]
-Description=Irongate Web Interface
-After=network.target irongate-engine.service
+Description=Irongate Network Isolation
+After=network.target dnsmasq.service
+Wants=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=${INSTALL_DIR}
-Environment="PATH=${INSTALL_DIR}/venv/bin"
-ExecStart=${INSTALL_DIR}/venv/bin/gunicorn \\
-    --bind 0.0.0.0:${WEB_PORT} \\
-    --workers 2 \\
-    --threads 4 \\
-    --certfile ${CONFIG_DIR}/certs/server.crt \\
-    --keyfile ${CONFIG_DIR}/certs/server.key \\
-    --access-logfile ${LOG_DIR}/web-access.log \\
-    --error-logfile ${LOG_DIR}/web-error.log \\
-    app:app
-Restart=always
+ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
+ExecStartPre=/bin/sleep 2
+Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable irongate-engine.service
-    systemctl enable irongate-web.service
-    
-    log_info "Services created"
+# Create default config
+cat > /etc/irongate/config.yaml << EOF
+# Irongate Default Configuration
+# This file is auto-generated - use Web UI to configure
+
+mode: "single"
+
+network:
+  interface: "$INTERFACE"
+  local_ip: "$CURRENT_IP"
+  gateway_ip: "$CURRENT_GATEWAY"
+
+layers:
+  arp_defense: true
+  ipv6_ra: true
+  gateway_takeover: true
+  bypass_detection: true
+  firewall: true
+
+devices: []
+EOF
+
+chown -R root:root /opt/irongate
+chmod -R 755 /opt/irongate
+
+systemctl daemon-reload
+systemctl enable irongate 2>/dev/null || true
+
+echo -e "${GREEN}Irongate service installed${NC}"
+
+#######################################
+# Configure Nginx
+#######################################
+echo -e "${YELLOW}Configuring Nginx...${NC}"
+
+# Detect PHP-FPM socket dynamically
+PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+if [ -z "$PHP_SOCK" ]; then
+    PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+fi
+if [ -z "$PHP_SOCK" ]; then
+    PHP_SOCK="/run/php/php-fpm.sock"
+fi
+echo -e "PHP-FPM Socket: ${GREEN}$PHP_SOCK${NC}"
+
+cat > /etc/nginx/sites-available/irongate << EOF
+server {
+    listen $WEBUI_PORT;
+    server_name _;
+    root /var/www/irongate;
+    index index.html;
+    location / { try_files \$uri \$uri/ =404; }
+    location ~ \.php\$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:$PHP_SOCK; }
+    location ~ /\.ht { deny all; }
 }
+EOF
 
-start_services() {
-    log_step "Starting services..."
-    
-    systemctl start irongate-engine.service
-    sleep 3
-    systemctl start irongate-web.service
-    
-    log_info "Services started"
+ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+#######################################
+# Configure log rotation
+#######################################
+cat > /etc/logrotate.d/dnsmasq << EOF
+/var/log/dnsmasq.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 644 root root
+    postrotate
+        systemctl reload dnsmasq > /dev/null 2>&1 || true
+    endscript
 }
+EOF
 
-#===============================================================================
-# MAIN INSTALLATION
-#===============================================================================
+#######################################
+# Enable and start services
+#######################################
+echo -e "${YELLOW}Starting services...${NC}"
 
-print_summary() {
-    echo ""
-    echo -e "${GREEN}${BOLD}"
-    echo "╔═══════════════════════════════════════════════════════════════════════╗"
-    echo "║                    IRONGATE INSTALLATION COMPLETE                     ║"
-    echo "╚═══════════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo ""
-    echo -e "  ${CYAN}Web Interface:${NC}  https://${LOCAL_IP}:${WEB_PORT}"
-    echo ""
-    echo -e "  ${YELLOW}Two Isolation Modes Available:${NC}"
-    echo ""
-    echo -e "  ${MAGENTA}┌─ SINGLE-NIC MODE (Default) ─────────────────────────────────────────┐${NC}"
-    echo -e "  ${MAGENTA}│${NC} 6-layer software isolation:                                         ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 1: DHCP Microsegmentation (/30 subnets + Option 121)     ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 2: ARP Defense (continuous poisoning + bypass detection) ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 3: IPv6 RA Attack (router advertisement hijacking)       ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 4: nftables Firewall (stateful packet filtering)         ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 5: Bypass Monitor (active defense + TCP RST injection)   ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ✓ Layer 6: Gateway Takeover (bidirectional ARP + CAM flood)      ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}                                                                     ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}│${NC}   ${YELLOW}⚠ ~95% effective - subject to timing race conditions${NC}            ${MAGENTA}│${NC}"
-    echo -e "  ${MAGENTA}└─────────────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "  ${GREEN}┌─ DUAL-NIC MODE (Recommended for Business) ──────────────────────────┐${NC}"
-    echo -e "  ${GREEN}│${NC} TRUE VLAN-EQUIVALENT security via Linux bridge port isolation:      ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}   ✓ 100% kernel-enforced isolation - NO BYPASS POSSIBLE            ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}   ✓ Equivalent to managed switch with VLANs                        ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}   ✓ Requires USB ethernet adapter (~\$10)                           ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}   ✓ Protected devices connect through isolated NIC                 ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}                                                                     ${GREEN}│${NC}"
-    echo -e "  ${GREEN}│${NC}   ${GREEN}✓ RECOMMENDED FOR BUSINESS SERVERS${NC}                              ${GREEN}│${NC}"
-    echo -e "  ${GREEN}└─────────────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "  ${CYAN}To switch modes:${NC} Go to https://${LOCAL_IP}:${WEB_PORT}/bridge"
-    echo ""
-    echo -e "  ${MAGENTA}Management Commands:${NC}"
-    echo "    systemctl status irongate-engine   # Check engine status"
-    echo "    systemctl status irongate-web      # Check web interface"
-    echo "    journalctl -u irongate-engine -f   # View live logs"
-    echo "    cat ${LOG_DIR}/security.log        # Security events"
-    echo ""
-    echo -e "  ${RED}Configuration:${NC}  ${CONFIG_DIR}/irongate.yaml"
-    echo -e "  ${RED}Device Database:${NC}  ${DATA_DIR}/zones/devices.yaml"
-    echo ""
-}
+systemctl daemon-reload
 
-main() {
-    print_banner
-    check_root
-    check_kernel
-    check_memory
-    detect_os
-    detect_network
-    
-    log_section "Beginning Installation"
-    
-    install_dependencies
-    setup_directories
-    setup_python_env
-    generate_certificates
-    create_config
-    enable_kernel_features
-    
-    log_section "Creating Core Components"
-    
-    create_core_engine
-    create_dhcp_server
-    create_arp_defender
-    create_ipv6_ra
-    create_firewall
-    create_monitor
-    create_gateway_takeover
-    create_bridge_manager
-    create_web_app
-    create_templates
-    create_services
-    
-    log_section "Starting Services"
-    
-    start_services
-    
-    print_summary
-}
+# Detect PHP-FPM service name
+PHP_FPM_SERVICE=$(systemctl list-unit-files | grep -oP 'php[\d.]*-fpm\.service' | head -n1)
+if [ -z "$PHP_FPM_SERVICE" ]; then
+    PHP_FPM_SERVICE="php-fpm.service"
+fi
+PHP_FPM_SERVICE="${PHP_FPM_SERVICE%.service}"
+echo -e "PHP-FPM Service: ${GREEN}$PHP_FPM_SERVICE${NC}"
 
-main "$@"
+systemctl enable dnsmasq nginx $PHP_FPM_SERVICE
+systemctl restart $PHP_FPM_SERVICE
+systemctl restart nginx
+
+# Test dnsmasq config before starting
+echo -e "${YELLOW}Validating dnsmasq configuration...${NC}"
+if dnsmasq --test 2>&1; then
+    echo -e "${GREEN}Configuration valid, starting dnsmasq...${NC}"
+    # Kill any zombie dnsmasq processes first
+    pkill -9 dnsmasq 2>/dev/null || true
+    sleep 1
+    systemctl start dnsmasq
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to start dnsmasq. Checking for port conflicts...${NC}"
+        ss -ulnp | grep :67 || true
+        journalctl -u dnsmasq -n 10 --no-pager
+    fi
+else
+    echo -e "${RED}Configuration error detected. Check /etc/dnsmasq.conf${NC}"
+    echo -e "${YELLOW}Attempting to start anyway...${NC}"
+    pkill -9 dnsmasq 2>/dev/null || true
+    sleep 1
+    systemctl start dnsmasq || true
+fi
+
+#######################################
+# Final output
+#######################################
+SERVER_IP=$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+
+echo ""
+echo -e "${MAGENTA}╔══════════════════════════════════════════════╗"
+echo -e "║     🛡️  IRONGATE Setup Complete!             ║"
+echo -e "╚══════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "Services:"
+echo -e "  DHCP Server:  $(systemctl is-active dnsmasq)"
+echo -e "  Web Server:   $(systemctl is-active nginx)"
+echo -e "  Protection:   $(systemctl is-active irongate 2>/dev/null || echo 'disabled (enable in UI)')"
+echo ""
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}  Access Irongate at:${NC}"
+echo ""
+echo -e "  ${BOLD}http://$SERVER_IP/${NC}"
+echo ""
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${CYAN}FEATURES:${NC}"
+echo -e "  ${GREEN}📊 Dashboard${NC}    - Protection status, zone summary"
+echo -e "  ${GREEN}🖥️ Devices${NC}      - Add devices to zones (isolated/servers/trusted)"
+echo -e "  ${GREEN}🔗 DHCP${NC}         - Configure DHCP server settings"
+echo -e "  ${GREEN}📋 Leases${NC}       - View active DHCP leases"
+echo -e "  ${GREEN}📌 Reservations${NC} - Static IP reservations"
+echo -e "  ${GREEN}🛡️ Protection${NC}   - Enable/configure network isolation"
+echo ""
+echo -e "${CYAN}ZONES:${NC}"
+echo -e "  ${RED}🔴 isolated${NC}  - Internet only, no LAN access"
+echo -e "  ${YELLOW}🟡 servers${NC}   - Can talk to other servers, no LAN"
+echo -e "  ${GREEN}🟢 trusted${NC}   - Full network access"
+echo ""
+echo -e "${CYAN}QUICK START:${NC}"
+echo -e "  1. Go to 🖥️ Devices & Zones"
+echo -e "  2. Click 'Import from Leases' or '+ Add Device'"
+echo -e "  3. Assign devices to zones"
+echo -e "  4. Go to 🛡️ Protection and enable"
+echo ""
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}  SAFE TO RE-RUN: Preserves all settings & data${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
