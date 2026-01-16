@@ -3667,7 +3667,7 @@ table inet irongate {{
     }}
     
     chain forward {{
-        type filter hook forward priority 0; policy drop;
+        type filter hook forward priority 0; policy accept;
         
         # Allow established connections
         ct state established,related accept
@@ -3675,12 +3675,9 @@ table inet irongate {{
         # =====================================================
         # ISOLATED zone: Internet only, no LAN, no other devices
         # =====================================================
-        # Outbound from isolated
         ip saddr @isolated_devices ip daddr @lan_ranges counter drop
         ip saddr @isolated_devices ip daddr @isolated_devices counter drop
         ip saddr @isolated_devices ip daddr @servers_devices counter drop
-        ip saddr @isolated_devices counter accept  # Internet only
-        # Inbound to isolated (block everything except internet replies handled by conntrack)
         ip daddr @isolated_devices ip saddr @lan_ranges counter drop
         ip daddr @isolated_devices ip saddr @servers_devices counter drop
         ip daddr @isolated_devices ip saddr @isolated_devices counter drop
@@ -3688,22 +3685,12 @@ table inet irongate {{
         # =====================================================
         # SERVERS zone: Inter-server OK, no LAN access
         # =====================================================
-        # Outbound from servers
         ip saddr @servers_devices ip daddr @lan_ranges counter drop
         ip saddr @servers_devices ip daddr @isolated_devices counter drop
-        ip saddr @servers_devices ip daddr @servers_devices counter accept  # Inter-server OK
-        ip saddr @servers_devices counter accept  # Internet OK
-        # Inbound to servers (only from other servers or internet)
         ip daddr @servers_devices ip saddr @lan_ranges counter drop
         ip daddr @servers_devices ip saddr @isolated_devices counter drop
-        ip daddr @servers_devices ip saddr @servers_devices counter accept  # Inter-server OK
         
-        # =====================================================
-        # TRUSTED zone: Full access (implicit, no restrictions)
-        # =====================================================
-        
-        # Block unclassified same-interface forwarding
-        iifname "{interface}" oifname "{interface}" drop
+        # Everything else is allowed (trusted devices, internet traffic, etc)
     }}
     
     chain output {{
@@ -3757,8 +3744,11 @@ table inet irongate {{
         return True
     
     def stop(self):
-        """Stop all services"""
+        """Stop all services and clean up firewall rules"""
         self.running = False
+        # Remove firewall rules so they don't persist after stop
+        os.system('nft delete table inet irongate 2>/dev/null')
+        logger.info("Firewall rules removed")
         logger.info("Irongate stopped")
 
 
@@ -3845,18 +3835,23 @@ chmod -R 755 /opt/irongate
 systemctl daemon-reload
 systemctl enable irongate 2>/dev/null || true
 
-# If irongate was already running (update scenario), restart it to load new config
-if systemctl is-active --quiet irongate 2>/dev/null; then
-    echo -e "${YELLOW}Restarting Irongate service with updated config...${NC}"
-    systemctl restart irongate
-    sleep 2
-    if systemctl is-active --quiet irongate; then
-        echo -e "${GREEN}  ✓ Irongate restarted successfully${NC}"
-    else
-        echo -e "${RED}  ✗ Irongate failed to restart - check logs${NC}"
-    fi
+# Always stop and kill any existing irongate processes before starting
+echo -e "${YELLOW}Stopping any existing Irongate processes...${NC}"
+systemctl stop irongate 2>/dev/null || true
+pkill -9 -f "irongate.py" 2>/dev/null || true
+# Clear any leftover firewall rules
+nft delete table inet irongate 2>/dev/null || true
+sleep 1
+
+# Start fresh
+echo -e "${YELLOW}Starting Irongate service...${NC}"
+systemctl start irongate
+sleep 2
+if systemctl is-active --quiet irongate; then
+    echo -e "${GREEN}  ✓ Irongate started successfully${NC}"
 else
-    echo -e "${GREEN}Irongate service installed${NC}"
+    echo -e "${RED}  ✗ Irongate failed to start - check logs${NC}"
+    journalctl -u irongate -n 10 --no-pager
 fi
 
 #######################################
