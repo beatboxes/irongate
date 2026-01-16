@@ -3430,6 +3430,29 @@ class Irongate:
             if not dev_ip:
                 continue
             
+            # Safety check: validate IP format (basic check)
+            parts = dev_ip.split('.')
+            if len(parts) != 4:
+                logger.warning(f"  Invalid IP format: {dev_ip}, skipping")
+                continue
+            try:
+                if not all(0 <= int(p) <= 255 for p in parts):
+                    logger.warning(f"  Invalid IP format: {dev_ip}, skipping")
+                    continue
+            except ValueError:
+                logger.warning(f"  Invalid IP format: {dev_ip}, skipping")
+                continue
+            
+            # Safety check: don't protect self
+            if dev_ip == self.local_ip:
+                logger.warning(f"  Cannot protect self ({dev_ip}), skipping")
+                continue
+            
+            # Safety check: don't protect gateway
+            if dev_ip == self.gateway_ip:
+                logger.warning(f"  Cannot protect gateway ({dev_ip}), skipping")
+                continue
+            
             if not dev_mac:
                 dev_mac = self._get_mac(dev_ip)
                 if not dev_mac:
@@ -3518,7 +3541,19 @@ class Irongate:
                 # Get current snapshot of lan_devices to avoid race condition
                 current_lan_devices = list(self.lan_devices)
                 
+                # Rate limiting: add micro-delay for large networks
+                # This prevents flooding the network with ARP packets
+                packet_delay = 0
+                total_packets = len(self.protected_devices) * (1 + len(current_lan_devices))
+                if total_packets > 500:
+                    packet_delay = 0.002  # 2ms delay = ~500 packets/sec max
+                elif total_packets > 200:
+                    packet_delay = 0.001  # 1ms delay
+                
                 for dev_ip, dev_mac, zone in self.protected_devices:
+                    if not self.running:
+                        return
+                    
                     # Tell protected device: "Gateway is at Irongate's MAC"
                     # This routes their outbound traffic through Irongate
                     self._send_unicast_arp(
@@ -3533,11 +3568,15 @@ class Irongate:
                     # Tell ALL LAN devices: "Protected device is at Irongate's MAC"
                     # This intercepts any LAN device trying to reach protected servers
                     for lan_ip, lan_mac in current_lan_devices:
+                        if not self.running:
+                            return
                         self._send_unicast_arp(
                             target_ip=lan_ip,
                             target_mac=lan_mac,
                             spoof_ip=dev_ip
                         )
+                        if packet_delay:
+                            time.sleep(packet_delay)
                 
                 time.sleep(1)
                 
@@ -3560,9 +3599,37 @@ class Irongate:
         
         local_mac_lower = self.local_mac.lower()
         
+        # Build protected device lookup
         protected_ips = {}
         for dev_ip, dev_mac, zone in self.protected_devices:
-            protected_ips[dev_ip] = dev_mac
+            protected_ips[dev_ip] = dev_mac.lower()
+        
+        # Build comprehensive "allowed" set - these IPs should get REAL MACs, not spoofed
+        # This includes everyone who legitimately needs to reach protected devices
+        allowed_ips = set()
+        allowed_macs = set()
+        
+        # Gateway/Firewalla needs real MACs for routing
+        if self.gateway_ip:
+            allowed_ips.add(self.gateway_ip)
+        
+        # Irongate itself
+        if self.local_ip:
+            allowed_ips.add(self.local_ip)
+        allowed_macs.add(local_mac_lower)
+        
+        # Trusted devices - they should have full access
+        for dev_ip, dev_mac in self.trusted_devices:
+            allowed_ips.add(dev_ip)
+            allowed_macs.add(dev_mac.lower())
+        
+        # Protected devices (servers) - they can reach each other
+        for dev_ip, dev_mac, zone in self.protected_devices:
+            allowed_ips.add(dev_ip)
+            allowed_macs.add(dev_mac.lower())
+        
+        logger.info(f"ARP defense: {len(protected_ips)} protected, {len(allowed_ips)} allowed (bypass spoof)")
+        logger.info(f"  Allowed IPs: {', '.join(sorted(allowed_ips))}")
         
         def handle_arp(pkt):
             if ARP not in pkt:
@@ -3571,34 +3638,55 @@ class Irongate:
             try:
                 arp = pkt[ARP]
                 
+                # Handle ARP Requests: "Who has X?"
                 if arp.op == 1:
                     requested_ip = arp.pdst
-                    requester_mac = arp.hwsrc
+                    requester_mac = arp.hwsrc.lower()
                     requester_ip = arp.psrc
                     
+                    # Only intercept requests for protected IPs
                     if requested_ip in protected_ips:
-                        if requester_mac.lower() != local_mac_lower and requester_ip != requested_ip:
-                            reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
-                                op=2, pdst=requester_ip, hwdst=requester_mac,
-                                psrc=requested_ip, hwsrc=self.local_mac
-                            )
-                            sendp(reply, iface=self.interface, verbose=False)
-                            sendp(reply, iface=self.interface, verbose=False)
+                        # Skip if requester is in the allowed list
+                        # This includes: gateway, irongate, trusted devices, other servers
+                        if requester_ip in allowed_ips or requester_mac in allowed_macs:
+                            return
+                        
+                        # Skip gratuitous ARP (asking about itself)
+                        if requester_ip == requested_ip:
+                            return
+                        
+                        # Requester is an untrusted LAN device - spoof them
+                        reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
+                            op=2, pdst=requester_ip, hwdst=requester_mac,
+                            psrc=requested_ip, hwsrc=self.local_mac
+                        )
+                        sendp(reply, iface=self.interface, verbose=False)
+                        sendp(reply, iface=self.interface, verbose=False)
                 
+                # Handle ARP Replies: "X is at MAC Y"
                 elif arp.op == 2:
                     sender_ip = arp.psrc
                     sender_mac = arp.hwsrc.lower()
-                    target_mac = arp.hwdst
+                    target_mac = arp.hwdst.lower()
                     target_ip = arp.pdst
                     
+                    # Only counter replies FROM protected devices with their real MAC
                     if sender_ip in protected_ips and sender_mac == protected_ips[sender_ip]:
-                        if target_mac.lower() != 'ff:ff:ff:ff:ff:ff':
-                            counter = Ether(dst=target_mac, src=self.local_mac) / ARP(
-                                op=2, pdst=target_ip, hwdst=target_mac,
-                                psrc=sender_ip, hwsrc=self.local_mac
-                            )
-                            sendp(counter, iface=self.interface, verbose=False)
-                            sendp(counter, iface=self.interface, verbose=False)
+                        # Skip broadcast
+                        if target_mac == 'ff:ff:ff:ff:ff:ff':
+                            return
+                        
+                        # Skip if target is in the allowed list
+                        if target_ip in allowed_ips or target_mac in allowed_macs:
+                            return
+                        
+                        # Target is an untrusted LAN device - counter the real reply
+                        counter = Ether(dst=target_mac, src=self.local_mac) / ARP(
+                            op=2, pdst=target_ip, hwdst=target_mac,
+                            psrc=sender_ip, hwsrc=self.local_mac
+                        )
+                        sendp(counter, iface=self.interface, verbose=False)
+                        sendp(counter, iface=self.interface, verbose=False)
                             
             except Exception:
                 pass
