@@ -1430,13 +1430,15 @@ function applyIrongateConfig($db) {
         $devices[] = $row;
     }
     
+    $config .= "devices:\n";
     if (!empty($devices)) {
-        $config .= "devices:\n";
         foreach ($devices as $dev) {
             $config .= "  - mac: \"" . $dev['mac'] . "\"\n";
             $config .= "    ip: \"" . $dev['ip'] . "\"\n";
             $config .= "    zone: \"" . $dev['zone'] . "\"\n";
         }
+    } else {
+        $config .= "  []\n";
     }
     
     // Write config
@@ -3228,8 +3230,6 @@ import time
 import signal
 import logging
 import threading
-import subprocess
-import sqlite3
 from pathlib import Path
 
 logging.basicConfig(
@@ -3238,7 +3238,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('irongate')
 
-DB_PATH = '/var/www/irongate/dhcp.db'
+# Global reference for signal handler
+irongate = None
+
 
 class Irongate:
     def __init__(self, config_path='/etc/irongate/config.yaml'):
@@ -3258,9 +3260,10 @@ class Irongate:
     def load_config(self):
         try:
             with open(self.config_path) as f:
-                self.config = yaml.safe_load(f)
+                self.config = yaml.safe_load(f) or {}
             logger.info(f"Loaded config from {self.config_path}")
-            devices = self.config.get('devices', [])
+            # Handle devices being None from YAML
+            devices = self.config.get('devices') or []
             logger.info(f"Found {len(devices)} devices in config")
             for dev in devices:
                 logger.info(f"  Device: {dev.get('ip')} ({dev.get('mac')}) zone={dev.get('zone')}")
@@ -3271,12 +3274,15 @@ class Irongate:
     
     def _load_lan_devices(self):
         """Load all known LAN devices from dnsmasq leases file (excluding trusted/protected)"""
-        self.lan_devices = []
+        new_lan_devices = []
         
         protected_ips = set(d[0] for d in self.protected_devices)
         protected_macs = set(d[1].lower() for d in self.protected_devices)
         trusted_ips = set(d[0] for d in self.trusted_devices)
         trusted_macs = set(d[1].lower() for d in self.trusted_devices)
+        
+        # Safety check for local_mac
+        local_mac_lower = self.local_mac.lower() if self.local_mac else ''
         
         lease_file = '/var/lib/dnsmasq/dnsmasq.leases'
         
@@ -3297,16 +3303,18 @@ class Irongate:
                                 mac not in trusted_macs and
                                 ip != self.gateway_ip and 
                                 ip != self.local_ip and
-                                mac != self.local_mac.lower()):
-                                self.lan_devices.append((ip, mac))
+                                mac != local_mac_lower):
+                                new_lan_devices.append((ip, mac))
             
             # Deduplicate by IP
             seen_ips = set()
             unique_devices = []
-            for ip, mac in self.lan_devices:
+            for ip, mac in new_lan_devices:
                 if ip not in seen_ips:
                     seen_ips.add(ip)
                     unique_devices.append((ip, mac))
+            
+            # Atomic update to avoid race condition
             self.lan_devices = unique_devices
             
             logger.info(f"Loaded {len(self.lan_devices)} LAN devices to spoof (excluding {len(self.trusted_devices)} trusted)")
@@ -3349,6 +3357,7 @@ class Irongate:
             sendp(pkt, iface=self.interface, verbose=False)
             return True
         except Exception as e:
+            logger.debug(f"ARP send failed to {target_ip}: {e}")
             return False
     
     def _restore_arp_tables(self):
@@ -3357,6 +3366,11 @@ class Irongate:
             from scapy.all import Ether, ARP, sendp, conf
             conf.verb = 0
         except ImportError:
+            logger.warning("scapy not available, cannot restore ARP tables")
+            return
+        
+        if not self.gateway_mac:
+            logger.warning("No gateway MAC, cannot restore ARP tables")
             return
         
         logger.info("Restoring ARP tables...")
@@ -3385,13 +3399,17 @@ class Irongate:
         """Run middleground ARP-based isolation (~95% protection)"""
         logger.info("Starting single-NIC mode (middleground ARP isolation)")
         
-        net = self.config.get('network', {})
+        net = self.config.get('network') or {}
         self.interface = net.get('interface', 'eth0')
         self.gateway_ip = net.get('gateway_ip', '')
         self.gateway_mac = net.get('gateway_mac', '')
         self.local_mac = net.get('local_mac', '')
         self.local_ip = net.get('local_ip', '')
-        devices = self.config.get('devices', [])
+        devices = self.config.get('devices') or []
+        
+        if not self.gateway_ip:
+            logger.error("No gateway IP configured - cannot start")
+            return False
         
         if not self.gateway_mac:
             logger.info(f"Resolving gateway MAC for {self.gateway_ip}...")
@@ -3400,7 +3418,7 @@ class Irongate:
                 logger.info(f"  Gateway MAC: {self.gateway_mac}")
             else:
                 logger.error("Could not resolve gateway MAC - ARP spoofing disabled")
-                return
+                return False
         
         self.protected_devices = []
         self.trusted_devices = []
@@ -3428,7 +3446,7 @@ class Irongate:
         
         if not self.protected_devices:
             logger.warning("No protected devices - nothing to isolate")
-            return
+            return False
         
         self._load_lan_devices()
         
@@ -3458,11 +3476,17 @@ class Irongate:
         logger.info(f"Single-NIC isolation active")
         logger.info(f"  Protected: {len(self.protected_devices)} devices")
         logger.info(f"  LAN targets: {len(self.lan_devices)} devices")
+        
+        return True
     
     def _lan_device_refresh_loop(self):
         """Periodically refresh list of LAN devices"""
         while self.running:
-            time.sleep(60)
+            # Sleep in small increments to allow faster shutdown
+            for _ in range(60):
+                if not self.running:
+                    return
+                time.sleep(1)
             try:
                 old_count = len(self.lan_devices)
                 self._load_lan_devices()
@@ -3482,11 +3506,18 @@ class Irongate:
             logger.error("No gateway MAC, cannot spoof")
             return
         
+        if not self.local_mac:
+            logger.error("No local MAC, cannot spoof")
+            return
+        
         logger.info(f"ARP spoof: {len(self.protected_devices)} protected, {len(self.lan_devices)} LAN targets")
         logger.info("NOTE: Not spoofing gateway - Firewalla will see real device MACs")
         
         while self.running:
             try:
+                # Get current snapshot of lan_devices to avoid race condition
+                current_lan_devices = list(self.lan_devices)
+                
                 for dev_ip, dev_mac, zone in self.protected_devices:
                     # Tell protected device: "Gateway is at Irongate's MAC"
                     # This routes their outbound traffic through Irongate
@@ -3501,7 +3532,7 @@ class Irongate:
                     
                     # Tell ALL LAN devices: "Protected device is at Irongate's MAC"
                     # This intercepts any LAN device trying to reach protected servers
-                    for lan_ip, lan_mac in self.lan_devices:
+                    for lan_ip, lan_mac in current_lan_devices:
                         self._send_unicast_arp(
                             target_ip=lan_ip,
                             target_mac=lan_mac,
@@ -3523,6 +3554,12 @@ class Irongate:
             logger.warning("scapy not available for ARP defense")
             return
         
+        if not self.local_mac:
+            logger.warning("No local MAC, cannot run ARP defense")
+            return
+        
+        local_mac_lower = self.local_mac.lower()
+        
         protected_ips = {}
         for dev_ip, dev_mac, zone in self.protected_devices:
             protected_ips[dev_ip] = dev_mac
@@ -3540,7 +3577,7 @@ class Irongate:
                     requester_ip = arp.psrc
                     
                     if requested_ip in protected_ips:
-                        if requester_mac.lower() != self.local_mac.lower() and requester_ip != requested_ip:
+                        if requester_mac.lower() != local_mac_lower and requester_ip != requested_ip:
                             reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
                                 op=2, pdst=requester_ip, hwdst=requester_mac,
                                 psrc=requested_ip, hwsrc=self.local_mac
@@ -3578,7 +3615,7 @@ class Irongate:
     
     def _setup_firewall(self):
         """Configure nftables - POLICY ACCEPT with specific drops"""
-        devices = self.config.get('devices', [])
+        devices = self.config.get('devices') or []
         
         isolated_ips = []
         servers_ips = []
@@ -3669,7 +3706,7 @@ table inet irongate {{
         """Run bridge isolation mode"""
         logger.info("Starting dual-NIC mode (bridge isolation)")
         
-        bridge_cfg = self.config.get('bridge', {})
+        bridge_cfg = self.config.get('bridge') or {}
         bridge_name = bridge_cfg.get('bridge_name', 'br-irongate')
         isolated_iface = bridge_cfg.get('isolated_interface', '')
         bridge_ip = bridge_cfg.get('bridge_ip', '10.99.0.1')
@@ -3740,9 +3777,15 @@ dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
         
         if mode == 'dual':
             if not self.run_dual_nic():
+                self.running = False
                 return False
         else:
-            self.run_single_nic()
+            if not self.run_single_nic():
+                self.running = False
+                logger.warning("Single-NIC mode initialization failed or no devices to protect")
+                # Still run for firewall-only mode if we got that far
+                if not self.protected_devices:
+                    logger.info("Entering idle mode - add protected devices to activate")
         
         logger.info("Irongate running")
         
