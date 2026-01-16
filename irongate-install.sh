@@ -3270,7 +3270,7 @@ class Irongate:
             return False
     
     def _load_lan_devices(self):
-        """Load all known LAN devices from DHCP database (excluding trusted)"""
+        """Load all known LAN devices from dnsmasq leases file (excluding trusted/protected)"""
         self.lan_devices = []
         
         protected_ips = set(d[0] for d in self.protected_devices)
@@ -3278,35 +3278,29 @@ class Irongate:
         trusted_ips = set(d[0] for d in self.trusted_devices)
         trusted_macs = set(d[1].lower() for d in self.trusted_devices)
         
+        lease_file = '/var/lib/dnsmasq/dnsmasq.leases'
+        
         try:
-            if not os.path.exists(DB_PATH):
-                logger.warning(f"Database not found: {DB_PATH}")
-                return
+            if os.path.exists(lease_file):
+                with open(lease_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            # Format: timestamp mac ip hostname clientid
+                            mac = parts[1].lower()
+                            ip = parts[2]
+                            
+                            # Exclude: protected, trusted, gateway, self
+                            if (ip not in protected_ips and 
+                                mac not in protected_macs and
+                                ip not in trusted_ips and
+                                mac not in trusted_macs and
+                                ip != self.gateway_ip and 
+                                ip != self.local_ip and
+                                mac != self.local_mac.lower()):
+                                self.lan_devices.append((ip, mac))
             
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            
-            try:
-                cursor.execute("SELECT ip, mac FROM leases WHERE ip IS NOT NULL AND mac IS NOT NULL")
-                for row in cursor.fetchall():
-                    ip, mac = row[0], row[1].lower()
-                    # Exclude: protected, trusted, gateway, self
-                    if (ip not in protected_ips and 
-                        mac not in protected_macs and
-                        ip not in trusted_ips and
-                        mac not in trusted_macs and
-                        ip != self.gateway_ip and 
-                        ip != self.local_ip and
-                        mac.lower() != self.local_mac.lower()):
-                        self.lan_devices.append((ip, mac))
-            except sqlite3.OperationalError:
-                pass
-            
-            # NOTE: Do NOT add trusted devices to lan_devices
-            # Trusted devices should NOT be ARP spoofed - they need real server MACs
-            
-            conn.close()
-            
+            # Deduplicate by IP
             seen_ips = set()
             unique_devices = []
             for ip, mac in self.lan_devices:
