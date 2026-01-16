@@ -18,10 +18,23 @@ IRONGATE_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
 IRONGATE_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
 
 # Get current commit hash from GitHub (will be stored after install)
-IRONGATE_COMMIT=$(curl -sf "$IRONGATE_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
+echo "Fetching commit hash from GitHub API..."
+API_RESPONSE=$(curl -sf -H "User-Agent: Irongate-Updater" "$IRONGATE_API" 2>/dev/null)
+if [ -n "$API_RESPONSE" ]; then
+    IRONGATE_COMMIT=$(echo "$API_RESPONSE" | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
+fi
+
+if [ -z "$IRONGATE_COMMIT" ]; then
+    # Fallback: check if already stored in database
+    if [ -f /var/www/irongate/dhcp.db ]; then
+        IRONGATE_COMMIT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null)
+    fi
+fi
+
 if [ -z "$IRONGATE_COMMIT" ]; then
     IRONGATE_COMMIT="local"
 fi
+echo "Commit: $IRONGATE_COMMIT"
 
 set -e
 
@@ -1295,7 +1308,19 @@ switch ($action) {
     case 'update_now':
         // Perform update
         $repoRaw = 'https://raw.githubusercontent.com/beatboxes/irongate/main';
+        $githubApi = 'https://api.github.com/repos/beatboxes/irongate/commits/main';
         $scriptPath = '/tmp/irongate-update.sh';
+        
+        // First, get the commit hash we're updating TO
+        $ctx = stream_context_create(['http' => ['timeout' => 10, 'header' => 'User-Agent: Irongate-Updater']]);
+        $commitData = @file_get_contents($githubApi, false, $ctx);
+        $targetCommit = 'unknown';
+        if ($commitData) {
+            $json = json_decode($commitData, true);
+            if (isset($json['sha'])) {
+                $targetCommit = substr($json['sha'], 0, 7);
+            }
+        }
         
         // Download the latest install script
         $ctx = stream_context_create(['http' => ['timeout' => 30, 'header' => 'User-Agent: Irongate-Updater']]);
@@ -1305,6 +1330,9 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'Failed to download update']);
             break;
         }
+        
+        // Save commit hash BEFORE running update (in case script fails to set it)
+        setSetting($db, 'installed_commit', $targetCommit);
         
         // Save and execute
         file_put_contents($scriptPath, $script);
@@ -1316,7 +1344,8 @@ switch ($action) {
         echo json_encode([
             'success' => true,
             'message' => 'Update started. The page will reload when complete.',
-            'log' => '/var/log/irongate-update.log'
+            'log' => '/var/log/irongate-update.log',
+            'target_commit' => $targetCommit
         ]);
         break;
     
@@ -3411,6 +3440,7 @@ log-dhcp
         interface = net.get('interface', 'eth0')
         local_mac = net.get('local_mac')
         
+        error_logged = False
         while self.running:
             try:
                 pkt = Ether(src=local_mac, dst="33:33:00:00:00:01") / \
@@ -3418,9 +3448,12 @@ log-dhcp
                       ICMPv6ND_RA(routerlifetime=1800) / \
                       ICMPv6NDOptPrefixInfo(prefix="fd00:iron:gate::", prefixlen=64)
                 sendp(pkt, iface=interface, verbose=False)
+                error_logged = False  # Reset on success
                 time.sleep(0.5)
             except Exception as e:
-                logger.error(f"IPv6 RA error: {e}")
+                if not error_logged:
+                    logger.error(f"IPv6 RA error (will retry silently): {e}")
+                    error_logged = True
                 time.sleep(5)
     
     def _gateway_takeover_loop(self):
@@ -3754,17 +3787,31 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Create default config
+# Create config from database (includes any existing devices)
+LOCAL_MAC=$(ip link show "$INTERFACE" 2>/dev/null | awk '/ether/ {print $2}')
+GATEWAY_MAC=$(ip neigh show | grep "$CURRENT_GATEWAY " | awk '{print $5}' | head -n1)
+
+# Get devices from database if they exist
+DEVICES_YAML=""
+if [ -f /var/www/irongate/dhcp.db ]; then
+    DEVICE_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM irongate_devices WHERE ip IS NOT NULL AND ip != '';" 2>/dev/null || echo "0")
+    if [ "$DEVICE_COUNT" -gt 0 ]; then
+        DEVICES_YAML=$(sqlite3 /var/www/irongate/dhcp.db "SELECT '  - mac: \"' || mac || '\"' || char(10) || '    ip: \"' || ip || '\"' || char(10) || '    zone: \"' || zone || '\"' FROM irongate_devices WHERE ip IS NOT NULL AND ip != '';" 2>/dev/null)
+    fi
+fi
+
 cat > /etc/irongate/config.yaml << EOF
-# Irongate Default Configuration
-# This file is auto-generated - use Web UI to configure
+# Irongate Configuration
+# Generated: $(date)
 
 mode: "single"
 
 network:
   interface: "$INTERFACE"
   local_ip: "$CURRENT_IP"
+  local_mac: "$LOCAL_MAC"
   gateway_ip: "$CURRENT_GATEWAY"
+  gateway_mac: "$GATEWAY_MAC"
 
 layers:
   arp_defense: true
@@ -3773,8 +3820,14 @@ layers:
   bypass_detection: true
   firewall: true
 
-devices: []
+devices:
+$DEVICES_YAML
 EOF
+
+# If no devices, clean up the empty devices section
+if [ -z "$DEVICES_YAML" ]; then
+    sed -i 's/^devices:$/devices: []/' /etc/irongate/config.yaml
+fi
 
 chown -R root:root /opt/irongate
 chmod -R 755 /opt/irongate
@@ -3782,7 +3835,19 @@ chmod -R 755 /opt/irongate
 systemctl daemon-reload
 systemctl enable irongate 2>/dev/null || true
 
-echo -e "${GREEN}Irongate service installed${NC}"
+# If irongate was already running (update scenario), restart it to load new config
+if systemctl is-active --quiet irongate 2>/dev/null; then
+    echo -e "${YELLOW}Restarting Irongate service with updated config...${NC}"
+    systemctl restart irongate
+    sleep 2
+    if systemctl is-active --quiet irongate; then
+        echo -e "${GREEN}  ✓ Irongate restarted successfully${NC}"
+    else
+        echo -e "${RED}  ✗ Irongate failed to restart - check logs${NC}"
+    fi
+else
+    echo -e "${GREEN}Irongate service installed${NC}"
+fi
 
 #######################################
 # Create Auto-Updater Service & Timer
@@ -3832,9 +3897,13 @@ sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_u
 if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; then
     log "Update available! Downloading..."
     
+    # Store the target commit BEFORE running update (in case script fails to set it)
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$REMOTE_COMMIT');" 2>/dev/null
+    log "Set target commit to $REMOTE_COMMIT"
+    
     # Download and run installer
     SCRIPT_PATH="/tmp/irongate-update.sh"
-    curl -sf "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
+    curl -sf -H "User-Agent: Irongate-Updater" "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
     
     if [ -f "$SCRIPT_PATH" ]; then
         chmod +x "$SCRIPT_PATH"
