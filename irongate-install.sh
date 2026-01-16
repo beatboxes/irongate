@@ -1179,6 +1179,47 @@ switch ($action) {
         }
         break;
     
+    case 'irongate_diag':
+        // Diagnostic info for troubleshooting
+        $diag = [];
+        
+        // 1. Check devices with IPs
+        $results = $db->query('SELECT * FROM irongate_devices WHERE ip IS NOT NULL AND ip != ""');
+        $devicesWithIp = [];
+        while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+            $devicesWithIp[] = $row;
+        }
+        $diag['devices_with_ip'] = $devicesWithIp;
+        $diag['devices_without_ip_warning'] = count($devicesWithIp) === 0 ? 
+            'WARNING: No devices have IPs set! Firewall rules will not work.' : null;
+        
+        // 2. IP forwarding status
+        $ipForward = trim(shell_exec('cat /proc/sys/net/ipv4/ip_forward 2>/dev/null'));
+        $diag['ip_forward'] = $ipForward === '1' ? 'enabled' : 'DISABLED';
+        
+        // 3. nftables rules
+        $nftRules = shell_exec('nft list table inet irongate 2>&1');
+        $diag['nftables'] = $nftRules ?: 'No irongate table found';
+        
+        // 4. ARP cache
+        $arpCache = shell_exec('ip neigh show 2>/dev/null | head -20');
+        $diag['arp_cache'] = $arpCache;
+        
+        // 5. Service status
+        exec('systemctl status irongate 2>&1', $svcStatus);
+        $diag['service_status'] = implode("\n", array_slice($svcStatus, 0, 15));
+        
+        // 6. Recent logs
+        $logs = shell_exec('sudo journalctl -u irongate -n 30 --no-pager 2>&1');
+        $diag['recent_logs'] = $logs;
+        
+        // 7. Config file
+        $config = @file_get_contents('/etc/irongate/config.yaml');
+        $diag['config'] = $config ?: 'Config file not found';
+        
+        echo json_encode(['success' => true, 'data' => $diag]);
+        break;
+    
     case 'update_check':
         // Check for updates from GitHub using commit hash
         $currentCommit = getSetting($db, 'installed_commit') ?: 'unknown';
@@ -1735,6 +1776,15 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                         <button class="btn btn-warning" onclick="runRepair()" style="margin-left:10px;">🔧 Auto-Repair</button>
                     </div>
                     <div id="diag-results"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">🛡️ Irongate Protection Diagnostics</div>
+                    <div style="margin-bottom:15px;">
+                        <button class="btn btn-primary" onclick="runIrongateDiag()">🔍 Check Irongate Setup</button>
+                    </div>
+                    <div id="irongate-diag-results" style="display:none;">
+                        <div id="irongate-diag-content" style="background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;white-space:pre-wrap;max-height:600px;overflow-y:auto;"></div>
+                    </div>
                 </div>
                 <div class="card">
                     <div class="card-title">Service Control</div>
@@ -2348,6 +2398,62 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     loadStatus();
                     runDiagnostics();
                 },2000);
+            }
+        }
+        
+        async function runIrongateDiag(){
+            const container = document.getElementById('irongate-diag-results');
+            const content = document.getElementById('irongate-diag-content');
+            container.style.display = 'block';
+            content.innerHTML = 'Running Irongate diagnostics...';
+            
+            try {
+                const res = await api('irongate_diag');
+                if (res.success && res.data) {
+                    const d = res.data;
+                    let html = '';
+                    
+                    // Warning about devices without IPs
+                    if (d.devices_without_ip_warning) {
+                        html += `<div style="color:#e94560;font-weight:bold;margin-bottom:15px;">⚠️ ${d.devices_without_ip_warning}</div>`;
+                    }
+                    
+                    // Devices with IPs
+                    html += `<div style="color:#58a6ff;font-weight:bold;">═══ PROTECTED DEVICES WITH IPs ═══</div>\n`;
+                    if (d.devices_with_ip && d.devices_with_ip.length > 0) {
+                        d.devices_with_ip.forEach(dev => {
+                            html += `  ${dev.zone}: ${dev.ip} (${dev.mac}) ${dev.hostname || ''}\n`;
+                        });
+                    } else {
+                        html += `  <span style="color:#e94560;">NONE - Add devices with IPs to enable protection!</span>\n`;
+                    }
+                    
+                    // IP Forwarding
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ IP FORWARDING ═══</div>\n`;
+                    html += `  Status: ${d.ip_forward === 'enabled' ? '✓ ' + d.ip_forward : '✗ ' + d.ip_forward}\n`;
+                    
+                    // nftables
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ NFTABLES RULES ═══</div>\n`;
+                    html += d.nftables + '\n';
+                    
+                    // ARP Cache
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ ARP CACHE ═══</div>\n`;
+                    html += d.arp_cache || 'Empty';
+                    
+                    // Config
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ CONFIG FILE ═══</div>\n`;
+                    html += d.config;
+                    
+                    // Recent Logs
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ RECENT LOGS ═══</div>\n`;
+                    html += d.recent_logs || 'No logs';
+                    
+                    content.innerHTML = html;
+                } else {
+                    content.innerHTML = 'Error: ' + (res.error || 'Unknown error');
+                }
+            } catch (e) {
+                content.innerHTML = 'Error: ' + e.message;
             }
         }
         
@@ -3131,11 +3237,24 @@ class Irongate:
         gateway_mac = net.get('gateway_mac', '')
         local_ip = net.get('local_ip', '')
         local_mac = net.get('local_mac', '')
+        devices = self.config.get('devices', [])
         
         if not gateway_mac:
             logger.warning("Gateway MAC not known, attempting to discover...")
             os.system(f"arping -c 1 -I {interface} {gateway_ip} 2>/dev/null")
             time.sleep(1)
+        
+        # === CRITICAL: Set static ARP entries for protected devices ===
+        # This allows Irongate to forward traffic to real device MACs
+        # even while we're ARP-spoofing the rest of the network
+        logger.info("Setting up static ARP entries for protected devices...")
+        for dev in devices:
+            dev_ip = dev.get('ip')
+            dev_mac = dev.get('mac')
+            if dev_ip and dev_mac:
+                # Add permanent ARP entry so kernel knows the REAL MAC
+                os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {interface} nud permanent 2>/dev/null")
+                logger.info(f"  Static ARP: {dev_ip} -> {dev_mac}")
         
         # Layer 2: ARP Defense
         if layers.get('arp_defense', True):
@@ -3383,30 +3502,59 @@ log-dhcp
         local_ip = net.get('local_ip')
         devices = self.config.get('devices', [])
         
-        # Build set of protected IPs (non-trusted)
+        # Build set of protected IPs (non-trusted) and their real MACs
         protected_ips = set()
+        protected_macs = {}  # ip -> mac
         for dev in devices:
             if dev.get('ip') and dev.get('zone', 'isolated') != 'trusted':
                 protected_ips.add(dev.get('ip'))
+                protected_macs[dev.get('ip')] = dev.get('mac', '').lower()
+        
+        logger.info(f"ARP Reply Handler protecting IPs: {protected_ips}")
         
         def handle_arp(pkt):
-            if ARP not in pkt or pkt[ARP].op != 1:  # Only ARP requests
+            if ARP not in pkt:
                 return
             
-            requested_ip = pkt[ARP].pdst
-            requester_mac = pkt[ARP].hwsrc
-            requester_ip = pkt[ARP].psrc
+            # Handle ARP requests - respond claiming to be the protected device
+            if pkt[ARP].op == 1:  # ARP request
+                requested_ip = pkt[ARP].pdst
+                requester_mac = pkt[ARP].hwsrc
+                requester_ip = pkt[ARP].psrc
+                
+                # If someone is asking for a protected device's MAC, respond with ours
+                if requested_ip in protected_ips and requester_ip != local_ip:
+                    # Send multiple replies to win the race against real device
+                    for _ in range(3):
+                        reply = Ether(dst=requester_mac, src=local_mac) / ARP(
+                            op=2,  # Reply
+                            psrc=requested_ip,    # "The IP you asked about..."
+                            hwsrc=local_mac,      # "...is at my MAC"
+                            pdst=requester_ip,
+                            hwdst=requester_mac
+                        )
+                        sendp(reply, iface=interface, verbose=False)
+                    logger.debug(f"ARP intercept: {requester_ip} asked for {requested_ip}")
             
-            # If someone is asking for a protected device's MAC, respond with ours
-            if requested_ip in protected_ips and requester_ip != local_ip:
-                reply = Ether(dst=requester_mac, src=local_mac) / ARP(
-                    op=2,  # Reply
-                    psrc=requested_ip,    # "The IP you asked about..."
-                    hwsrc=local_mac,      # "...is at my MAC"
-                    pdst=requester_ip,
-                    hwdst=requester_mac
-                )
-                sendp(reply, iface=interface, verbose=False)
+            # Handle ARP replies from protected devices - re-poison immediately
+            elif pkt[ARP].op == 2:  # ARP reply
+                sender_ip = pkt[ARP].psrc
+                sender_mac = pkt[ARP].hwsrc.lower()
+                target_ip = pkt[ARP].pdst
+                
+                # If a protected device is announcing itself, immediately re-poison
+                if sender_ip in protected_ips and sender_mac == protected_macs.get(sender_ip):
+                    # The real device just announced itself - counter it
+                    counter = Ether(dst="ff:ff:ff:ff:ff:ff", src=local_mac) / ARP(
+                        op=2,
+                        psrc=sender_ip,
+                        hwsrc=local_mac,  # Claim WE are that IP
+                        pdst=sender_ip,
+                        hwdst="ff:ff:ff:ff:ff:ff"
+                    )
+                    for _ in range(2):
+                        sendp(counter, iface=interface, verbose=False)
+                    logger.debug(f"ARP counter-poison for {sender_ip}")
         
         while self.running:
             try:
@@ -3485,27 +3633,27 @@ table inet irongate {{
         # ISOLATED zone: Internet only, no LAN, no other devices
         # =====================================================
         # Outbound from isolated
-        ip saddr @isolated_devices ip daddr @lan_ranges drop
-        ip saddr @isolated_devices ip daddr @isolated_devices drop
-        ip saddr @isolated_devices ip daddr @servers_devices drop
-        ip saddr @isolated_devices accept  # Internet only
+        ip saddr @isolated_devices ip daddr @lan_ranges counter drop
+        ip saddr @isolated_devices ip daddr @isolated_devices counter drop
+        ip saddr @isolated_devices ip daddr @servers_devices counter drop
+        ip saddr @isolated_devices counter accept  # Internet only
         # Inbound to isolated (block everything except internet replies handled by conntrack)
-        ip daddr @isolated_devices ip saddr @lan_ranges drop
-        ip daddr @isolated_devices ip saddr @servers_devices drop
-        ip daddr @isolated_devices ip saddr @isolated_devices drop
+        ip daddr @isolated_devices ip saddr @lan_ranges counter drop
+        ip daddr @isolated_devices ip saddr @servers_devices counter drop
+        ip daddr @isolated_devices ip saddr @isolated_devices counter drop
         
         # =====================================================
         # SERVERS zone: Inter-server OK, no LAN access
         # =====================================================
         # Outbound from servers
-        ip saddr @servers_devices ip daddr @lan_ranges drop
-        ip saddr @servers_devices ip daddr @isolated_devices drop
-        ip saddr @servers_devices ip daddr @servers_devices accept  # Inter-server OK
-        ip saddr @servers_devices accept  # Internet OK
+        ip saddr @servers_devices ip daddr @lan_ranges counter drop
+        ip saddr @servers_devices ip daddr @isolated_devices counter drop
+        ip saddr @servers_devices ip daddr @servers_devices counter accept  # Inter-server OK
+        ip saddr @servers_devices counter accept  # Internet OK
         # Inbound to servers (only from other servers or internet)
-        ip daddr @servers_devices ip saddr @lan_ranges drop
-        ip daddr @servers_devices ip saddr @isolated_devices drop
-        ip daddr @servers_devices ip saddr @servers_devices accept  # Inter-server OK
+        ip daddr @servers_devices ip saddr @lan_ranges counter drop
+        ip daddr @servers_devices ip saddr @isolated_devices counter drop
+        ip daddr @servers_devices ip saddr @servers_devices counter accept  # Inter-server OK
         
         # =====================================================
         # TRUSTED zone: Full access (implicit, no restrictions)
