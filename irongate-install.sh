@@ -3247,6 +3247,7 @@ class Irongate:
         self.running = False
         self.threads = []
         self.protected_devices = []
+        self.trusted_devices = []
         self.lan_devices = []
         self.gateway_ip = None
         self.gateway_mac = None
@@ -3269,11 +3270,13 @@ class Irongate:
             return False
     
     def _load_lan_devices(self):
-        """Load all known LAN devices from DHCP database"""
+        """Load all known LAN devices from DHCP database (excluding trusted)"""
         self.lan_devices = []
         
         protected_ips = set(d[0] for d in self.protected_devices)
         protected_macs = set(d[1].lower() for d in self.protected_devices)
+        trusted_ips = set(d[0] for d in self.trusted_devices)
+        trusted_macs = set(d[1].lower() for d in self.trusted_devices)
         
         try:
             if not os.path.exists(DB_PATH):
@@ -3287,8 +3290,11 @@ class Irongate:
                 cursor.execute("SELECT ip, mac FROM leases WHERE ip IS NOT NULL AND mac IS NOT NULL")
                 for row in cursor.fetchall():
                     ip, mac = row[0], row[1].lower()
+                    # Exclude: protected, trusted, gateway, self
                     if (ip not in protected_ips and 
                         mac not in protected_macs and
+                        ip not in trusted_ips and
+                        mac not in trusted_macs and
                         ip != self.gateway_ip and 
                         ip != self.local_ip and
                         mac.lower() != self.local_mac.lower()):
@@ -3296,15 +3302,8 @@ class Irongate:
             except sqlite3.OperationalError:
                 pass
             
-            try:
-                cursor.execute("SELECT ip, mac FROM irongate_devices WHERE zone = 'trusted' AND ip IS NOT NULL AND mac IS NOT NULL")
-                for row in cursor.fetchall():
-                    ip, mac = row[0], row[1].lower()
-                    if ip != self.gateway_ip and ip != self.local_ip:
-                        if not any(d[0] == ip for d in self.lan_devices):
-                            self.lan_devices.append((ip, mac))
-            except sqlite3.OperationalError:
-                pass
+            # NOTE: Do NOT add trusted devices to lan_devices
+            # Trusted devices should NOT be ARP spoofed - they need real server MACs
             
             conn.close()
             
@@ -3316,7 +3315,7 @@ class Irongate:
                     unique_devices.append((ip, mac))
             self.lan_devices = unique_devices
             
-            logger.info(f"Loaded {len(self.lan_devices)} LAN devices from database")
+            logger.info(f"Loaded {len(self.lan_devices)} LAN devices to spoof (excluding {len(self.trusted_devices)} trusted)")
             
         except Exception as e:
             logger.error(f"Failed to load LAN devices: {e}")
@@ -3410,6 +3409,7 @@ class Irongate:
                 return
         
         self.protected_devices = []
+        self.trusted_devices = []
         for dev in devices:
             dev_ip = dev.get('ip')
             dev_mac = dev.get('mac', '').lower()
@@ -3417,16 +3417,17 @@ class Irongate:
             
             if not dev_ip:
                 continue
-                
-            if zone == 'trusted':
-                logger.info(f"  TRUSTED (no spoofing): {dev_ip}")
-                continue
             
             if not dev_mac:
                 dev_mac = self._get_mac(dev_ip)
                 if not dev_mac:
                     logger.warning(f"  Cannot resolve MAC for {dev_ip}, skipping")
                     continue
+                
+            if zone == 'trusted':
+                self.trusted_devices.append((dev_ip, dev_mac))
+                logger.info(f"  TRUSTED (full access): {dev_ip} ({dev_mac})")
+                continue
             
             self.protected_devices.append((dev_ip, dev_mac, zone))
             logger.info(f"  PROTECTED ({zone}): {dev_ip} ({dev_mac})")
@@ -3587,6 +3588,7 @@ class Irongate:
         
         isolated_ips = []
         servers_ips = []
+        trusted_ips = []
         
         for dev in devices:
             ip = dev.get('ip', '')
@@ -3596,10 +3598,13 @@ class Irongate:
                     isolated_ips.append(ip)
                 elif zone == 'servers':
                     servers_ips.append(ip)
+                elif zone == 'trusted':
+                    trusted_ips.append(ip)
         
         # Use placeholder if empty
         isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
         servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
+        trusted_set = ', '.join(trusted_ips) if trusted_ips else '0.0.0.0'
         
         # CRITICAL: policy accept - only drop specific traffic
         rules = f"""
@@ -3614,10 +3619,19 @@ table inet irongate {{
         elements = {{ {servers_set} }}
     }}
     
+    set trusted_devices {{
+        type ipv4_addr
+        elements = {{ {trusted_set} }}
+    }}
+    
     chain forward {{
         type filter hook forward priority 0; policy accept;
         
         ct state established,related accept
+        
+        # === TRUSTED: Full access to everything ===
+        ip saddr @trusted_devices accept
+        ip daddr @trusted_devices accept
         
         # === OUTBOUND: Protected devices cannot reach LAN ===
         # Isolated: block all LAN access
@@ -3651,7 +3665,7 @@ table inet irongate {{
                 f.write(rules)
             result = os.system('nft -f /tmp/irongate.nft')
             if result == 0:
-                logger.info(f"Firewall: {len(isolated_ips)} isolated, {len(servers_ips)} servers (policy accept)")
+                logger.info(f"Firewall: {len(isolated_ips)} isolated, {len(servers_ips)} servers, {len(trusted_ips)} trusted (policy accept)")
             else:
                 logger.error("Failed to apply firewall rules")
         except Exception as e:
