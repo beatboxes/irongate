@@ -3323,8 +3323,8 @@ class Irongate:
             logger.error(f"Failed to load LAN devices: {e}")
     
     def setup_kernel(self):
-        """Enable IP forwarding for traffic we intercept"""
-        os.system('sysctl -w net.ipv4.ip_forward=1 2>/dev/null')
+        """DEBUG: Don't touch kernel settings"""
+        logger.info("Kernel settings: UNCHANGED (debug mode)")
     
     def _get_mac(self, ip):
         """Resolve MAC address via ARP request"""
@@ -3408,8 +3408,8 @@ class Irongate:
         logger.info("ARP tables restored")
     
     def run_single_nic(self):
-        """Run middleground ARP-based isolation (~95% protection)"""
-        logger.info("Starting single-NIC mode (middleground ARP isolation)")
+        """Run FIREWALL-ONLY mode - NO ARP spoofing"""
+        logger.info("Starting single-NIC mode (FIREWALL ONLY - NO ARP)")
         
         net = self.config.get('network', {})
         self.interface = net.get('interface', 'eth0')
@@ -3419,17 +3419,7 @@ class Irongate:
         self.local_ip = net.get('local_ip', '')
         devices = self.config.get('devices', [])
         
-        # Resolve gateway MAC if not provided
-        if not self.gateway_mac:
-            logger.info(f"Resolving gateway MAC for {self.gateway_ip}...")
-            self.gateway_mac = self._get_mac(self.gateway_ip)
-            if self.gateway_mac:
-                logger.info(f"  Gateway MAC: {self.gateway_mac}")
-            else:
-                logger.error("Could not resolve gateway MAC - ARP spoofing disabled")
-                return
-        
-        # Build list of protected devices (isolated + servers, NOT trusted)
+        # Build list of protected devices
         self.protected_devices = []
         for dev in devices:
             dev_ip = dev.get('ip')
@@ -3438,58 +3428,16 @@ class Irongate:
             
             if not dev_ip:
                 continue
-                
-            if zone == 'trusted':
-                logger.info(f"  TRUSTED (no spoofing): {dev_ip}")
-                continue
-            
-            if not dev_mac:
-                dev_mac = self._get_mac(dev_ip)
-                if not dev_mac:
-                    logger.warning(f"  Cannot resolve MAC for {dev_ip}, skipping")
-                    continue
             
             self.protected_devices.append((dev_ip, dev_mac, zone))
-            logger.info(f"  PROTECTED ({zone}): {dev_ip} ({dev_mac})")
+            logger.info(f"  Device ({zone}): {dev_ip}")
         
-        if not self.protected_devices:
-            logger.warning("No protected devices - nothing to isolate")
-            return
-        
-        # Load all known LAN devices from database
-        self._load_lan_devices()
-        
-        # Set up static ARP entries on Irongate
-        logger.info("Setting up local static ARP entries...")
-        for dev_ip, dev_mac, zone in self.protected_devices:
-            os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {self.interface} nud permanent 2>/dev/null")
-        os.system(f"ip neigh replace {self.gateway_ip} lladdr {self.gateway_mac} dev {self.interface} nud permanent 2>/dev/null")
-        
-        # Setup firewall
+        # ONLY set up firewall - absolutely no ARP manipulation
         self._setup_firewall()
-        logger.info("Firewall configured")
+        logger.info("Firewall configured (NO ARP spoofing)")
+        logger.info("NOTE: Protection is limited without ARP - LAN devices can still reach servers directly")
         
-        # Start ARP spoofing thread
-        t = threading.Thread(target=self._middleground_arp_spoof_loop, daemon=True)
-        t.start()
-        self.threads.append(t)
-        logger.info("Middleground ARP spoofing started")
-        
-        # Start ARP defense thread
-        t2 = threading.Thread(target=self._arp_defense_loop, daemon=True)
-        t2.start()
-        self.threads.append(t2)
-        logger.info("ARP defense started")
-        
-        # Start LAN device refresh thread (picks up new devices)
-        t3 = threading.Thread(target=self._lan_device_refresh_loop, daemon=True)
-        t3.start()
-        self.threads.append(t3)
-        logger.info("LAN device refresh started")
-        
-        logger.info(f"Single-NIC isolation active")
-        logger.info(f"  Protected: {len(self.protected_devices)} devices")
-        logger.info(f"  LAN targets: {len(self.lan_devices)} devices")
+        logger.info(f"Single-NIC FIREWALL-ONLY mode active ({len(self.protected_devices)} devices)")
     
     def _lan_device_refresh_loop(self):
         """Periodically refresh list of LAN devices from database"""
@@ -3636,65 +3584,11 @@ class Irongate:
                     time.sleep(1)
     
     def _setup_firewall(self):
-        """Configure nftables for traffic control"""
-        devices = self.config.get('devices', [])
-        
-        isolated_ips = []
-        servers_ips = []
-        
-        for dev in devices:
-            ip = dev.get('ip', '')
-            zone = dev.get('zone', 'isolated')
-            if ip:
-                if zone == 'isolated':
-                    isolated_ips.append(ip)
-                elif zone == 'servers':
-                    servers_ips.append(ip)
-        
-        isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
-        servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
-        
-        rules = f"""
-table inet irongate {{
-    set isolated_devices {{
-        type ipv4_addr
-        elements = {{ {isolated_set} }}
-    }}
-    
-    set servers_devices {{
-        type ipv4_addr
-        elements = {{ {servers_set} }}
-    }}
-    
-    chain forward {{
-        type filter hook forward priority 0; policy accept;
-        
-        ct state established,related accept
-        
-        # Isolated: block all LAN access
-        ip saddr @isolated_devices ip daddr 10.0.0.0/8 drop
-        ip saddr @isolated_devices ip daddr 172.16.0.0/12 drop
-        ip saddr @isolated_devices ip daddr 192.168.0.0/16 drop
-        
-        # Servers: allow inter-server, block other LAN
-        ip saddr @servers_devices ip daddr @servers_devices accept
-        ip saddr @servers_devices ip daddr 10.0.0.0/8 drop
-        ip saddr @servers_devices ip daddr 172.16.0.0/12 drop
-        ip saddr @servers_devices ip daddr 192.168.0.0/16 drop
-    }}
-}}
-"""
-        try:
-            os.system('nft delete table inet irongate 2>/dev/null')
-            with open('/tmp/irongate.nft', 'w') as f:
-                f.write(rules)
-            result = os.system('nft -f /tmp/irongate.nft')
-            if result == 0:
-                logger.info(f"Firewall: {len(isolated_ips)} isolated, {len(servers_ips)} servers")
-            else:
-                logger.error("Failed to apply firewall rules")
-        except Exception as e:
-            logger.error(f"Firewall error: {e}")
+        """Configure minimal nftables - DEBUG MODE"""
+        # Just delete any existing irongate table and don't add anything
+        # This is purely for debugging to see if firewall is the problem
+        os.system('nft delete table inet irongate 2>/dev/null')
+        logger.info("Firewall: DISABLED (debug mode - no rules)")
     
     def run_dual_nic(self):
         """Run bridge isolation mode"""
