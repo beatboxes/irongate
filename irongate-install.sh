@@ -3395,21 +3395,37 @@ table inet irongate {{
         # Allow established connections
         ct state established,related accept
         
-        # ISOLATED zone: Only internet, no LAN, no other devices
+        # =====================================================
+        # ISOLATED zone: Internet only, no LAN, no other devices
+        # =====================================================
+        # Outbound from isolated
         ip saddr @isolated_devices ip daddr @lan_ranges drop
         ip saddr @isolated_devices ip daddr @isolated_devices drop
         ip saddr @isolated_devices ip daddr @servers_devices drop
         ip saddr @isolated_devices accept  # Internet only
+        # Inbound to isolated (block everything except internet replies handled by conntrack)
+        ip daddr @isolated_devices ip saddr @lan_ranges drop
+        ip daddr @isolated_devices ip saddr @servers_devices drop
+        ip daddr @isolated_devices ip saddr @isolated_devices drop
         
-        # SERVERS zone: Can talk to other servers, no LAN
+        # =====================================================
+        # SERVERS zone: Inter-server OK, no LAN access
+        # =====================================================
+        # Outbound from servers
         ip saddr @servers_devices ip daddr @lan_ranges drop
         ip saddr @servers_devices ip daddr @isolated_devices drop
         ip saddr @servers_devices ip daddr @servers_devices accept  # Inter-server OK
         ip saddr @servers_devices accept  # Internet OK
+        # Inbound to servers (only from other servers or internet)
+        ip daddr @servers_devices ip saddr @lan_ranges drop
+        ip daddr @servers_devices ip saddr @isolated_devices drop
+        ip daddr @servers_devices ip saddr @servers_devices accept  # Inter-server OK
         
-        # TRUSTED zone: Full access (handled by default accept below)
+        # =====================================================
+        # TRUSTED zone: Full access (implicit, no restrictions)
+        # =====================================================
         
-        # Block same-interface forwarding for unclassified traffic
+        # Block unclassified same-interface forwarding
         iifname "{interface}" oifname "{interface}" drop
     }}
     
