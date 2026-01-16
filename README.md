@@ -2,7 +2,7 @@
 
 **Enterprise-Grade Multi-Layer Network Isolation System**
 
-Irongate is a sophisticated network security tool that enforces strict device separation on standard network infrastructure—without requiring managed switches or VLANs. It implements six layers of defense-in-depth isolation to prevent unauthorized device communication on your network.
+Irongate is a sophisticated network security tool that enforces strict device separation on standard network infrastructure—without requiring managed switches or VLANs. It implements seven layers of defense-in-depth isolation to prevent unauthorized device communication on your network.
 
 ## Overview
 
@@ -10,7 +10,7 @@ Many organizations need to isolate critical devices (servers, medical equipment,
 
 ### Key Features
 
-- **6 Layers of Protection** - Defense-in-depth approach ensures isolation even if one layer is bypassed
+- **7 Layers of Protection** - Defense-in-depth approach ensures isolation even if one layer is bypassed
 - **No Special Hardware Required** - Works on standard unmanaged network infrastructure
 - **Two Isolation Modes** - Single-NIC (software-based) or Dual-NIC (hardware-enforced) isolation
 - **Web-Based Management** - Modern HTTPS dashboard for real-time monitoring and device management
@@ -19,7 +19,7 @@ Many organizations need to isolate critical devices (servers, medical equipment,
 
 ## How It Works
 
-Irongate implements six complementary layers of network isolation:
+Irongate implements seven complementary layers of network isolation:
 
 ### Layer 1: DHCP Microsegmentation
 - Assigns /30 subnets to isolated devices, forcing all traffic through Irongate
@@ -55,6 +55,13 @@ Irongate implements six complementary layers of network isolation:
 - CAM table management to control switch forwarding behavior
 - Gateway MAC coordination to win Layer 2 arbitration
 - Promiscuous packet interception for stateful validation
+
+### Layer 7: ARP Reply Interception
+- Real-time monitoring of all ARP traffic on the network
+- Intercepts ARP replies from protected devices announcing their real MAC addresses
+- Immediately counters with spoofed replies to maintain isolation
+- Prevents Layer 2 bypass attempts by untrusted devices
+- Selective enforcement: allows trusted devices, gateway, and servers to communicate normally
 
 ## System Requirements
 
@@ -173,6 +180,7 @@ tail -f /var/log/irongate/web.log
 │   ├── firewall.py         # Layer 4: nftables Firewall
 │   ├── monitor.py          # Layer 5: Bypass Detection
 │   ├── gateway_takeover.py # Layer 6: Gateway Takeover
+│   ├── arp_interceptor.py  # Layer 7: ARP Reply Interception
 │   └── bridge_manager.py   # Dual-NIC bridge management
 ├── templates/              # Flask HTML templates
 └── static/                 # CSS/JS assets
@@ -225,7 +233,7 @@ tail -f /var/log/irongate/web.log
 
 **Isolation not working**
 - Review security logs: `tail -f /var/log/irongate/security.log`
-- Verify all 6 layers are enabled in configuration
+- Verify all 7 layers are enabled in configuration
 - Consider switching to Dual-NIC mode for complete isolation
 
 ## License
