@@ -13,6 +13,16 @@
 # Deploy on any Debian/Raspbian SBC
 #######################################
 
+IRONGATE_REPO="https://github.com/beatboxes/irongate"
+IRONGATE_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
+IRONGATE_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
+
+# Get current commit hash from GitHub (will be stored after install)
+IRONGATE_COMMIT=$(curl -sf "$IRONGATE_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
+if [ -z "$IRONGATE_COMMIT" ]; then
+    IRONGATE_COMMIT="local"
+fi
+
 set -e
 
 RED='\033[0;31m'
@@ -29,6 +39,7 @@ echo "║                                              ║"
 echo "║          🛡️  I R O N G A T E                ║"
 echo "║                                              ║"
 echo "║       Network Isolation System              ║"
+echo "║              ${IRONGATE_COMMIT}                          ║"
 echo "║                                              ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -289,6 +300,10 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('dns_primary', '8.8.8.8');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('dns_secondary', '1.1.1.1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('lease_time', '24h');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('domain', '');
+-- Auto-update settings
+INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_update_enabled', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('last_update_check', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('installed_commit', '');
 -- Irongate Network Isolation Settings
 INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_enabled', 'false');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('irongate_mode', 'single');
@@ -371,6 +386,10 @@ CREATE TABLE IF NOT EXISTS irongate_devices (
 );
 EOSQL
 fi
+
+# Always update the installed commit hash
+sqlite3 /var/www/irongate/dhcp.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '${IRONGATE_COMMIT}');"
+echo -e "${GREEN}  ✓ Commit: ${IRONGATE_COMMIT}${NC}"
 
 #######################################
 # Create PHP Backend API
@@ -907,6 +926,17 @@ switch ($action) {
     case 'settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            
+            // Validate lease_time format (dnsmasq format: 30m, 24h, 7d, 1w, infinite, or raw seconds)
+            if (isset($data['lease_time'])) {
+                $lt = trim($data['lease_time']);
+                if (!preg_match('/^(\d+[smhdw]?|infinite)$/i', $lt)) {
+                    echo json_encode(['success' => false, 'error' => 'Invalid lease time format. Use: 30m, 24h, 7d, 1w, or infinite']);
+                    exit;
+                }
+                $data['lease_time'] = strtolower($lt);
+            }
+            
             foreach ($data as $key => $value) {
                 setSetting($db, $key, $value);
             }
@@ -1149,13 +1179,119 @@ switch ($action) {
         }
         break;
     
+    case 'update_check':
+        // Check for updates from GitHub using commit hash
+        $currentCommit = getSetting($db, 'installed_commit') ?: 'unknown';
+        $githubApi = 'https://api.github.com/repos/beatboxes/irongate/commits/main';
+        
+        // Fetch latest commit from GitHub API
+        $ctx = stream_context_create([
+            'http' => [
+                'timeout' => 10,
+                'header' => 'User-Agent: Irongate-Updater'
+            ]
+        ]);
+        $response = @file_get_contents($githubApi, false, $ctx);
+        
+        if ($response === false) {
+            echo json_encode(['success' => false, 'error' => 'Could not reach GitHub API']);
+            break;
+        }
+        
+        $data = json_decode($response, true);
+        if (!isset($data['sha'])) {
+            echo json_encode(['success' => false, 'error' => 'Invalid response from GitHub']);
+            break;
+        }
+        
+        $remoteCommit = substr($data['sha'], 0, 7);
+        $commitMessage = $data['commit']['message'] ?? '';
+        $commitDate = $data['commit']['committer']['date'] ?? '';
+        $updateAvailable = ($currentCommit !== $remoteCommit && $currentCommit !== 'unknown' && $currentCommit !== 'local');
+        
+        // Update last check time
+        setSetting($db, 'last_update_check', date('Y-m-d H:i:s'));
+        
+        echo json_encode([
+            'success' => true,
+            'current_commit' => $currentCommit,
+            'remote_commit' => $remoteCommit,
+            'update_available' => $updateAvailable,
+            'commit_message' => $commitMessage,
+            'commit_date' => $commitDate,
+            'last_check' => date('Y-m-d H:i:s')
+        ]);
+        break;
+    
+    case 'update_settings':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            if (isset($data['auto_update_enabled'])) {
+                setSetting($db, 'auto_update_enabled', $data['auto_update_enabled'] ? 'true' : 'false');
+                
+                // Enable/disable the auto-update timer
+                if ($data['auto_update_enabled']) {
+                    exec('sudo systemctl enable irongate-updater.timer 2>&1');
+                    exec('sudo systemctl start irongate-updater.timer 2>&1');
+                } else {
+                    exec('sudo systemctl stop irongate-updater.timer 2>&1');
+                    exec('sudo systemctl disable irongate-updater.timer 2>&1');
+                }
+            }
+            echo json_encode(['success' => true]);
+        } else {
+            echo json_encode([
+                'success' => true,
+                'data' => [
+                    'auto_update_enabled' => getSetting($db, 'auto_update_enabled') === 'true',
+                    'installed_commit' => getSetting($db, 'installed_commit') ?: 'unknown',
+                    'last_update_check' => getSetting($db, 'last_update_check') ?: 'Never'
+                ]
+            ]);
+        }
+        break;
+    
+    case 'update_now':
+        // Perform update
+        $repoRaw = 'https://raw.githubusercontent.com/beatboxes/irongate/main';
+        $scriptPath = '/tmp/irongate-update.sh';
+        
+        // Download the latest install script
+        $ctx = stream_context_create(['http' => ['timeout' => 30, 'header' => 'User-Agent: Irongate-Updater']]);
+        $script = @file_get_contents("$repoRaw/irongate-install.sh", false, $ctx);
+        
+        if ($script === false) {
+            echo json_encode(['success' => false, 'error' => 'Failed to download update']);
+            break;
+        }
+        
+        // Save and execute
+        file_put_contents($scriptPath, $script);
+        chmod($scriptPath, 0755);
+        
+        // Run update in background
+        exec("sudo bash $scriptPath > /var/log/irongate-update.log 2>&1 &");
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Update started. The page will reload when complete.',
+            'log' => '/var/log/irongate-update.log'
+        ]);
+        break;
+    
+    case 'update_log':
+        $log = @file_get_contents('/var/log/irongate-update.log');
+        echo json_encode(['success' => true, 'data' => $log ?: 'No update log available']);
+        break;
+    
     default:
         echo json_encode(['error' => 'Unknown action', 'available' => [
             'system', 'status', 'settings', 'apply', 'leases', 
             'reservations', 'logs', 'restart', 'stop', 'start',
             'diagnostics', 'repair', 'validate',
             'irongate_status', 'irongate_settings', 'irongate_interfaces',
-            'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices'
+            'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices',
+            'update_check', 'update_settings', 'update_now', 'update_log'
         ]]);
 }
 
@@ -1340,6 +1476,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             <div class="nav-item" onclick="showPage('protection')">🛡️ Protection</div>
             <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
             <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
+            <div class="nav-item" onclick="showPage('updates')" style="border-top:1px solid var(--surface2);margin-top:10px;padding-top:15px;">⬆️ Updates</div>
         </div>
         <div class="main">
             <!-- Dashboard -->
@@ -1414,6 +1551,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     <button class="btn btn-primary" onclick="showPage('devices')">➕ Add Device</button>
                     <button class="btn btn-success" onclick="showPage('protection')" style="margin-left:10px;">🛡️ Protection Settings</button>
                     <button class="btn btn-secondary" onclick="showPage('dhcp')" style="margin-left:10px;">🔗 DHCP Settings</button>
+                    <button class="btn btn-secondary" onclick="loadDashboard()" style="margin-left:10px;">🔄 Refresh</button>
                 </div>
                 
                 <div id="dash-error" class="alert alert-danger" style="display:none;">
@@ -1523,7 +1661,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     </div>
                     <div class="form-row">
                         <div class="form-group"><label>Gateway (Router IP)</label><input class="form-control" id="set-gateway" placeholder="e.g., 192.168.1.1"></div>
-                        <div class="form-group"><label>Lease Time</label><input class="form-control" id="set-lease-time" placeholder="e.g., 24h"></div>
+                        <div class="form-group"><label>Lease Time</label><input class="form-control" id="set-lease-time" placeholder="24h"><div style="font-size:0.75em;color:var(--text-secondary);margin-top:3px;">Format: 30m, 24h, 7d, 1w, or infinite</div></div>
                     </div>
                     <div class="form-row">
                         <div class="form-group"><label>Primary DNS</label><input class="form-control" id="set-dns-primary" placeholder="8.8.8.8"></div>
@@ -1733,6 +1871,80 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     </div>
                 </div>
             </div>
+            
+            <!-- Updates Page -->
+            <div class="page" id="page-updates">
+                <h2 style="margin-bottom:20px;">⬆️ Updates</h2>
+                
+                <!-- Current Version -->
+                <div class="card">
+                    <div class="card-title">Current Installation</div>
+                    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);">
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-current-commit" style="font-family:monospace;">--</div>
+                            <div class="stat-label">Installed Commit</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-remote-commit" style="font-family:monospace;">--</div>
+                            <div class="stat-label">Latest Commit</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-last-check">--</div>
+                            <div class="stat-label">Last Checked</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Update Status -->
+                <div id="update-status-card" class="card" style="display:none;">
+                    <div id="update-status-content"></div>
+                </div>
+                
+                <!-- Latest Commit Info -->
+                <div class="card" id="commit-info-card" style="display:none;">
+                    <div class="card-title">📝 Latest Commit</div>
+                    <div id="commit-info-content" style="background:var(--bg);padding:15px;border-radius:8px;"></div>
+                </div>
+                
+                <!-- Auto-Update Setting -->
+                <div class="card">
+                    <div class="card-title">Auto-Update</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="auto-update-toggle" onclick="toggleAutoUpdate()"></div>
+                            <span id="auto-update-status-text">Disabled</span>
+                        </div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, Irongate will automatically check for and install updates daily at 4:00 AM.
+                    </p>
+                </div>
+                
+                <!-- Manual Update Actions -->
+                <div class="card">
+                    <div class="card-title">Manual Update</div>
+                    <button class="btn btn-primary" onclick="checkForUpdates()">🔍 Check for Updates</button>
+                    <button class="btn btn-success" id="btn-update-now" onclick="performUpdate()" style="margin-left:10px;display:none;">⬆️ Update Now</button>
+                    <button class="btn btn-secondary" onclick="viewUpdateLog()" style="margin-left:10px;">📜 View Update Log</button>
+                </div>
+                
+                <!-- Update Log -->
+                <div class="card" id="update-log-card" style="display:none;">
+                    <div class="card-title">📜 Update Log</div>
+                    <div id="update-log-content" style="background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;max-height:400px;overflow-y:auto;white-space:pre-wrap;"></div>
+                </div>
+                
+                <!-- GitHub Info -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(88,166,255,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#58a6ff;">GitHub Repository</div>
+                    <p style="color:var(--text-secondary);">
+                        Irongate is open source. View the source code, report issues, or contribute:
+                    </p>
+                    <a href="https://github.com/beatboxes/irongate" target="_blank" style="color:#58a6ff;text-decoration:none;">
+                        🔗 https://github.com/beatboxes/irongate
+                    </a>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -1810,15 +2022,18 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
             document.getElementById('page-'+page).classList.add('active');
-            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','logs','diagnostics'];
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','logs','diagnostics','updates'];
             const idx = pages.indexOf(page);
             if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
+            if(page==='dashboard')loadDashboard();
             if(page==='leases')loadLeases();
             if(page==='reservations')loadReservations();
             if(page==='logs')loadLogs();
             if(page==='diagnostics')runDiagnostics();
             if(page==='devices')loadIrongateDevices();
             if(page==='protection')loadIrongateStatus();
+            if(page==='dhcp')loadSettings();
+            if(page==='updates')loadUpdateStatus();
         }
         
         function toast(msg,type='success'){
@@ -2343,18 +2558,18 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                                   dev.zone === 'servers' ? '#ffc107' : '#00bf63';
                 const zoneIcon = dev.zone === 'isolated' ? '🔴' : 
                                  dev.zone === 'servers' ? '🟡' : '🟢';
-                return \`
+                return `
                     <tr>
-                        <td><span style="color:\${zoneColor};">\${zoneIcon} \${dev.zone}</span></td>
-                        <td><code>\${dev.mac}</code></td>
-                        <td>\${dev.ip || '<span style="color:var(--text-secondary);">DHCP</span>'}</td>
-                        <td>\${dev.hostname || '-'}</td>
+                        <td><span style="color:${zoneColor};">${zoneIcon} ${dev.zone}</span></td>
+                        <td><code>${dev.mac}</code></td>
+                        <td>${dev.ip || '<span style="color:var(--text-secondary);">DHCP</span>'}</td>
+                        <td>${dev.hostname || '-'}</td>
                         <td>
-                            <button class="btn btn-sm btn-secondary" onclick="editDevice(\${dev.id})">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteDevice(\${dev.id})" style="margin-left:5px;">Delete</button>
+                            <button class="btn btn-sm btn-secondary" onclick="editDevice(${dev.id})">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteDevice(${dev.id})" style="margin-left:5px;">Delete</button>
                         </td>
                     </tr>
-                \`;
+                `;
             }).join('');
         }
         
@@ -2453,13 +2668,13 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 }
                 
                 const container = document.getElementById('import-leases-list');
-                container.innerHTML = available.map(lease => \`
+                container.innerHTML = available.map(lease => `
                     <label style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--bg);border-radius:6px;margin-bottom:8px;cursor:pointer;">
-                        <input type="checkbox" class="import-check" data-mac="\${lease.mac}" data-ip="\${lease.ip}" data-hostname="\${lease.hostname}">
+                        <input type="checkbox" class="import-check" data-mac="${lease.mac}" data-ip="${lease.ip}" data-hostname="${lease.hostname}">
                         <div style="flex:1;">
-                            <div><strong>\${lease.hostname || 'Unknown'}</strong></div>
+                            <div><strong>${lease.hostname || 'Unknown'}</strong></div>
                             <div style="font-size:0.85em;color:var(--text-secondary);">
-                                <code>\${lease.mac}</code> → \${lease.ip}
+                                <code>${lease.mac}</code> → ${lease.ip}
                             </div>
                         </div>
                         <select class="form-control import-zone" style="width:150px;font-size:0.85em;">
@@ -2468,7 +2683,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             <option value="trusted">🟢 trusted</option>
                         </select>
                     </label>
-                \`).join('');
+                `).join('');
                 
                 document.getElementById('import-modal').classList.add('active');
             } catch (e) {
@@ -2509,7 +2724,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             }
             
             hideImportModal();
-            toast(\`Imported \${added} device(s)\`, 'success');
+            toast(`Imported ${added} device(s)`, 'success');
             await loadIrongateDevices();
         }
         
@@ -2519,6 +2734,249 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             await origLoadIrongateStatus();
             await loadIrongateDevices();
         };
+        
+        //======================================================================
+        // DASHBOARD LOADING
+        //======================================================================
+        
+        async function loadDashboard() {
+            try {
+                // Load system info
+                const sysRes = await api('system');
+                if (sysRes.success) {
+                    systemInfo = sysRes.data;
+                    document.getElementById('sys-hostname').value = sysRes.data.hostname || '';
+                    document.getElementById('sys-ip').value = sysRes.data.ip || '';
+                    document.getElementById('sys-interface').value = sysRes.data.interface || '';
+                    document.getElementById('sys-gateway').value = sysRes.data.gateway || '';
+                }
+                
+                // Load settings for DHCP status
+                const setRes = await api('settings');
+                if (setRes.success && setRes.data) {
+                    const dhcpEnabled = setRes.data.dhcp_enabled === 'true';
+                    document.getElementById('dash-dhcp-status').textContent = dhcpEnabled ? 'Enabled' : 'Disabled';
+                    const start = setRes.data.range_start;
+                    const end = setRes.data.range_end;
+                    document.getElementById('dash-pool-range').textContent = (start && end) ? `${start} - ${end}` : 'Not configured';
+                }
+                
+                // Load leases count
+                const leaseRes = await api('leases');
+                if (leaseRes.success) {
+                    document.getElementById('dash-leases').textContent = leaseRes.data ? leaseRes.data.length : '0';
+                }
+                
+                // Load reservations count
+                const resRes = await api('reservations');
+                if (resRes.success) {
+                    document.getElementById('dash-reservations').textContent = resRes.data ? resRes.data.length : '0';
+                }
+                
+                // Load Irongate status
+                const igRes = await api('irongate_status');
+                if (igRes.success) {
+                    const enabled = igRes.data.enabled;
+                    document.getElementById('dash-protection').textContent = enabled ? 'ON' : 'OFF';
+                    document.getElementById('dash-protection').style.color = enabled ? 'var(--success)' : 'var(--danger)';
+                    
+                    // Update protection banner
+                    const banner = document.getElementById('protection-banner');
+                    if (enabled) {
+                        banner.className = 'alert alert-success';
+                        banner.innerHTML = '<span>✓</span><span>Protection is <strong>enabled</strong>.</span>';
+                    } else {
+                        banner.className = 'alert alert-warning';
+                        banner.innerHTML = '<span>⚠️</span><span>Protection is <strong>disabled</strong>. Go to Protection settings to enable.</span>';
+                    }
+                }
+                
+                // Load devices and count by zone
+                const devRes = await api('irongate_devices');
+                if (devRes.success && devRes.data) {
+                    const devices = devRes.data;
+                    document.getElementById('dash-devices').textContent = devices.length;
+                    
+                    // Count by zone
+                    let isolated = 0, servers = 0, trusted = 0;
+                    devices.forEach(d => {
+                        if (d.zone === 'isolated') isolated++;
+                        else if (d.zone === 'servers') servers++;
+                        else if (d.zone === 'trusted') trusted++;
+                    });
+                    document.getElementById('dash-isolated').textContent = isolated;
+                    document.getElementById('dash-servers').textContent = servers;
+                    document.getElementById('dash-trusted').textContent = trusted;
+                }
+                
+            } catch (e) {
+                console.error('Dashboard load error:', e);
+            }
+        }
+        
+        //======================================================================
+        // UPDATE FUNCTIONS
+        //======================================================================
+        
+        async function loadUpdateStatus() {
+            try {
+                // Load update settings
+                const settingsRes = await api('update_settings');
+                if (settingsRes.success && settingsRes.data) {
+                    document.getElementById('update-current-commit').textContent = settingsRes.data.installed_commit || 'unknown';
+                    document.getElementById('update-last-check').textContent = settingsRes.data.last_update_check || 'Never';
+                    
+                    const autoEnabled = settingsRes.data.auto_update_enabled;
+                    const toggle = document.getElementById('auto-update-toggle');
+                    toggle.classList.toggle('active', autoEnabled);
+                    document.getElementById('auto-update-status-text').textContent = autoEnabled ? 'Enabled' : 'Disabled';
+                }
+                
+                // Check for updates
+                await checkForUpdates(true);
+            } catch (e) {
+                console.error('Load update status error:', e);
+            }
+        }
+        
+        async function checkForUpdates(silent = false) {
+            try {
+                if (!silent) {
+                    document.getElementById('update-status-card').style.display = 'block';
+                    document.getElementById('update-status-content').innerHTML = '<span style="color:var(--warning);">🔍 Checking for updates...</span>';
+                }
+                
+                const res = await api('update_check');
+                
+                if (res.success) {
+                    document.getElementById('update-current-commit').textContent = res.current_commit;
+                    document.getElementById('update-remote-commit').textContent = res.remote_commit;
+                    document.getElementById('update-last-check').textContent = res.last_check;
+                    
+                    const statusCard = document.getElementById('update-status-card');
+                    const statusContent = document.getElementById('update-status-content');
+                    const updateBtn = document.getElementById('btn-update-now');
+                    
+                    // Show commit info
+                    if (res.commit_message) {
+                        document.getElementById('commit-info-card').style.display = 'block';
+                        const commitDate = res.commit_date ? new Date(res.commit_date).toLocaleString() : '';
+                        document.getElementById('commit-info-content').innerHTML = `
+                            <div style="margin-bottom:10px;"><strong style="font-family:monospace;color:var(--primary);">${res.remote_commit}</strong> <span style="color:var(--text-secondary);font-size:0.85em;">${commitDate}</span></div>
+                            <div style="font-size:0.9em;">${res.commit_message.replace(/\n/g, '<br>')}</div>
+                        `;
+                    }
+                    
+                    if (res.update_available) {
+                        statusCard.style.display = 'block';
+                        statusContent.innerHTML = `
+                            <div style="color:var(--success);">
+                                <strong>✓ Update Available!</strong><br>
+                                <span style="font-size:0.9em;">Commit <code>${res.remote_commit}</code> is available (you have <code>${res.current_commit}</code>)</span>
+                            </div>
+                        `;
+                        updateBtn.style.display = 'inline-block';
+                    } else {
+                        statusCard.style.display = 'block';
+                        statusContent.innerHTML = '<span style="color:var(--success);">✓ You are running the latest commit</span>';
+                        updateBtn.style.display = 'none';
+                    }
+                    
+                    if (!silent) {
+                        toast('Update check complete', 'success');
+                    }
+                } else {
+                    if (!silent) {
+                        document.getElementById('update-status-card').style.display = 'block';
+                        document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ ${res.error || 'Failed to check for updates'}</span>`;
+                        toast('Update check failed', 'error');
+                    }
+                }
+            } catch (e) {
+                if (!silent) {
+                    toast('Error checking for updates: ' + e.message, 'error');
+                }
+            }
+        }
+        
+        async function toggleAutoUpdate() {
+            const toggle = document.getElementById('auto-update-toggle');
+            const newState = !toggle.classList.contains('active');
+            
+            try {
+                const res = await api('update_settings', {
+                    method: 'POST',
+                    body: { auto_update_enabled: newState }
+                });
+                
+                if (res.success) {
+                    toggle.classList.toggle('active', newState);
+                    document.getElementById('auto-update-status-text').textContent = newState ? 'Enabled' : 'Disabled';
+                    toast('Auto-update ' + (newState ? 'enabled' : 'disabled'), 'success');
+                } else {
+                    toast('Failed to update setting', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function performUpdate() {
+            if (!confirm('This will update Irongate to the latest version. The page will reload when complete. Continue?')) {
+                return;
+            }
+            
+            try {
+                document.getElementById('update-status-card').style.display = 'block';
+                document.getElementById('update-status-content').innerHTML = `
+                    <div style="color:var(--warning);">
+                        <strong>⬆️ Updating...</strong><br>
+                        <span style="font-size:0.9em;">Please wait, this may take a minute...</span>
+                    </div>
+                `;
+                document.getElementById('btn-update-now').disabled = true;
+                
+                const res = await api('update_now');
+                
+                if (res.success) {
+                    document.getElementById('update-status-content').innerHTML = `
+                        <div style="color:var(--success);">
+                            <strong>✓ Update started!</strong><br>
+                            <span style="font-size:0.9em;">The page will reload in 30 seconds...</span>
+                        </div>
+                    `;
+                    
+                    // Poll for completion and reload
+                    setTimeout(() => {
+                        location.reload();
+                    }, 30000);
+                } else {
+                    document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ ${res.error || 'Update failed'}</span>`;
+                    document.getElementById('btn-update-now').disabled = false;
+                    toast('Update failed', 'error');
+                }
+            } catch (e) {
+                document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ Error: ${e.message}</span>`;
+                document.getElementById('btn-update-now').disabled = false;
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function viewUpdateLog() {
+            try {
+                const res = await api('update_log');
+                
+                document.getElementById('update-log-card').style.display = 'block';
+                document.getElementById('update-log-content').textContent = res.data || 'No update log available';
+            } catch (e) {
+                toast('Error loading log: ' + e.message, 'error');
+            }
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+        });
     </script>
 </body>
 </html>
@@ -2560,6 +3018,10 @@ www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload dnsmasq
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart irongate
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl start irongate
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop irongate
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl enable irongate-updater.timer
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl disable irongate-updater.timer
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl start irongate-updater.timer
+www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop irongate-updater.timer
 www-data ALL=(ALL) NOPASSWD: /usr/bin/pkill -9 dnsmasq
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chown dnsmasq\:nogroup /var/lib/dnsmasq/dnsmasq.leases
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /var/lib/dnsmasq/dnsmasq.leases
@@ -2568,6 +3030,7 @@ www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u dnsmasq *
 www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u irongate *
 www-data ALL=(ALL) NOPASSWD: /usr/bin/tail *
 www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
+www-data ALL=(ALL) NOPASSWD: /bin/bash /tmp/irongate-update.sh
 EOF
 chmod 440 /etc/sudoers.d/dnsmasq-web
 
@@ -3072,6 +3535,119 @@ systemctl enable irongate 2>/dev/null || true
 echo -e "${GREEN}Irongate service installed${NC}"
 
 #######################################
+# Create Auto-Updater Service & Timer
+#######################################
+echo -e "${YELLOW}Creating auto-updater service...${NC}"
+
+# Create updater script
+cat > /opt/irongate/irongate-updater.sh << 'UPDATER'
+#!/bin/bash
+# Irongate Auto-Updater (commit hash based)
+
+GITHUB_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
+REPO_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
+DB_PATH="/var/www/irongate/dhcp.db"
+LOG_FILE="/var/log/irongate-update.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Check if auto-update is enabled
+AUTO_UPDATE=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='auto_update_enabled';" 2>/dev/null)
+if [ "$AUTO_UPDATE" != "true" ]; then
+    log "Auto-update is disabled, skipping"
+    exit 0
+fi
+
+log "Starting update check..."
+
+# Get current commit from database
+CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null || echo "unknown")
+
+# Get latest commit from GitHub API
+REMOTE_COMMIT=$(curl -sf -H "User-Agent: Irongate-Updater" "$GITHUB_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
+
+if [ -z "$REMOTE_COMMIT" ]; then
+    log "ERROR: Could not fetch remote commit from GitHub API"
+    exit 1
+fi
+
+log "Current: $CURRENT_COMMIT, Remote: $REMOTE_COMMIT"
+
+# Update last check time
+sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
+
+# Compare commits
+if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; then
+    log "Update available! Downloading..."
+    
+    # Download and run installer
+    SCRIPT_PATH="/tmp/irongate-update.sh"
+    curl -sf "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
+    
+    if [ -f "$SCRIPT_PATH" ]; then
+        chmod +x "$SCRIPT_PATH"
+        log "Running installer..."
+        bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
+        log "Update complete!"
+    else
+        log "ERROR: Failed to download update script"
+        exit 1
+    fi
+else
+    log "Already up to date"
+fi
+
+log "Update check finished"
+UPDATER
+
+chmod +x /opt/irongate/irongate-updater.sh
+
+# Create systemd service for manual updates
+cat > /etc/systemd/system/irongate-updater.service << EOF
+[Unit]
+Description=Irongate Auto-Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/irongate/irongate-updater.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create systemd timer for daily auto-updates
+cat > /etc/systemd/system/irongate-updater.timer << EOF
+[Unit]
+Description=Irongate Daily Update Check
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=1800
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+
+# Check if auto-update should be enabled from database
+AUTO_UPDATE_ENABLED=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='auto_update_enabled';" 2>/dev/null)
+if [ "$AUTO_UPDATE_ENABLED" = "true" ]; then
+    systemctl enable irongate-updater.timer 2>/dev/null || true
+    systemctl start irongate-updater.timer 2>/dev/null || true
+    echo -e "${GREEN}Auto-updater enabled${NC}"
+else
+    echo -e "${YELLOW}Auto-updater available (disabled by default)${NC}"
+fi
+
+#######################################
 # Configure Nginx
 #######################################
 echo -e "${YELLOW}Configuring Nginx...${NC}"
@@ -3168,10 +3744,13 @@ echo -e "${MAGENTA}╔═══════════════════�
 echo -e "║     🛡️  IRONGATE Setup Complete!             ║"
 echo -e "╚══════════════════════════════════════════════╝${NC}"
 echo ""
+echo -e "  Commit: ${BOLD}${IRONGATE_COMMIT}${NC}"
+echo ""
 echo -e "Services:"
 echo -e "  DHCP Server:  $(systemctl is-active dnsmasq)"
 echo -e "  Web Server:   $(systemctl is-active nginx)"
 echo -e "  Protection:   $(systemctl is-active irongate 2>/dev/null || echo 'disabled (enable in UI)')"
+echo -e "  Auto-Update:  $(systemctl is-active irongate-updater.timer 2>/dev/null || echo 'disabled')"
 echo ""
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}  Access Irongate at:${NC}"
@@ -3187,6 +3766,7 @@ echo -e "  ${GREEN}🔗 DHCP${NC}         - Configure DHCP server settings"
 echo -e "  ${GREEN}📋 Leases${NC}       - View active DHCP leases"
 echo -e "  ${GREEN}📌 Reservations${NC} - Static IP reservations"
 echo -e "  ${GREEN}🛡️ Protection${NC}   - Enable/configure network isolation"
+echo -e "  ${GREEN}⬆️ Updates${NC}      - Check for updates, enable auto-update"
 echo ""
 echo -e "${CYAN}ZONES:${NC}"
 echo -e "  ${RED}🔴 isolated${NC}  - Internet only, no LAN access"
@@ -3201,5 +3781,6 @@ echo -e "  4. Go to 🛡️ Protection and enable"
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}  SAFE TO RE-RUN: Preserves all settings & data${NC}"
+echo -e "${GREEN}  GitHub: ${IRONGATE_REPO}${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
