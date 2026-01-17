@@ -2,7 +2,7 @@
 
 **Enterprise-Grade Multi-Layer Network Isolation System**
 
-Irongate is a sophisticated network security tool that enforces strict device separation on standard network infrastructure—without requiring managed switches or VLANs. It implements seven layers of defense-in-depth isolation to prevent unauthorized device communication on your network.
+Irongate is a sophisticated network security tool that enforces strict device separation on standard network infrastructure—without requiring managed switches or VLANs. It implements eight layers of defense-in-depth isolation to prevent unauthorized device communication on your network.
 
 ## Overview
 
@@ -10,7 +10,7 @@ Many organizations need to isolate critical devices (servers, medical equipment,
 
 ### Key Features
 
-- **7 Layers of Protection** - Defense-in-depth approach ensures isolation even if one layer is bypassed
+- **8 Layers of Protection** - Defense-in-depth approach ensures isolation even if one layer is bypassed
 - **No Special Hardware Required** - Works on standard unmanaged network infrastructure
 - **Two Isolation Modes** - Single-NIC (software-based) or Dual-NIC (hardware-enforced) isolation
 - **Web-Based Management** - Modern HTTPS dashboard for real-time monitoring and device management
@@ -19,7 +19,7 @@ Many organizations need to isolate critical devices (servers, medical equipment,
 
 ## How It Works
 
-Irongate implements seven complementary layers of network isolation:
+Irongate implements eight complementary layers of network isolation:
 
 ### Layer 1: DHCP Microsegmentation
 - Assigns /30 subnets to isolated devices, forcing all traffic through Irongate
@@ -62,6 +62,16 @@ Irongate implements seven complementary layers of network isolation:
 - Immediately counters with spoofed replies to maintain isolation
 - Prevents Layer 2 bypass attempts by untrusted devices
 - Selective enforcement: allows trusted devices, gateway, and servers to communicate normally
+
+### Layer 8: Algorand Blockchain Verification (Optional)
+- Provides 100% VLAN-equivalent protection via cryptographic device authentication
+- Stores authorized devices in an immutable on-chain registry on Algorand blockchain
+- Verifies device identity via cryptographic signatures before allowing access
+- Devices must be registered on-chain to access protected resources
+- Integrates with Layers 1-7 for defense-in-depth (falls back to standard protection if blockchain unavailable)
+- Configurable caching for performance optimization
+- Optional audit logging for compliance and security forensics
+- Requires deploying a smart contract and configuring the app_id in config
 
 ## System Requirements
 
@@ -127,6 +137,26 @@ security:
 - 100% kernel-enforced isolation
 - Requires additional USB ethernet adapter
 
+### Layer 8 Blockchain (Optional)
+
+To enable Layer 8 Algorand blockchain verification for 100% VLAN-equivalent protection:
+
+1. Install the Algorand SDK: `pip install py-algorand-sdk`
+2. Deploy the smart contract: `python3 /opt/irongate/smart_contract.py`
+3. Configure blockchain in `/etc/irongate/irongate.yaml`:
+
+```yaml
+blockchain:
+  enabled: true
+  network: "mainnet"       # mainnet, testnet, or betanet
+  app_id: YOUR_APP_ID      # From smart contract deployment
+  cache_ttl: 60            # Cache duration in seconds
+  fallback_allow: true     # Allow access if blockchain unavailable
+  audit_logging: false     # Enable for compliance logging
+```
+
+4. Register devices using the CLI: `irongate-blockchain register`
+
 ## Usage
 
 ### Starting/Stopping Services
@@ -181,6 +211,7 @@ tail -f /var/log/irongate/web.log
 │   ├── monitor.py          # Layer 5: Bypass Detection
 │   ├── gateway_takeover.py # Layer 6: Gateway Takeover
 │   ├── arp_interceptor.py  # Layer 7: ARP Reply Interception
+│   ├── blockchain.py       # Layer 8: Algorand Blockchain (optional)
 │   └── bridge_manager.py   # Dual-NIC bridge management
 ├── templates/              # Flask HTML templates
 └── static/                 # CSS/JS assets
@@ -202,6 +233,7 @@ tail -f /var/log/irongate/web.log
 | gunicorn | 21.2.0 | WSGI server |
 | pyroute2 | 0.7.9 | Network interface management |
 | cryptography | 41.0.0 | TLS/SSL handling |
+| py-algorand-sdk | - | Layer 8 blockchain (optional) |
 
 ## Security Considerations
 
@@ -233,8 +265,9 @@ tail -f /var/log/irongate/web.log
 
 **Isolation not working**
 - Review security logs: `tail -f /var/log/irongate/security.log`
-- Verify all 7 layers are enabled in configuration
+- Verify all layers are enabled in configuration
 - Consider switching to Dual-NIC mode for complete isolation
+- Enable Layer 8 blockchain verification for 100% VLAN-equivalent protection
 
 ## License
 
