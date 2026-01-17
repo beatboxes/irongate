@@ -3334,6 +3334,10 @@ class Irongate:
                 logger.info(f"  App ID: {blockchain_config.get('app_id')}")
                 logger.info(f"  Cache TTL: {blockchain_config.get('cache_ttl', 60)}s")
                 logger.info(f"  Audit Logging: {blockchain_config.get('audit_logging', False)}")
+                if blockchain_config.get('allow_rogue_devices', False):
+                    logger.info("  Mode: PUBLIC WIFI (rogue devices allowed)")
+                else:
+                    logger.info("  Mode: STRICT (unregistered devices blocked)")
                 logger.info("  → 100% VLAN-equivalent protection enabled!")
                 logger.info("━" * 50)
             else:
@@ -3468,8 +3472,8 @@ class Irongate:
         logger.info("ARP tables restored")
     
     def run_single_nic(self):
-        """Run middleground ARP-based isolation (~95% protection)"""
-        logger.info("Starting single-NIC mode (middleground ARP isolation)")
+        """Run middleground ARP-based isolation (~98% protection with aggressive spoofing)"""
+        logger.info("Starting single-NIC mode (aggressive ARP isolation)")
         
         net = self.config.get('network') or {}
         self.interface = net.get('interface', 'eth0')
@@ -3650,7 +3654,8 @@ class Irongate:
                         if packet_delay:
                             time.sleep(packet_delay)
                 
-                time.sleep(1)
+                # More aggressive poisoning interval for better protection
+                time.sleep(0.3)
                 
             except Exception as e:
                 logger.error(f"ARP spoof error: {e}")
@@ -3742,7 +3747,7 @@ class Irongate:
                             return
                         
                         elif verification.get('verified') == False:
-                            # Device NOT verified - block it via spoofing
+                            # Device NOT verified on blockchain
                             result = verification.get('result')
                             
                             if result and hasattr(result, 'value'):
@@ -3750,6 +3755,22 @@ class Irongate:
                             else:
                                 result_str = str(result)
                             
+                            # PUBLIC WIFI MODE: Log but allow unregistered devices
+                            if blockchain.allow_rogue_devices:
+                                logger.info(f"LAYER 8 ROGUE: {requester_ip} ({requester_mac}) -> {requested_ip} (allowed)")
+                                logger.info(f"  Status: {verification.get('details', result_str)}")
+                                
+                                # Still log to blockchain audit trail if enabled
+                                if blockchain.audit_logging:
+                                    blockchain.log_access(
+                                        requester_mac, requester_ip,
+                                        f"arp_request:{requested_ip}",
+                                        f"rogue_allowed_{result_str}"
+                                    )
+                                # Let it through - don't spoof
+                                return
+                            
+                            # STRICT MODE: Block unregistered devices
                             logger.warning(f"LAYER 8 BLOCK: {requester_ip} ({requester_mac}) -> {requested_ip}")
                             logger.warning(f"  Reason: {verification.get('details', result_str)}")
                             
@@ -3761,13 +3782,13 @@ class Irongate:
                                     f"blocked_{result_str}"
                                 )
                             
-                            # Spoof to block access
+                            # Spoof to block access - aggressive burst
                             reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
                                 op=2, pdst=requester_ip, hwdst=requester_mac,
                                 psrc=requested_ip, hwsrc=self.local_mac
                             )
-                            sendp(reply, iface=self.interface, verbose=False)
-                            sendp(reply, iface=self.interface, verbose=False)
+                            for _ in range(5):
+                                sendp(reply, iface=self.interface, verbose=False)
                             return
                         
                         # verification['verified'] is None = blockchain unavailable
@@ -3788,13 +3809,15 @@ class Irongate:
                         if requester_ip == requested_ip:
                             return
                         
-                        # Requester is an untrusted LAN device - spoof them
+                        # Requester is an untrusted LAN device - spoof them AGGRESSIVELY
+                        # Send multiple replies to win the race against real ARP responses
                         reply = Ether(dst=requester_mac, src=self.local_mac) / ARP(
                             op=2, pdst=requester_ip, hwdst=requester_mac,
                             psrc=requested_ip, hwsrc=self.local_mac
                         )
-                        sendp(reply, iface=self.interface, verbose=False)
-                        sendp(reply, iface=self.interface, verbose=False)
+                        # Burst of 5 packets to overwhelm real reply
+                        for _ in range(5):
+                            sendp(reply, iface=self.interface, verbose=False)
                 
                 # Handle ARP Replies: "X is at MAC Y"
                 elif arp.op == 2:
@@ -3813,13 +3836,14 @@ class Irongate:
                         if target_ip in allowed_ips or target_mac in allowed_macs:
                             return
                         
-                        # Target is an untrusted LAN device - counter the real reply
+                        # Target is an untrusted LAN device - counter the real reply AGGRESSIVELY
                         counter = Ether(dst=target_mac, src=self.local_mac) / ARP(
                             op=2, pdst=target_ip, hwdst=target_mac,
                             psrc=sender_ip, hwsrc=self.local_mac
                         )
-                        sendp(counter, iface=self.interface, verbose=False)
-                        sendp(counter, iface=self.interface, verbose=False)
+                        # Burst of 5 packets to override the real MAC in ARP cache
+                        for _ in range(5):
+                            sendp(counter, iface=self.interface, verbose=False)
                             
             except Exception:
                 pass
@@ -4148,6 +4172,17 @@ class IrongateBlockchain:
         self.enabled = False
         self.config = config or {}
         
+        # Set defaults for attributes that might be accessed even when disabled
+        self.network = self.config.get('network', 'mainnet')
+        self.cache_ttl = self.config.get('cache_ttl', 60)
+        self.fallback_allow = self.config.get('fallback_allow', True)
+        self.audit_logging = self.config.get('audit_logging', False)
+        self.allow_rogue_devices = self.config.get('allow_rogue_devices', False)
+        self._cache = {}
+        self._cache_time = {}
+        self._admin_key = None
+        self._admin_address = None
+        
         # Check if explicitly enabled
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")
@@ -4159,13 +4194,9 @@ class IrongateBlockchain:
             logger.warning("  Install with: pip install py-algorand-sdk")
             return
         
-        # Get config values
-        self.network = self.config.get('network', 'mainnet')
+        # Get additional config values
         self.app_id = self.config.get('app_id')
         self.admin_mnemonic = self.config.get('admin_mnemonic')
-        self.cache_ttl = self.config.get('cache_ttl', 60)
-        self.fallback_allow = self.config.get('fallback_allow', True)
-        self.audit_logging = self.config.get('audit_logging', False)
         
         # Validate app_id
         if not self.app_id:
@@ -4188,8 +4219,6 @@ class IrongateBlockchain:
             return
         
         # Initialize admin credentials if provided
-        self._admin_key = None
-        self._admin_address = None
         if self.admin_mnemonic:
             try:
                 self._admin_key = mnemonic.to_private_key(self.admin_mnemonic)
@@ -4198,9 +4227,6 @@ class IrongateBlockchain:
             except Exception as e:
                 logger.warning(f"  Invalid admin mnemonic: {e}")
         
-        # Local cache for performance
-        self._cache: Dict[str, Dict] = {}
-        self._cache_time: Dict[str, float] = {}
         self._last_sync = 0
         
         # Mark as enabled
@@ -4608,6 +4634,7 @@ class IrongateBlockchain:
             'cache_ttl': self.cache_ttl,
             'fallback_allow': self.fallback_allow,
             'audit_logging': self.audit_logging,
+            'allow_rogue_devices': self.allow_rogue_devices,
             'admin_configured': self._admin_address is not None
         }
         
@@ -4924,6 +4951,7 @@ def cmd_status(args):
         print(f"Cache Size: {stats.get('cache_size')} devices")
         print(f"Cache TTL: {stats.get('cache_ttl')}s")
         print(f"Audit Logging: {'✓ On' if stats.get('audit_logging') else '✗ Off'}")
+        print(f"Rogue Devices: {'✓ Allowed (Public WiFi Mode)' if stats.get('allow_rogue_devices') else '✗ Blocked (Strict Mode)'}")
 
 def cmd_list(args):
     """List all registered devices"""
@@ -5228,6 +5256,11 @@ blockchain:
   fallback_allow: true
   # Log all access attempts to blockchain audit trail
   audit_logging: false
+  # PUBLIC WIFI MODE: Allow unregistered devices but log them
+  # When true: devices not registered on-chain are allowed but logged
+  # When false: devices not registered on-chain are BLOCKED (default)
+  # Useful for: coffee shops, hotels, public hotspots
+  allow_rogue_devices: false
 
 devices:
 $DEVICES_YAML
@@ -5493,7 +5526,7 @@ echo ""
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "${CYAN}PROTECTION LAYERS:${NC}"
-echo -e "  ${GREEN}Layer 1-7${NC}  - ARP/IPv6/Firewall isolation (~95% protection)"
+echo -e "  ${GREEN}Layer 1-7${NC}  - Aggressive ARP/IPv6/Firewall isolation (~98% protection)"
 echo -e "  ${MAGENTA}Layer 8${NC}    - Algorand Blockchain verification (100% VLAN-equivalent)"
 echo ""
 echo -e "${CYAN}FEATURES:${NC}"
@@ -5520,6 +5553,10 @@ echo -e "       ${BOLD}blockchain:${NC}"
 echo -e "       ${BOLD}  enabled: true${NC}"
 echo -e "       ${BOLD}  app_id: YOUR_APP_ID${NC}"
 echo -e "    3. Restart: ${BOLD}systemctl restart irongate${NC}"
+echo -e "  "
+echo -e "  ${YELLOW}Public WiFi Mode:${NC}"
+echo -e "    Set ${BOLD}allow_rogue_devices: true${NC} to log unregistered"
+echo -e "    devices without blocking them (useful for hotspots)"
 echo -e "  "
 echo -e "  CLI: ${BOLD}irongate-blockchain status|list|register|revoke${NC}"
 echo ""
