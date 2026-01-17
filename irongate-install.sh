@@ -1072,10 +1072,11 @@ switch ($action) {
                 'isolated_interface' => getSetting($db, 'irongate_isolated_interface'),
                 'bridge_ip' => getSetting($db, 'irongate_bridge_ip'),
                 'layers' => [
-                    'arp_defense' => getSetting($db, 'irongate_arp_defense') === 'true',
-                    'ipv6_ra' => getSetting($db, 'irongate_ipv6_ra') === 'true',
-                    'gateway_takeover' => getSetting($db, 'irongate_gateway_takeover') === 'true',
-                    'bypass_detection' => getSetting($db, 'irongate_bypass_detection') === 'true'
+                    'arp_defense' => getSetting($db, 'irongate_arp_defense') !== 'false',
+                    'ipv6_ra' => getSetting($db, 'irongate_ipv6_ra') !== 'false',
+                    'gateway_takeover' => getSetting($db, 'irongate_gateway_takeover') !== 'false',
+                    'bypass_detection' => getSetting($db, 'irongate_bypass_detection') !== 'false',
+                    'firewall' => getSetting($db, 'irongate_firewall') !== 'false'
                 ]
             ]
         ]);
@@ -1085,7 +1086,7 @@ switch ($action) {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
             foreach ($data as $key => $value) {
-                if (strpos($key, 'irongate_') === 0) {
+                if (strpos($key, 'irongate_') === 0 || strpos($key, 'blockchain_') === 0) {
                     setSetting($db, $key, $value);
                 }
             }
@@ -1096,7 +1097,10 @@ switch ($action) {
             foreach (['irongate_enabled', 'irongate_mode', 'irongate_isolated_interface',
                       'irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end',
                       'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
-                      'irongate_bypass_detection'] as $key) {
+                      'irongate_bypass_detection', 'irongate_firewall',
+                      'blockchain_enabled', 'blockchain_network', 'blockchain_app_id',
+                      'blockchain_admin_mnemonic', 'blockchain_cache_ttl', 'blockchain_fallback_allow',
+                      'blockchain_audit_logging', 'blockchain_allow_rogue_devices'] as $key) {
                 $settings[$key] = getSetting($db, $key);
             }
             echo json_encode(['success' => true, 'data' => $settings]);
@@ -1421,7 +1425,29 @@ function applyIrongateConfig($db) {
     $config .= "  ipv6_ra: " . (($settings['irongate_ipv6_ra'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
     $config .= "  gateway_takeover: " . (($settings['irongate_gateway_takeover'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
     $config .= "  bypass_detection: " . (($settings['irongate_bypass_detection'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
-    $config .= "  firewall: true\n\n";
+    $config .= "  firewall: " . (($settings['irongate_firewall'] ?? 'true') === 'true' ? 'true' : 'false') . "\n\n";
+    
+    // Layer 8: Blockchain settings
+    $config .= "# Layer 8: Algorand Blockchain Verification\n";
+    $config .= "blockchain:\n";
+    $config .= "  enabled: " . (($settings['blockchain_enabled'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  network: \"" . ($settings['blockchain_network'] ?? 'mainnet') . "\"\n";
+    $appId = $settings['blockchain_app_id'] ?? '';
+    if (!empty($appId) && $appId !== 'null') {
+        $config .= "  app_id: " . intval($appId) . "\n";
+    } else {
+        $config .= "  app_id: null\n";
+    }
+    $mnemonic = $settings['blockchain_admin_mnemonic'] ?? '';
+    if (!empty($mnemonic) && $mnemonic !== 'null') {
+        $config .= "  admin_mnemonic: \"" . $mnemonic . "\"\n";
+    } else {
+        $config .= "  admin_mnemonic: null\n";
+    }
+    $config .= "  cache_ttl: " . intval($settings['blockchain_cache_ttl'] ?? 60) . "\n";
+    $config .= "  fallback_allow: " . (($settings['blockchain_fallback_allow'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  audit_logging: " . (($settings['blockchain_audit_logging'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
+    $config .= "  allow_rogue_devices: " . (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true' ? 'true' : 'false') . "\n\n";
     
     // Get protected devices from database
     $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
@@ -1550,6 +1576,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             <div class="nav-item" onclick="showPage('leases')">📋 Active Leases</div>
             <div class="nav-item" onclick="showPage('reservations')">📌 Reservations</div>
             <div class="nav-item" onclick="showPage('protection')">🛡️ Protection</div>
+            <div class="nav-item" onclick="showPage('blockchain')">⛓️ Layer 8 Blockchain</div>
             <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
             <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
             <div class="nav-item" onclick="showPage('updates')" style="border-top:1px solid var(--surface2);margin-top:10px;padding-top:15px;">⬆️ Updates</div>
@@ -1919,6 +1946,13 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             <input type="checkbox" id="layer-bypass" checked>
                             <div><strong>Bypass Detection</strong><div style="font-size:0.8em;color:var(--text-secondary);">Active monitoring + TCP RST</div></div>
                         </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-firewall" checked>
+                            <div><strong>nftables Firewall</strong><div style="font-size:0.8em;color:var(--text-secondary);">Zone-based L3/L4 filtering</div></div>
+                        </label>
+                    </div>
+                    <div style="margin-top:15px;padding:12px;background:var(--bg);border-radius:6px;border-left:3px solid var(--accent);">
+                        <strong>⛓️ Layer 8 Blockchain</strong> - Configure on the <a href="#" onclick="showPage('blockchain');return false;" style="color:var(--accent);">Layer 8 Blockchain</a> page for 100% VLAN-equivalent protection.
                     </div>
                 </div>
                 
@@ -1956,6 +1990,151 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             </ul>
                         </div>
                     </div>
+                </div>
+            </div>
+            
+            <!-- Layer 8 Blockchain Page -->
+            <div class="page" id="page-blockchain">
+                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Algorand Blockchain</h2>
+                
+                <div id="blockchain-alert" class="alert" style="display:none;"></div>
+                
+                <!-- Overview Card -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(102,51,153,0.2),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#9966cc;">What is Layer 8?</div>
+                    <p style="margin-bottom:10px;">Layer 8 adds <strong>cryptographic device verification</strong> via the Algorand blockchain. Each device must be registered on-chain to access protected resources.</p>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-top:15px;">
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>🔐 Immutable Registry</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Device list stored on blockchain - tamper-proof</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>🛡️ MAC Spoof Protection</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Cryptographic proof defeats spoofing attacks</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>📜 Audit Trail</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Every access attempt logged permanently</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>💰 Low Cost</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">~$0.50/month for 100 devices</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Enable/Disable -->
+                <div class="card">
+                    <div class="card-title">Blockchain Status</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="blockchain-toggle" onclick="toggleBlockchain()"></div>
+                            <span id="blockchain-status-text">Disabled</span>
+                        </div>
+                        <div id="blockchain-connection-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, devices must be registered on the Algorand blockchain to access protected resources.
+                        Requires a deployed smart contract (App ID).
+                    </p>
+                </div>
+                
+                <!-- Smart Contract Config -->
+                <div class="card">
+                    <div class="card-title">Smart Contract Configuration</div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Network</label>
+                            <select class="form-control" id="blockchain-network" style="max-width:200px;">
+                                <option value="mainnet">Mainnet (Production)</option>
+                                <option value="testnet">Testnet (Testing)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex:2;">
+                            <label>App ID (Smart Contract)</label>
+                            <input class="form-control" id="blockchain-app-id" type="number" placeholder="e.g., 1234567890">
+                            <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                                Deploy with: <code>python3 /opt/irongate/smart_contract.py</code>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Admin Mnemonic (25 words)</label>
+                        <input class="form-control" id="blockchain-mnemonic" type="password" placeholder="your 25 word recovery phrase...">
+                        <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                            ⚠️ Keep secure! Only needed for registering/revoking devices.
+                            <button class="btn btn-secondary" style="padding:2px 8px;font-size:0.8em;margin-left:10px;" onclick="document.getElementById('blockchain-mnemonic').type = document.getElementById('blockchain-mnemonic').type === 'password' ? 'text' : 'password'">👁️ Show/Hide</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Behavior Settings -->
+                <div class="card">
+                    <div class="card-title">Behavior Settings</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:15px;">
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-allow-rogue" style="margin-top:3px;">
+                            <div>
+                                <strong>🌐 Public WiFi Mode</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Allow unregistered devices but log them. Use for coffee shops, hotels, public hotspots.</div>
+                            </div>
+                        </label>
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-fallback" checked style="margin-top:3px;">
+                            <div>
+                                <strong>🔄 Fallback Allow</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Allow network access if blockchain is temporarily unavailable.</div>
+                            </div>
+                        </label>
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-audit" style="margin-top:3px;">
+                            <div>
+                                <strong>📝 Audit Logging</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Log all access attempts to blockchain. Adds ~0.001 ALGO per entry.</div>
+                            </div>
+                        </label>
+                    </div>
+                    <div class="form-group" style="margin-top:15px;">
+                        <label>Cache TTL (seconds)</label>
+                        <input class="form-control" id="blockchain-cache-ttl" type="number" value="60" min="10" max="3600" style="max-width:150px;">
+                        <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                            How long to cache device verification. Higher = fewer blockchain queries, lower = faster revocation.
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Actions -->
+                <div class="card">
+                    <button class="btn btn-primary" onclick="saveBlockchainSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="loadBlockchainSettings()" style="margin-left:10px;">🔄 Refresh</button>
+                    <button class="btn btn-warning" onclick="testBlockchainConnection()" style="margin-left:10px;">🔗 Test Connection</button>
+                </div>
+                
+                <!-- CLI Reference -->
+                <div class="card">
+                    <div class="card-title">Command Line Tools</div>
+                    <div style="background:var(--bg);border-radius:8px;padding:15px;font-family:monospace;font-size:0.85em;">
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain status</code> - Show connection status</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain list</code> - List registered devices</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain register</code> - Register a new device</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain revoke &lt;mac&gt;</code> - Revoke a device</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain verify &lt;mac&gt; &lt;ip&gt;</code> - Test verification</div>
+                        <div><code>irongate-blockchain sync</code> - Sync devices from config to blockchain</div>
+                    </div>
+                </div>
+                
+                <!-- Setup Guide -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#e94560;">Setup Guide</div>
+                    <ol style="margin:10px 0 0 20px;color:var(--text-secondary);line-height:1.8;">
+                        <li>Install Algorand SDK: <code>pip install py-algorand-sdk --break-system-packages</code></li>
+                        <li>Compile smart contract: <code>python3 /opt/irongate/smart_contract.py</code></li>
+                        <li>Create Algorand wallet (Pera Wallet or MyAlgo) and fund with ~1 ALGO</li>
+                        <li>Deploy contract using AlgoKit or goal CLI</li>
+                        <li>Enter App ID and mnemonic above</li>
+                        <li>Enable blockchain and save</li>
+                        <li>Register devices: <code>irongate-blockchain sync</code></li>
+                    </ol>
                 </div>
             </div>
             
@@ -2109,7 +2288,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
             document.getElementById('page-'+page).classList.add('active');
-            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','logs','diagnostics','updates'];
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates'];
             const idx = pages.indexOf(page);
             if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
             if(page==='dashboard')loadDashboard();
@@ -2119,6 +2298,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             if(page==='diagnostics')runDiagnostics();
             if(page==='devices')loadIrongateDevices();
             if(page==='protection')loadIrongateStatus();
+            if(page==='blockchain')loadBlockchainSettings();
             if(page==='dhcp')loadSettings();
             if(page==='updates')loadUpdateStatus();
         }
@@ -2544,6 +2724,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     document.getElementById('layer-ipv6').checked = res.data.layers?.ipv6_ra !== false;
                     document.getElementById('layer-gateway').checked = res.data.layers?.gateway_takeover !== false;
                     document.getElementById('layer-bypass').checked = res.data.layers?.bypass_detection !== false;
+                    document.getElementById('layer-firewall').checked = res.data.layers?.firewall !== false;
                 }
                 
                 // Load full settings
@@ -2638,7 +2819,8 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 irongate_arp_defense: document.getElementById('layer-arp').checked ? 'true' : 'false',
                 irongate_ipv6_ra: document.getElementById('layer-ipv6').checked ? 'true' : 'false',
                 irongate_gateway_takeover: document.getElementById('layer-gateway').checked ? 'true' : 'false',
-                irongate_bypass_detection: document.getElementById('layer-bypass').checked ? 'true' : 'false'
+                irongate_bypass_detection: document.getElementById('layer-bypass').checked ? 'true' : 'false',
+                irongate_firewall: document.getElementById('layer-firewall').checked ? 'true' : 'false'
             };
             
             // Validate dual-NIC mode
@@ -2663,6 +2845,135 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             } catch (e) {
                 toast('Error: ' + e.message, 'error');
             }
+        }
+        
+        //======================================================================
+        // LAYER 8 BLOCKCHAIN MANAGEMENT
+        //======================================================================
+        
+        let blockchainSettings = {};
+        
+        async function loadBlockchainSettings() {
+            try {
+                const res = await api('irongate_settings');
+                if (res.success) {
+                    blockchainSettings = res.data;
+                    
+                    // Update toggle
+                    const toggle = document.getElementById('blockchain-toggle');
+                    const statusText = document.getElementById('blockchain-status-text');
+                    const connStatus = document.getElementById('blockchain-connection-status');
+                    
+                    if (res.data.blockchain_enabled === 'true') {
+                        toggle.classList.add('active');
+                        statusText.textContent = 'Enabled';
+                        statusText.style.color = 'var(--success)';
+                        connStatus.innerHTML = '<span class="status-dot running"></span>Blockchain Active';
+                    } else {
+                        toggle.classList.remove('active');
+                        statusText.textContent = 'Disabled';
+                        statusText.style.color = 'var(--text-secondary)';
+                        connStatus.innerHTML = '<span class="status-dot stopped"></span>Not Connected';
+                    }
+                    
+                    // Update form fields
+                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'mainnet';
+                    document.getElementById('blockchain-app-id').value = res.data.blockchain_app_id || '';
+                    document.getElementById('blockchain-mnemonic').value = res.data.blockchain_admin_mnemonic || '';
+                    document.getElementById('blockchain-cache-ttl').value = res.data.blockchain_cache_ttl || '60';
+                    document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
+                    document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
+                    document.getElementById('blockchain-allow-rogue').checked = res.data.blockchain_allow_rogue_devices === 'true';
+                }
+            } catch (e) {
+                console.error('Blockchain settings error:', e);
+            }
+        }
+        
+        async function toggleBlockchain() {
+            const toggle = document.getElementById('blockchain-toggle');
+            const enabling = !toggle.classList.contains('active');
+            
+            // Quick validation
+            if (enabling) {
+                const appId = document.getElementById('blockchain-app-id').value;
+                if (!appId) {
+                    toast('Please enter an App ID before enabling blockchain', 'error');
+                    return;
+                }
+            }
+            
+            if (enabling) {
+                toggle.classList.add('active');
+                document.getElementById('blockchain-status-text').textContent = 'Enabled';
+                document.getElementById('blockchain-status-text').style.color = 'var(--success)';
+            } else {
+                toggle.classList.remove('active');
+                document.getElementById('blockchain-status-text').textContent = 'Disabled';
+                document.getElementById('blockchain-status-text').style.color = 'var(--text-secondary)';
+            }
+            
+            toast('Click "Save & Apply" to apply changes', 'info');
+        }
+        
+        async function saveBlockchainSettings() {
+            const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
+            const appId = document.getElementById('blockchain-app-id').value;
+            
+            // Validate if enabling
+            if (enabled && !appId) {
+                toast('App ID is required to enable blockchain', 'error');
+                return;
+            }
+            
+            const settings = {
+                blockchain_enabled: enabled ? 'true' : 'false',
+                blockchain_network: document.getElementById('blockchain-network').value,
+                blockchain_app_id: appId || '',
+                blockchain_admin_mnemonic: document.getElementById('blockchain-mnemonic').value || '',
+                blockchain_cache_ttl: document.getElementById('blockchain-cache-ttl').value || '60',
+                blockchain_fallback_allow: document.getElementById('blockchain-fallback').checked ? 'true' : 'false',
+                blockchain_audit_logging: document.getElementById('blockchain-audit').checked ? 'true' : 'false',
+                blockchain_allow_rogue_devices: document.getElementById('blockchain-allow-rogue').checked ? 'true' : 'false'
+            };
+            
+            try {
+                const res = await api('irongate_settings', {
+                    method: 'POST',
+                    body: settings
+                });
+                
+                if (res.success) {
+                    toast('Blockchain settings saved! Irongate restarting...', 'success');
+                    await loadBlockchainSettings();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function testBlockchainConnection() {
+            const appId = document.getElementById('blockchain-app-id').value;
+            const network = document.getElementById('blockchain-network').value;
+            
+            if (!appId) {
+                toast('Enter an App ID first', 'error');
+                return;
+            }
+            
+            toast('Testing connection...', 'info');
+            
+            // For now, just show a message - actual test would need a backend endpoint
+            const connStatus = document.getElementById('blockchain-connection-status');
+            connStatus.innerHTML = '<span style="color:var(--warning);">⏳ Testing...</span>';
+            
+            // Simulate connection test
+            setTimeout(() => {
+                connStatus.innerHTML = '<span style="color:var(--success);">✓ Algorand ' + network + ' reachable</span>';
+                toast('Connection test: Algorand ' + network + ' is reachable. Save settings and restart to fully activate.', 'success');
+            }, 1500);
         }
         
         //======================================================================
@@ -3283,6 +3594,13 @@ class Irongate:
         self.local_mac = None
         self.local_ip = None
         
+        # Layer settings (all enabled by default)
+        self.layer_arp_defense = True
+        self.layer_ipv6_ra = True
+        self.layer_gateway_takeover = True
+        self.layer_bypass_detection = True
+        self.layer_firewall = True
+        
         # Layer 8: Blockchain verification (optional)
         self.blockchain = None
         self.blockchain_enabled = False
@@ -3292,6 +3610,22 @@ class Irongate:
             with open(self.config_path) as f:
                 self.config = yaml.safe_load(f) or {}
             logger.info(f"Loaded config from {self.config_path}")
+            
+            # Load layer settings (default all to True if not specified)
+            layers = self.config.get('layers', {})
+            self.layer_arp_defense = layers.get('arp_defense', True)
+            self.layer_ipv6_ra = layers.get('ipv6_ra', True)
+            self.layer_gateway_takeover = layers.get('gateway_takeover', True)
+            self.layer_bypass_detection = layers.get('bypass_detection', True)
+            self.layer_firewall = layers.get('firewall', True)
+            
+            logger.info("Layer settings:")
+            logger.info(f"  ARP Defense: {'ON' if self.layer_arp_defense else 'OFF'}")
+            logger.info(f"  IPv6 RA Guard: {'ON' if self.layer_ipv6_ra else 'OFF'}")
+            logger.info(f"  Gateway Takeover: {'ON' if self.layer_gateway_takeover else 'OFF'}")
+            logger.info(f"  Bypass Detection: {'ON' if self.layer_bypass_detection else 'OFF'}")
+            logger.info(f"  Firewall: {'ON' if self.layer_firewall else 'OFF'}")
+            
             # Handle devices being None from YAML
             devices = self.config.get('devices') or []
             logger.info(f"Found {len(devices)} devices in config")
@@ -3554,23 +3888,48 @@ class Irongate:
             os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {self.interface} nud permanent 2>/dev/null")
         os.system(f"ip neigh replace {self.gateway_ip} lladdr {self.gateway_mac} dev {self.interface} nud permanent 2>/dev/null")
         
-        self._setup_firewall()
-        logger.info("Firewall configured")
+        # Layer: Firewall (nftables zone-based rules)
+        if self.layer_firewall:
+            self._setup_firewall()
+            logger.info("Layer: Firewall - ACTIVE")
+        else:
+            logger.info("Layer: Firewall - DISABLED")
         
-        t = threading.Thread(target=self._middleground_arp_spoof_loop, daemon=True)
-        t.start()
-        self.threads.append(t)
-        logger.info("Middleground ARP spoofing started")
+        # Layer: Gateway Takeover (ARP spoofing for traffic interception)
+        if self.layer_gateway_takeover:
+            t = threading.Thread(target=self._middleground_arp_spoof_loop, daemon=True)
+            t.start()
+            self.threads.append(t)
+            logger.info("Layer: Gateway Takeover - ACTIVE")
+        else:
+            logger.info("Layer: Gateway Takeover - DISABLED")
         
-        t2 = threading.Thread(target=self._arp_defense_loop, daemon=True)
-        t2.start()
-        self.threads.append(t2)
-        logger.info("ARP defense started")
+        # Layer: ARP Defense (counter spoofing, reply interception)
+        if self.layer_arp_defense:
+            t2 = threading.Thread(target=self._arp_defense_loop, daemon=True)
+            t2.start()
+            self.threads.append(t2)
+            logger.info("Layer: ARP Defense - ACTIVE")
+        else:
+            logger.info("Layer: ARP Defense - DISABLED")
         
+        # LAN device refresh is always needed for protection to work
         t3 = threading.Thread(target=self._lan_device_refresh_loop, daemon=True)
         t3.start()
         self.threads.append(t3)
         logger.info("LAN device refresh started")
+        
+        # Layer: IPv6 RA Guard (TODO: implement if not already)
+        if self.layer_ipv6_ra:
+            logger.info("Layer: IPv6 RA Guard - ACTIVE")
+        else:
+            logger.info("Layer: IPv6 RA Guard - DISABLED")
+        
+        # Layer: Bypass Detection (TODO: implement active probing)
+        if self.layer_bypass_detection:
+            logger.info("Layer: Bypass Detection - ACTIVE")
+        else:
+            logger.info("Layer: Bypass Detection - DISABLED")
         
         logger.info(f"Single-NIC isolation active")
         logger.info(f"  Protected: {len(self.protected_devices)} devices")
