@@ -96,6 +96,12 @@ apt install -y python3 python3-pip python3-venv python3-dev \
 PHP_VERSION=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
 echo -e "PHP Version: ${GREEN}$PHP_VERSION${NC}"
 
+# Enable persistent journaling (logs survive reboots for debugging)
+echo -e "${YELLOW}Enabling persistent journaling...${NC}"
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+systemctl restart systemd-journald 2>/dev/null || true
+
 # Stop services during configuration and kill any zombie processes
 systemctl stop dnsmasq 2>/dev/null || true
 pkill -9 dnsmasq 2>/dev/null || true
@@ -3518,6 +3524,14 @@ mkdir -p /opt/irongate
 mkdir -p /etc/irongate
 mkdir -p /var/log/irongate
 
+# IMPORTANT: www-data needs to write to config.yaml from the web UI
+chown -R root:www-data /etc/irongate
+chmod 775 /etc/irongate
+# Config file will be created later, but set default permissions
+touch /etc/irongate/config.yaml 2>/dev/null || true
+chown root:www-data /etc/irongate/config.yaml 2>/dev/null || true
+chmod 664 /etc/irongate/config.yaml 2>/dev/null || true
+
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
 # Core dependencies
@@ -4209,12 +4223,20 @@ class Irongate:
         
         logger.info(f"ARP defense monitoring {len(protected_ips)} protected IPs")
         
+        # Use stop_filter instead of timeout to keep promiscuous mode stable
+        # This prevents the SMSC95xx driver on Pi 3B from crashing due to
+        # constant promiscuous mode toggling
+        def should_stop(pkt):
+            return not self.running
+        
         while self.running:
             try:
+                # Long timeout with stop_filter - keeps promiscuous mode stable
                 sniff(iface=self.interface, filter="arp", prn=handle_arp,
-                      store=False, timeout=5)
+                      store=False, timeout=30, stop_filter=should_stop)
             except Exception as e:
                 if self.running:
+                    logger.debug(f"Sniff restart: {e}")
                     time.sleep(1)
     
     def _setup_firewall(self):
@@ -5630,6 +5652,10 @@ if [ -z "$DEVICES_YAML" ]; then
     sed -i 's/^devices:$/devices: []/' /etc/irongate/config.yaml
 fi
 
+# Set permissions so www-data can update config from web UI
+chown root:www-data /etc/irongate/config.yaml
+chmod 664 /etc/irongate/config.yaml
+
 chown -R root:root /opt/irongate
 chmod -R 755 /opt/irongate
 
@@ -5793,9 +5819,35 @@ server {
     server_name _;
     root /var/www/irongate;
     index index.html;
+    
+    # Timeouts to prevent hung connections
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+    
+    # Limit request size
+    client_max_body_size 10M;
+    
     location / { try_files \$uri \$uri/ =404; }
-    location ~ \.php\$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:$PHP_SOCK; }
+    
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$PHP_SOCK;
+        
+        # PHP timeouts - prevent hung requests from blocking workers
+        fastcgi_connect_timeout 10s;
+        fastcgi_send_timeout 30s;
+        fastcgi_read_timeout 30s;
+    }
+    
     location ~ /\.ht { deny all; }
+    
+    # Health check endpoint
+    location /health {
+        access_log off;
+        return 200 "OK";
+        add_header Content-Type text/plain;
+    }
 }
 EOF
 
