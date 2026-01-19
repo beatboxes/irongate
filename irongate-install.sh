@@ -111,13 +111,26 @@ cleanup_on_exit() {
     fi
     # Always ensure critical services are running when script exits
     echo -e "${YELLOW}Ensuring services are started...${NC}"
+    
+    # Find PHP version and fix nginx config BEFORE starting nginx
+    TRAP_PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+    if [ -z "$TRAP_PHP_VER" ]; then
+        TRAP_PHP_VER=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+    fi
+    if [ -n "$TRAP_PHP_VER" ] && [ -f /etc/nginx/sites-available/irongate ]; then
+        sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate 2>/dev/null || true
+    fi
+    
     systemctl start dnsmasq 2>/dev/null || true
-    systemctl start nginx 2>/dev/null || true
-    # Find and start php-fpm regardless of version
+    
+    # Start php-fpm BEFORE nginx
     PHP_FPM=$(systemctl list-unit-files | grep -oP 'php[\d.]*-fpm\.service' | head -n1)
     if [ -n "$PHP_FPM" ]; then
         systemctl start "$PHP_FPM" 2>/dev/null || true
     fi
+    
+    # Now start nginx
+    systemctl start nginx 2>/dev/null || true
     systemctl start irongate 2>/dev/null || true
 }
 trap cleanup_on_exit EXIT
