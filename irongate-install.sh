@@ -1238,7 +1238,7 @@ switch ($action) {
         if ($enable) {
             $result = safeApplyConfig($db);
         } else {
-            exec('sudo systemctl stop irongate 2>&1', $output, $retval);
+            exec('sudo systemctl stop irongate >/dev/null 2>&1 &');
             $result = ['success' => true, 'message' => 'Irongate disabled'];
         }
         echo json_encode($result);
@@ -1592,7 +1592,7 @@ function applyIrongateConfig($db) {
     $enabled = ($settings['irongate_enabled'] ?? 'false') === 'true';
     
     if (!$enabled) {
-        exec('sudo systemctl stop irongate 2>&1');
+        exec('sudo systemctl stop irongate >/dev/null 2>&1 &');
         return ['success' => true, 'message' => 'Irongate disabled'];
     }
     
@@ -1721,18 +1721,8 @@ function applyIrongateConfig($db) {
         }
     }
     
-    // Restart service
-    exec('sudo systemctl restart irongate 2>&1', $output, $retval);
-    
-    if ($retval !== 0) {
-        exec('sudo journalctl -u irongate -n 20 --no-pager 2>&1', $journalOutput);
-        return [
-            'success' => false,
-            'error' => 'Failed to start Irongate',
-            'output' => implode("\n", $output),
-            'journal' => implode("\n", $journalOutput)
-        ];
-    }
+    // Restart service in background - don't wait for it
+    exec('sudo systemctl restart irongate >/dev/null 2>&1 &');
     
     return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
 }
@@ -6425,6 +6415,8 @@ Wants=network.target
 Type=simple
 ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
 ExecStartPre=/bin/sleep 2
+ExecStop=/bin/kill -9 \$MAINPID
+TimeoutStopSec=3
 Restart=on-failure
 RestartSec=5
 
