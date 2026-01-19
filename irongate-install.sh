@@ -109,28 +109,20 @@ cleanup_on_exit() {
     if [ $exit_code -ne 0 ]; then
         echo -e "${RED}Script exited with code $exit_code - ensuring services are running...${NC}"
     fi
-    # Always ensure critical services are running when script exits
     echo -e "${YELLOW}Ensuring services are started...${NC}"
     
-    # Find PHP version and fix nginx config BEFORE starting nginx
+    # Get PHP version
     TRAP_PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
-    if [ -z "$TRAP_PHP_VER" ]; then
-        TRAP_PHP_VER=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
-    fi
+    
+    # Fix nginx config with correct socket path
     if [ -n "$TRAP_PHP_VER" ] && [ -f /etc/nginx/sites-available/irongate ]; then
-        sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate 2>/dev/null || true
+        sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
     fi
     
+    # Start services in correct order
     systemctl start dnsmasq 2>/dev/null || true
-    
-    # Start php-fpm BEFORE nginx
-    PHP_FPM=$(systemctl list-unit-files | grep -oP 'php[\d.]*-fpm\.service' | head -n1)
-    if [ -n "$PHP_FPM" ]; then
-        systemctl start "$PHP_FPM" 2>/dev/null || true
-    fi
-    
-    # Now start nginx
-    systemctl start nginx 2>/dev/null || true
+    [ -n "$TRAP_PHP_VER" ] && systemctl restart php${TRAP_PHP_VER}-fpm 2>/dev/null || true
+    systemctl restart nginx 2>/dev/null || true
     systemctl start irongate 2>/dev/null || true
 }
 trap cleanup_on_exit EXIT
@@ -6911,5 +6903,15 @@ echo -e "${GREEN}  GitHub: ${IRONGATE_REPO}${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# Final restart to ensure web UI is online
-systemctl restart nginx 2>/dev/null || true
+# FINAL BULLETPROOF RESTART - This MUST work
+echo -e "${YELLOW}Final service restart...${NC}"
+FINAL_PHP=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+if [ -n "$FINAL_PHP" ]; then
+    # Fix nginx config with correct PHP socket
+    sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${FINAL_PHP}-fpm.sock;|" /etc/nginx/sites-available/irongate
+    # Restart PHP-FPM first
+    systemctl restart php${FINAL_PHP}-fpm
+fi
+# Restart nginx
+systemctl restart nginx
+echo -e "${GREEN}Done.${NC}"
