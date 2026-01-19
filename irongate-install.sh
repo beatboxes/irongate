@@ -110,19 +110,55 @@ cleanup_on_exit() {
         echo -e "${RED}Script exited with code $exit_code - ensuring services are running...${NC}"
     fi
     echo -e "${YELLOW}Ensuring services are started...${NC}"
-    
-    # Get PHP version
+
+    # Get PHP version with multiple fallback methods
     TRAP_PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
-    
+
+    # Fallback 1: Check installed php-fpm packages
+    if [ -z "$TRAP_PHP_VER" ]; then
+        TRAP_PHP_VER=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+    fi
+
+    # Fallback 2: Find existing PHP-FPM socket
+    if [ -z "$TRAP_PHP_VER" ]; then
+        FOUND_SOCK=$(find /run/php/ /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+        if [ -n "$FOUND_SOCK" ]; then
+            TRAP_PHP_VER=$(echo "$FOUND_SOCK" | grep -oP '\d+\.\d+')
+        fi
+    fi
+
+    # Fallback 3: Check systemd for php-fpm service
+    if [ -z "$TRAP_PHP_VER" ]; then
+        TRAP_PHP_VER=$(systemctl list-unit-files 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+    fi
+
     # Fix nginx config with correct socket path
     if [ -n "$TRAP_PHP_VER" ] && [ -f /etc/nginx/sites-available/irongate ]; then
         sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
     fi
-    
-    # Start services in correct order
+
+    # Start services in correct order with proper delays
     systemctl start dnsmasq 2>/dev/null || true
-    [ -n "$TRAP_PHP_VER" ] && systemctl restart php${TRAP_PHP_VER}-fpm 2>/dev/null || true
+
+    # Restart PHP-FPM (required for nginx to work)
+    if [ -n "$TRAP_PHP_VER" ]; then
+        systemctl restart php${TRAP_PHP_VER}-fpm 2>/dev/null || true
+        # Wait for PHP-FPM socket to be ready before starting nginx
+        sleep 2
+    fi
+
+    # Restart nginx
     systemctl restart nginx 2>/dev/null || true
+
+    # Verify nginx started, retry if failed
+    sleep 1
+    if ! systemctl is-active --quiet nginx 2>/dev/null; then
+        echo -e "${RED}nginx failed to start, retrying...${NC}"
+        # Try to fix common issues
+        nginx -t 2>/dev/null || true
+        systemctl restart nginx 2>/dev/null || true
+    fi
+
     systemctl start irongate 2>/dev/null || true
 }
 trap cleanup_on_exit EXIT
@@ -6573,11 +6609,53 @@ if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown"
     # Download and run installer
     SCRIPT_PATH="/tmp/irongate-update.sh"
     curl -sf -H "User-Agent: Irongate-Updater" "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
-    
+
     if [ -f "$SCRIPT_PATH" ]; then
         chmod +x "$SCRIPT_PATH"
         log "Running installer..."
-        bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
+        if bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1; then
+            log "Installer completed successfully"
+        else
+            log "WARNING: Installer exited with non-zero status"
+        fi
+
+        # Verify services are running after update (recovery mechanism)
+        sleep 3
+        log "Verifying services after update..."
+
+        # Check and recover PHP-FPM
+        RECOVERY_PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+        if [ -z "$RECOVERY_PHP_VER" ]; then
+            RECOVERY_PHP_VER=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+        fi
+
+        if [ -n "$RECOVERY_PHP_VER" ]; then
+            if ! systemctl is-active --quiet php${RECOVERY_PHP_VER}-fpm 2>/dev/null; then
+                log "RECOVERY: PHP-FPM not running, starting..."
+                systemctl restart php${RECOVERY_PHP_VER}-fpm 2>/dev/null || true
+                sleep 2
+            fi
+        fi
+
+        # Check and recover nginx
+        if ! systemctl is-active --quiet nginx 2>/dev/null; then
+            log "RECOVERY: nginx not running, attempting to start..."
+            # Fix nginx config if needed
+            if [ -n "$RECOVERY_PHP_VER" ] && [ -f /etc/nginx/sites-available/irongate ]; then
+                sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${RECOVERY_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
+            fi
+            nginx -t >> "$LOG_FILE" 2>&1 || true
+            systemctl restart nginx 2>/dev/null || true
+            sleep 1
+            if systemctl is-active --quiet nginx 2>/dev/null; then
+                log "RECOVERY: nginx recovered successfully"
+            else
+                log "ERROR: Failed to recover nginx - manual intervention required"
+            fi
+        else
+            log "nginx is running"
+        fi
+
         log "Update complete!"
     else
         log "ERROR: Failed to download update script"
