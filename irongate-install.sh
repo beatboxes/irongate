@@ -362,8 +362,19 @@ CREATE TABLE IF NOT EXISTS irongate_devices (
     zone TEXT DEFAULT 'isolated',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+-- Custom device groups table
+CREATE TABLE IF NOT EXISTS device_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    color TEXT DEFAULT '#6c757d',
+    icon TEXT DEFAULT '📁',
+    description TEXT,
+    lan_access TEXT DEFAULT 'none',
+    can_access_groups TEXT DEFAULT '[]',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 EOSQL
-    
+
     # Always fix hostnames with spaces in database (replace space with hyphen)
     echo -e "${YELLOW}  → Sanitizing hostnames in database...${NC}"
     sqlite3 /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %';"
@@ -420,6 +431,17 @@ CREATE TABLE IF NOT EXISTS irongate_devices (
     ip TEXT,
     hostname TEXT,
     zone TEXT DEFAULT 'isolated',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+-- Custom device groups table
+CREATE TABLE IF NOT EXISTS device_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    color TEXT DEFAULT '#6c757d',
+    icon TEXT DEFAULT '📁',
+    description TEXT,
+    lan_access TEXT DEFAULT 'none',
+    can_access_groups TEXT DEFAULT '[]',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 EOSQL
@@ -1188,7 +1210,122 @@ switch ($action) {
         }
         echo json_encode(['success' => true, 'data' => array_reverse($logs)]);
         break;
-    
+
+    case 'device_groups':
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            $name = trim($data['name'] ?? '');
+
+            // Validate name - cannot use built-in group names
+            $reserved = ['isolated', 'servers', 'trusted'];
+            if (in_array(strtolower($name), $reserved)) {
+                echo json_encode(['success' => false, 'error' => 'Cannot use reserved group name']);
+                break;
+            }
+
+            if (empty($name)) {
+                echo json_encode(['success' => false, 'error' => 'Group name is required']);
+                break;
+            }
+
+            $stmt = $db->prepare('INSERT OR REPLACE INTO device_groups (name, color, icon, description, lan_access, can_access_groups) VALUES (?, ?, ?, ?, ?, ?)');
+            $stmt->bindValue(1, $name, SQLITE3_TEXT);
+            $stmt->bindValue(2, $data['color'] ?? '#6c757d', SQLITE3_TEXT);
+            $stmt->bindValue(3, $data['icon'] ?? '📁', SQLITE3_TEXT);
+            $stmt->bindValue(4, $data['description'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(5, $data['lan_access'] ?? 'none', SQLITE3_TEXT);
+            $stmt->bindValue(6, json_encode($data['can_access_groups'] ?? []), SQLITE3_TEXT);
+            $result = $stmt->execute();
+
+            if ($result) {
+                applyIrongateConfig($db);
+            }
+            echo json_encode(['success' => $result ? true : false]);
+        } elseif ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
+            $id = $_GET['id'] ?? 0;
+            $name = $_GET['name'] ?? '';
+
+            // First get the group name if deleting by ID
+            if ($id) {
+                $stmt = $db->prepare('SELECT name FROM device_groups WHERE id = ?');
+                $stmt->bindValue(1, $id, SQLITE3_INTEGER);
+                $result = $stmt->execute();
+                $row = $result->fetchArray(SQLITE3_ASSOC);
+                if ($row) {
+                    $name = $row['name'];
+                }
+            }
+
+            // Move all devices in this group to 'isolated'
+            if ($name) {
+                $stmt = $db->prepare('UPDATE irongate_devices SET zone = ? WHERE zone = ?');
+                $stmt->bindValue(1, 'isolated', SQLITE3_TEXT);
+                $stmt->bindValue(2, $name, SQLITE3_TEXT);
+                $stmt->execute();
+            }
+
+            // Delete the group
+            if ($id) {
+                $stmt = $db->prepare('DELETE FROM device_groups WHERE id = ?');
+                $stmt->bindValue(1, $id, SQLITE3_INTEGER);
+            } else {
+                $stmt = $db->prepare('DELETE FROM device_groups WHERE name = ?');
+                $stmt->bindValue(1, $name, SQLITE3_TEXT);
+            }
+            $result = $stmt->execute();
+
+            if ($result) {
+                applyIrongateConfig($db);
+            }
+            echo json_encode(['success' => $result ? true : false]);
+        } else {
+            // GET - return all custom groups plus built-in groups
+            $results = $db->query('SELECT * FROM device_groups ORDER BY name');
+            $groups = [];
+
+            // Add built-in groups first
+            $groups[] = [
+                'id' => 0,
+                'name' => 'isolated',
+                'color' => '#e94560',
+                'icon' => '🔴',
+                'description' => 'Internet only, no LAN access',
+                'lan_access' => 'none',
+                'can_access_groups' => [],
+                'builtin' => true
+            ];
+            $groups[] = [
+                'id' => 0,
+                'name' => 'servers',
+                'color' => '#ffc107',
+                'icon' => '🟡',
+                'description' => 'Can communicate with other servers',
+                'lan_access' => 'servers',
+                'can_access_groups' => ['servers'],
+                'builtin' => true
+            ];
+            $groups[] = [
+                'id' => 0,
+                'name' => 'trusted',
+                'color' => '#00bf63',
+                'icon' => '🟢',
+                'description' => 'Full network access',
+                'lan_access' => 'full',
+                'can_access_groups' => [],
+                'builtin' => true
+            ];
+
+            // Add custom groups
+            while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+                $row['can_access_groups'] = json_decode($row['can_access_groups'] ?? '[]', true) ?: [];
+                $row['builtin'] = false;
+                $groups[] = $row;
+            }
+
+            echo json_encode(['success' => true, 'data' => $groups]);
+        }
+        break;
+
     case 'irongate_devices':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
@@ -1393,7 +1530,7 @@ switch ($action) {
             'reservations', 'logs', 'restart', 'stop', 'start',
             'diagnostics', 'repair', 'validate',
             'irongate_status', 'irongate_settings', 'irongate_interfaces',
-            'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices',
+            'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices', 'device_groups',
             'update_check', 'update_settings', 'update_now', 'update_log'
         ]]);
 }
@@ -1474,13 +1611,37 @@ function applyIrongateConfig($db) {
     $config .= "  audit_logging: " . (($settings['blockchain_audit_logging'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
     $config .= "  allow_rogue_devices: " . (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true' ? 'true' : 'false') . "\n\n";
     
+    // Get custom device groups from database
+    $groupResults = $db->query('SELECT * FROM device_groups ORDER BY name');
+    $customGroups = [];
+    while ($row = $groupResults->fetchArray(SQLITE3_ASSOC)) {
+        $customGroups[] = $row;
+    }
+
+    $config .= "# Custom Device Groups\n";
+    $config .= "custom_groups:\n";
+    if (!empty($customGroups)) {
+        foreach ($customGroups as $group) {
+            $config .= "  - name: \"" . $group['name'] . "\"\n";
+            $config .= "    color: \"" . $group['color'] . "\"\n";
+            $config .= "    icon: \"" . $group['icon'] . "\"\n";
+            $config .= "    description: \"" . ($group['description'] ?? '') . "\"\n";
+            $config .= "    lan_access: \"" . ($group['lan_access'] ?? 'none') . "\"\n";
+            $canAccess = json_decode($group['can_access_groups'] ?? '[]', true) ?: [];
+            $config .= "    can_access_groups: [" . implode(', ', array_map(function($g) { return '"' . $g . '"'; }, $canAccess)) . "]\n";
+        }
+    } else {
+        $config .= "  []\n";
+    }
+    $config .= "\n";
+
     // Get protected devices from database
     $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
     $devices = [];
     while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
         $devices[] = $row;
     }
-    
+
     $config .= "devices:\n";
     if (!empty($devices)) {
         foreach ($devices as $dev) {
@@ -1491,7 +1652,7 @@ function applyIrongateConfig($db) {
     } else {
         $config .= "  []\n";
     }
-    
+
     // Write config
     @mkdir('/etc/irongate', 0755, true);
     file_put_contents('/etc/irongate/config.yaml', $config);
@@ -1656,6 +1817,8 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             <div style="font-size:0.8em;color:var(--text-secondary);">Full access</div>
                         </div>
                     </div>
+                    <!-- Custom Groups Summary (populated dynamically) -->
+                    <div id="dash-custom-groups" style="margin-top:15px;"></div>
                 </div>
                 
                 <!-- System Info -->
@@ -1694,15 +1857,19 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             <!-- Devices & Zones -->
             <div class="page" id="page-devices">
                 <h2 style="margin-bottom:20px;">🖥️ Devices & Zones</h2>
-                
+
                 <p style="color:var(--text-secondary);margin-bottom:20px;">
                     Add devices to zones to control their network access. Devices not in any zone have normal network access.
                 </p>
-                
+
                 <!-- Zone Legend -->
                 <div class="card">
-                    <div class="card-title">Zone Access Rules</div>
-                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Zone Access Rules</div>
+                        <button class="btn btn-secondary btn-sm" onclick="showGroupModal()">+ Create Custom Group</button>
+                    </div>
+                    <div id="zone-legend-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                        <!-- Built-in zones (static) -->
                         <div style="padding:15px;background:rgba(233,69,96,0.1);border-radius:8px;border-left:4px solid #e94560;">
                             <strong style="color:#e94560;">🔴 isolated</strong>
                             <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
@@ -1727,7 +1894,9 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                                 ✓ Can reach all devices
                             </div>
                         </div>
+                        <!-- Custom groups will be appended here dynamically -->
                     </div>
+                    <div id="custom-groups-container" style="margin-top:15px;"></div>
                 </div>
                 
                 <!-- Device Management -->
@@ -2302,6 +2471,75 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 <button class="btn btn-primary" onclick="importSelectedDevices()">Import Selected</button>
                 <button class="btn btn-secondary" onclick="hideImportModal()">Cancel</button>
             </div>
+        </div>
+    </div>
+
+    <!-- Custom Group Modal -->
+    <div class="modal" id="group-modal">
+        <div class="modal-content" style="max-width:550px;">
+            <div class="modal-title" id="group-modal-title">📁 Create Custom Group</div>
+            <form id="group-form" onsubmit="saveCustomGroup(event)">
+                <input type="hidden" id="group-edit-id" value="">
+                <div class="form-group">
+                    <label>Group Name *</label>
+                    <input class="form-control" id="group-name" required placeholder="e.g., cameras, printers, iot">
+                    <div style="font-size:0.8em;color:var(--text-secondary);margin-top:3px;">
+                        Use lowercase, no spaces. This will be the zone identifier.
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Icon</label>
+                        <select class="form-control" id="group-icon">
+                            <option value="📁">📁 Folder</option>
+                            <option value="📷">📷 Camera</option>
+                            <option value="🖨️">🖨️ Printer</option>
+                            <option value="📺">📺 TV/Display</option>
+                            <option value="🔌">🔌 IoT Device</option>
+                            <option value="💡">💡 Smart Light</option>
+                            <option value="🌡️">🌡️ Sensor</option>
+                            <option value="🔒">🔒 Security</option>
+                            <option value="🏠">🏠 Home</option>
+                            <option value="🏢">🏢 Office</option>
+                            <option value="🎮">🎮 Gaming</option>
+                            <option value="📱">📱 Mobile</option>
+                            <option value="💻">💻 Computer</option>
+                            <option value="🖥️">🖥️ Server</option>
+                            <option value="🔷">🔷 Blue</option>
+                            <option value="🟣">🟣 Purple</option>
+                            <option value="🟠">🟠 Orange</option>
+                            <option value="⚪">⚪ White</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Color</label>
+                        <input type="color" class="form-control" id="group-color" value="#6c757d" style="height:38px;padding:2px;">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <input class="form-control" id="group-description" placeholder="Brief description of this group">
+                </div>
+                <div class="form-group">
+                    <label>LAN Access Level *</label>
+                    <select class="form-control" id="group-lan-access" onchange="updateGroupAccessOptions()">
+                        <option value="none">No LAN access (Internet only)</option>
+                        <option value="same">Can communicate within same group only</option>
+                        <option value="selected">Can communicate with selected groups</option>
+                        <option value="full">Full LAN access (like trusted)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="group-access-groups-container" style="display:none;">
+                    <label>Can Access Groups</label>
+                    <div id="group-access-groups-list" style="max-height:150px;overflow-y:auto;background:var(--bg);padding:10px;border-radius:6px;">
+                        <!-- Checkboxes will be populated dynamically -->
+                    </div>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Save Group</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideGroupModal()">Cancel</button>
+                </div>
+            </form>
         </div>
     </div>
 
@@ -3002,13 +3240,230 @@ cat > /var/www/irongate/index.html << 'EOHTML'
         }
         
         //======================================================================
+        // CUSTOM DEVICE GROUPS MANAGEMENT
+        //======================================================================
+
+        let deviceGroups = [];
+
+        async function loadDeviceGroups() {
+            try {
+                const res = await api('device_groups');
+                if (res.success) {
+                    deviceGroups = res.data || [];
+                    renderCustomGroupsLegend();
+                    populateZoneDropdowns();
+                }
+            } catch (e) {
+                console.error('Load groups error:', e);
+            }
+        }
+
+        function renderCustomGroupsLegend() {
+            const container = document.getElementById('custom-groups-container');
+            if (!container) return;
+
+            const customGroups = deviceGroups.filter(g => !g.builtin);
+            if (customGroups.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            container.innerHTML = `
+                <div style="font-size:0.9em;color:var(--text-secondary);margin-bottom:10px;margin-top:15px;">Custom Groups:</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                    ${customGroups.map(g => {
+                        const accessDesc = g.lan_access === 'none' ? '✗ No LAN access' :
+                                          g.lan_access === 'same' ? '✓ Can reach same group' :
+                                          g.lan_access === 'selected' ? '✓ Can reach selected groups' :
+                                          g.lan_access === 'full' ? '✓ Full LAN access' : '✗ No LAN access';
+                        return `
+                            <div style="padding:15px;background:${hexToRgba(g.color, 0.1)};border-radius:8px;border-left:4px solid ${g.color};position:relative;">
+                                <strong style="color:${g.color};">${g.icon} ${g.name}</strong>
+                                <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                    ${g.description || 'Custom device group'}<br>
+                                    ${accessDesc}
+                                </div>
+                                <div style="position:absolute;top:10px;right:10px;">
+                                    <button class="btn btn-sm btn-secondary" onclick="editGroup(${g.id})" style="padding:3px 8px;font-size:0.75em;">Edit</button>
+                                    <button class="btn btn-sm btn-danger" onclick="deleteGroup(${g.id})" style="padding:3px 8px;font-size:0.75em;margin-left:3px;">Delete</button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        function hexToRgba(hex, alpha) {
+            const r = parseInt(hex.slice(1, 3), 16);
+            const g = parseInt(hex.slice(3, 5), 16);
+            const b = parseInt(hex.slice(5, 7), 16);
+            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        }
+
+        function populateZoneDropdowns() {
+            const devZone = document.getElementById('dev-zone');
+            if (!devZone) return;
+
+            const currentValue = devZone.value;
+
+            devZone.innerHTML = deviceGroups.map(g => {
+                const desc = g.builtin ?
+                    (g.name === 'isolated' ? ' - Internet only, no LAN access' :
+                     g.name === 'servers' ? ' - Can talk to other servers' :
+                     g.name === 'trusted' ? ' - Full network access' : '') :
+                    (g.description ? ' - ' + g.description : '');
+                return `<option value="${g.name}">${g.icon} ${g.name}${desc}</option>`;
+            }).join('');
+
+            // Restore previous selection if valid
+            if (currentValue && deviceGroups.find(g => g.name === currentValue)) {
+                devZone.value = currentValue;
+            }
+        }
+
+        function showGroupModal(group = null) {
+            document.getElementById('group-form').reset();
+            document.getElementById('group-edit-id').value = '';
+            document.getElementById('group-modal-title').textContent = '📁 Create Custom Group';
+            document.getElementById('group-access-groups-container').style.display = 'none';
+
+            if (group) {
+                document.getElementById('group-modal-title').textContent = '📁 Edit Custom Group';
+                document.getElementById('group-edit-id').value = group.id;
+                document.getElementById('group-name').value = group.name || '';
+                document.getElementById('group-icon').value = group.icon || '📁';
+                document.getElementById('group-color').value = group.color || '#6c757d';
+                document.getElementById('group-description').value = group.description || '';
+                document.getElementById('group-lan-access').value = group.lan_access || 'none';
+                updateGroupAccessOptions(group.can_access_groups || []);
+            } else {
+                updateGroupAccessOptions([]);
+            }
+
+            document.getElementById('group-modal').classList.add('active');
+        }
+
+        function hideGroupModal() {
+            document.getElementById('group-modal').classList.remove('active');
+            document.getElementById('group-form').reset();
+        }
+
+        function updateGroupAccessOptions(selectedGroups = []) {
+            const lanAccess = document.getElementById('group-lan-access').value;
+            const container = document.getElementById('group-access-groups-container');
+            const list = document.getElementById('group-access-groups-list');
+
+            if (lanAccess === 'selected') {
+                container.style.display = 'block';
+                // Populate with all groups (except the one being edited)
+                const editId = document.getElementById('group-edit-id').value;
+                const editName = editId ? deviceGroups.find(g => g.id == editId)?.name : null;
+
+                list.innerHTML = deviceGroups
+                    .filter(g => g.name !== editName)
+                    .map(g => `
+                        <label style="display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer;">
+                            <input type="checkbox" class="group-access-check" value="${g.name}" ${selectedGroups.includes(g.name) ? 'checked' : ''}>
+                            <span style="color:${g.color};">${g.icon} ${g.name}</span>
+                        </label>
+                    `).join('');
+            } else {
+                container.style.display = 'none';
+            }
+        }
+
+        async function saveCustomGroup(event) {
+            event.preventDefault();
+
+            let name = document.getElementById('group-name').value.trim().toLowerCase();
+            name = name.replace(/[^a-z0-9_-]/g, ''); // Sanitize
+
+            if (!name) {
+                toast('Group name is required', 'error');
+                return;
+            }
+
+            // Get selected access groups
+            const canAccessGroups = [];
+            if (document.getElementById('group-lan-access').value === 'selected') {
+                document.querySelectorAll('.group-access-check:checked').forEach(cb => {
+                    canAccessGroups.push(cb.value);
+                });
+            } else if (document.getElementById('group-lan-access').value === 'same') {
+                canAccessGroups.push(name); // Can access itself
+            }
+
+            const group = {
+                name: name,
+                icon: document.getElementById('group-icon').value,
+                color: document.getElementById('group-color').value,
+                description: document.getElementById('group-description').value.trim(),
+                lan_access: document.getElementById('group-lan-access').value,
+                can_access_groups: canAccessGroups
+            };
+
+            try {
+                const res = await api('device_groups', {
+                    method: 'POST',
+                    body: group
+                });
+
+                if (res.success) {
+                    toast('Group saved successfully', 'success');
+                    hideGroupModal();
+                    await loadDeviceGroups();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to save group: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+
+        function editGroup(id) {
+            const group = deviceGroups.find(g => g.id === id);
+            if (group && !group.builtin) {
+                showGroupModal(group);
+            }
+        }
+
+        async function deleteGroup(id) {
+            const group = deviceGroups.find(g => g.id === id);
+            if (!group || group.builtin) return;
+
+            if (!confirm(`Delete the "${group.name}" group? All devices in this group will be moved to "isolated".`)) return;
+
+            try {
+                const res = await api('device_groups', {
+                    method: 'DELETE',
+                    params: { id: id }
+                });
+
+                if (res.success) {
+                    toast('Group deleted', 'success');
+                    await loadDeviceGroups();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to delete group', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+
+        //======================================================================
         // IRONGATE DEVICE MANAGEMENT
         //======================================================================
-        
+
         let irongateDevices = [];
         
         async function loadIrongateDevices() {
             try {
+                // Load groups first to have colors/icons available
+                await loadDeviceGroups();
+
                 const res = await api('irongate_devices');
                 if (res.success) {
                     irongateDevices = res.data || [];
@@ -3018,28 +3473,41 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 console.error('Load devices error:', e);
             }
         }
-        
+
+        function getGroupInfo(zoneName) {
+            const group = deviceGroups.find(g => g.name === zoneName);
+            if (group) {
+                return { color: group.color, icon: group.icon };
+            }
+            // Fallback for built-in groups if not loaded yet
+            if (zoneName === 'isolated') return { color: '#e94560', icon: '🔴' };
+            if (zoneName === 'servers') return { color: '#ffc107', icon: '🟡' };
+            if (zoneName === 'trusted') return { color: '#00bf63', icon: '🟢' };
+            return { color: '#6c757d', icon: '📁' };
+        }
+
         function renderDevicesTable() {
             const tbody = document.getElementById('irongate-devices-table');
             if (!irongateDevices || irongateDevices.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No devices configured. Add devices to protect them with Irongate.</td></tr>';
                 return;
             }
-            
-            // Sort by zone
-            const zoneOrder = { isolated: 0, servers: 1, trusted: 2 };
-            const sorted = [...irongateDevices].sort((a, b) => 
-                (zoneOrder[a.zone] || 99) - (zoneOrder[b.zone] || 99)
-            );
-            
+
+            // Sort by zone - built-in first, then custom alphabetically
+            const builtinOrder = { isolated: 0, servers: 1, trusted: 2 };
+            const sorted = [...irongateDevices].sort((a, b) => {
+                const aOrder = builtinOrder[a.zone] ?? 100;
+                const bOrder = builtinOrder[b.zone] ?? 100;
+                if (aOrder !== bOrder) return aOrder - bOrder;
+                // Both custom groups - sort alphabetically
+                return (a.zone || '').localeCompare(b.zone || '');
+            });
+
             tbody.innerHTML = sorted.map(dev => {
-                const zoneColor = dev.zone === 'isolated' ? '#e94560' : 
-                                  dev.zone === 'servers' ? '#ffc107' : '#00bf63';
-                const zoneIcon = dev.zone === 'isolated' ? '🔴' : 
-                                 dev.zone === 'servers' ? '🟡' : '🟢';
+                const groupInfo = getGroupInfo(dev.zone);
                 return `
                     <tr>
-                        <td><span style="color:${zoneColor};">${zoneIcon} ${dev.zone}</span></td>
+                        <td><span style="color:${groupInfo.color};">${groupInfo.icon} ${dev.zone}</span></td>
                         <td><code>${dev.mac}</code></td>
                         <td>${dev.ip || '<span style="color:var(--text-secondary);">DHCP</span>'}</td>
                         <td>${dev.hostname || '-'}</td>
@@ -3054,6 +3522,9 @@ cat > /var/www/irongate/index.html << 'EOHTML'
         
         function showDeviceModal(device = null) {
             document.getElementById('device-form').reset();
+            // Refresh zone dropdown with latest groups
+            populateZoneDropdowns();
+
             if (device) {
                 document.getElementById('dev-mac').value = device.mac || '';
                 document.getElementById('dev-ip').value = device.ip || '';
@@ -3147,6 +3618,11 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 }
                 
                 const container = document.getElementById('import-leases-list');
+                // Build zone options dynamically from deviceGroups
+                const zoneOptions = deviceGroups.map(g =>
+                    `<option value="${g.name}">${g.icon} ${g.name}</option>`
+                ).join('');
+
                 container.innerHTML = available.map(lease => `
                     <label style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--bg);border-radius:6px;margin-bottom:8px;cursor:pointer;">
                         <input type="checkbox" class="import-check" data-mac="${lease.mac}" data-ip="${lease.ip}" data-hostname="${lease.hostname}">
@@ -3157,9 +3633,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             </div>
                         </div>
                         <select class="form-control import-zone" style="width:150px;font-size:0.85em;">
-                            <option value="isolated">🔴 isolated</option>
-                            <option value="servers">🟡 servers</option>
-                            <option value="trusted">🟢 trusted</option>
+                            ${zoneOptions}
                         </select>
                     </label>
                 `).join('');
@@ -3270,22 +3744,49 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     }
                 }
                 
+                // Load device groups first
+                const groupsRes = await api('device_groups');
+                const groups = groupsRes.success ? groupsRes.data : [];
+
                 // Load devices and count by zone
                 const devRes = await api('irongate_devices');
                 if (devRes.success && devRes.data) {
                     const devices = devRes.data;
                     document.getElementById('dash-devices').textContent = devices.length;
-                    
-                    // Count by zone
-                    let isolated = 0, servers = 0, trusted = 0;
+
+                    // Count by zone (including custom groups)
+                    const zoneCounts = {};
                     devices.forEach(d => {
-                        if (d.zone === 'isolated') isolated++;
-                        else if (d.zone === 'servers') servers++;
-                        else if (d.zone === 'trusted') trusted++;
+                        const zone = d.zone || 'isolated';
+                        zoneCounts[zone] = (zoneCounts[zone] || 0) + 1;
                     });
-                    document.getElementById('dash-isolated').textContent = isolated;
-                    document.getElementById('dash-servers').textContent = servers;
-                    document.getElementById('dash-trusted').textContent = trusted;
+
+                    // Update built-in zone counts
+                    document.getElementById('dash-isolated').textContent = zoneCounts['isolated'] || 0;
+                    document.getElementById('dash-servers').textContent = zoneCounts['servers'] || 0;
+                    document.getElementById('dash-trusted').textContent = zoneCounts['trusted'] || 0;
+
+                    // Render custom groups summary
+                    const customGroups = groups.filter(g => !g.builtin);
+                    const customContainer = document.getElementById('dash-custom-groups');
+                    if (customContainer && customGroups.length > 0) {
+                        customContainer.innerHTML = `
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-bottom:10px;">Custom Groups:</div>
+                            <div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
+                                ${customGroups.map(g => {
+                                    const count = zoneCounts[g.name] || 0;
+                                    return `
+                                        <div style="text-align:center;padding:12px;background:${hexToRgba(g.color, 0.1)};border-radius:8px;">
+                                            <div style="font-size:1.5em;color:${g.color};">${count}</div>
+                                            <div style="color:var(--text-secondary);font-size:0.9em;">${g.icon} ${g.name}</div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        `;
+                    } else if (customContainer) {
+                        customContainer.innerHTML = '';
+                    }
                 }
                 
             } catch (e) {
@@ -4255,81 +4756,148 @@ class Irongate:
                     time.sleep(1)
     
     def _setup_firewall(self):
-        """Configure nftables - POLICY ACCEPT with specific drops"""
+        """Configure nftables - POLICY ACCEPT with specific drops
+        Supports both built-in zones and custom device groups"""
         devices = self.config.get('devices') or []
-        
-        isolated_ips = []
-        servers_ips = []
-        trusted_ips = []
-        
+        custom_groups = self.config.get('custom_groups') or []
+
+        # Build a dictionary of group name -> group config
+        group_configs = {}
+        for g in custom_groups:
+            group_configs[g.get('name', '')] = {
+                'lan_access': g.get('lan_access', 'none'),
+                'can_access_groups': g.get('can_access_groups', [])
+            }
+
+        # Categorize devices by zone/group
+        zone_ips = {}  # zone_name -> list of IPs
         for dev in devices:
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
-                if zone == 'isolated':
-                    isolated_ips.append(ip)
-                elif zone == 'servers':
-                    servers_ips.append(ip)
-                elif zone == 'trusted':
-                    trusted_ips.append(ip)
-        
-        # Use placeholder if empty
-        isolated_set = ', '.join(isolated_ips) if isolated_ips else '0.0.0.0'
-        servers_set = ', '.join(servers_ips) if servers_ips else '0.0.0.0'
-        trusted_set = ', '.join(trusted_ips) if trusted_ips else '0.0.0.0'
-        
-        # CRITICAL: policy accept - only drop specific traffic
-        rules = f"""
-table inet irongate {{
-    set isolated_devices {{
+                if zone not in zone_ips:
+                    zone_ips[zone] = []
+                zone_ips[zone].append(ip)
+
+        # Ensure built-in zones exist even if empty
+        for builtin in ['isolated', 'servers', 'trusted']:
+            if builtin not in zone_ips:
+                zone_ips[builtin] = []
+
+        # Build nftables sets for all zones
+        sets_section = ""
+        for zone_name, ips in zone_ips.items():
+            set_name = f"{zone_name}_devices"
+            ip_list = ', '.join(ips) if ips else '0.0.0.0'
+            sets_section += f"""
+    set {set_name} {{
         type ipv4_addr
-        elements = {{ {isolated_set} }}
+        elements = {{ {ip_list} }}
     }}
-    
-    set servers_devices {{
-        type ipv4_addr
-        elements = {{ {servers_set} }}
-    }}
-    
-    set trusted_devices {{
-        type ipv4_addr
-        elements = {{ {trusted_set} }}
-    }}
-    
-    chain forward {{
+"""
+
+        # Build firewall rules
+        rules_section = """
+    chain forward {
         type filter hook forward priority 0; policy accept;
-        
+
         ct state established,related accept
-        
+
         # === TRUSTED: Full access to everything ===
         ip saddr @trusted_devices accept
         ip daddr @trusted_devices accept
-        
-        # === OUTBOUND: Protected devices cannot reach LAN ===
+"""
+
+        # === BUILT-IN ZONES ===
         # Isolated: block all LAN access
+        rules_section += """
+        # === ISOLATED: Block all LAN access ===
         ip saddr @isolated_devices ip daddr 10.0.0.0/8 drop
         ip saddr @isolated_devices ip daddr 172.16.0.0/12 drop
         ip saddr @isolated_devices ip daddr 192.168.0.0/16 drop
-        
+        ip daddr @isolated_devices ip saddr 10.0.0.0/8 drop
+        ip daddr @isolated_devices ip saddr 172.16.0.0/12 drop
+        ip daddr @isolated_devices ip saddr 192.168.0.0/16 drop
+"""
+
         # Servers: allow inter-server, block other LAN
+        rules_section += """
+        # === SERVERS: Allow inter-server, block other LAN ===
         ip saddr @servers_devices ip daddr @servers_devices accept
         ip saddr @servers_devices ip daddr 10.0.0.0/8 drop
         ip saddr @servers_devices ip daddr 172.16.0.0/12 drop
         ip saddr @servers_devices ip daddr 192.168.0.0/16 drop
-        
-        # === INBOUND: LAN cannot reach protected devices ===
-        # Block LAN trying to reach isolated devices (RDP, SSH, etc)
-        ip daddr @isolated_devices ip saddr 10.0.0.0/8 drop
-        ip daddr @isolated_devices ip saddr 172.16.0.0/12 drop
-        ip daddr @isolated_devices ip saddr 192.168.0.0/16 drop
-        
-        # Block LAN trying to reach servers (except from other servers)
         ip daddr @servers_devices ip saddr @servers_devices accept
         ip daddr @servers_devices ip saddr 10.0.0.0/8 drop
         ip daddr @servers_devices ip saddr 172.16.0.0/12 drop
         ip daddr @servers_devices ip saddr 192.168.0.0/16 drop
-    }}
-}}
+"""
+
+        # === CUSTOM GROUPS ===
+        for group in custom_groups:
+            group_name = group.get('name', '')
+            if not group_name or group_name in ['isolated', 'servers', 'trusted']:
+                continue  # Skip built-ins
+
+            lan_access = group.get('lan_access', 'none')
+            can_access = group.get('can_access_groups', [])
+            set_name = f"{group_name}_devices"
+
+            if lan_access == 'full':
+                # Full access - no restrictions needed
+                rules_section += f"""
+        # === {group_name.upper()}: Full LAN access ===
+        ip saddr @{set_name} accept
+        ip daddr @{set_name} accept
+"""
+            elif lan_access == 'same':
+                # Can only communicate within same group
+                rules_section += f"""
+        # === {group_name.upper()}: Same-group access only ===
+        ip saddr @{set_name} ip daddr @{set_name} accept
+        ip saddr @{set_name} ip daddr 10.0.0.0/8 drop
+        ip saddr @{set_name} ip daddr 172.16.0.0/12 drop
+        ip saddr @{set_name} ip daddr 192.168.0.0/16 drop
+        ip daddr @{set_name} ip saddr @{set_name} accept
+        ip daddr @{set_name} ip saddr 10.0.0.0/8 drop
+        ip daddr @{set_name} ip saddr 172.16.0.0/12 drop
+        ip daddr @{set_name} ip saddr 192.168.0.0/16 drop
+"""
+            elif lan_access == 'selected' and can_access:
+                # Can communicate with selected groups
+                rules_section += f"""
+        # === {group_name.upper()}: Selected group access ===
+"""
+                for target_group in can_access:
+                    target_set = f"{target_group}_devices"
+                    if target_group in zone_ips:
+                        rules_section += f"        ip saddr @{set_name} ip daddr @{target_set} accept\n"
+                        rules_section += f"        ip daddr @{set_name} ip saddr @{target_set} accept\n"
+
+                rules_section += f"""        ip saddr @{set_name} ip daddr 10.0.0.0/8 drop
+        ip saddr @{set_name} ip daddr 172.16.0.0/12 drop
+        ip saddr @{set_name} ip daddr 192.168.0.0/16 drop
+        ip daddr @{set_name} ip saddr 10.0.0.0/8 drop
+        ip daddr @{set_name} ip saddr 172.16.0.0/12 drop
+        ip daddr @{set_name} ip saddr 192.168.0.0/16 drop
+"""
+            else:
+                # No LAN access (default behavior like isolated)
+                rules_section += f"""
+        # === {group_name.upper()}: No LAN access ===
+        ip saddr @{set_name} ip daddr 10.0.0.0/8 drop
+        ip saddr @{set_name} ip daddr 172.16.0.0/12 drop
+        ip saddr @{set_name} ip daddr 192.168.0.0/16 drop
+        ip daddr @{set_name} ip saddr 10.0.0.0/8 drop
+        ip daddr @{set_name} ip saddr 172.16.0.0/12 drop
+        ip daddr @{set_name} ip saddr 192.168.0.0/16 drop
+"""
+
+        rules_section += "    }\n"
+
+        # Combine into full ruleset
+        rules = f"""
+table inet irongate {{{sets_section}{rules_section}}}
 """
         try:
             os.system('nft delete table inet irongate 2>/dev/null')
@@ -4337,7 +4905,9 @@ table inet irongate {{
                 f.write(rules)
             result = os.system('nft -f /tmp/irongate.nft')
             if result == 0:
-                logger.info(f"Firewall: {len(isolated_ips)} isolated, {len(servers_ips)} servers, {len(trusted_ips)} trusted (policy accept)")
+                # Log summary
+                custom_count = len([g for g in custom_groups if g.get('name') not in ['isolated', 'servers', 'trusted']])
+                logger.info(f"Firewall: {len(zone_ips.get('isolated', []))} isolated, {len(zone_ips.get('servers', []))} servers, {len(zone_ips.get('trusted', []))} trusted + {custom_count} custom groups")
             else:
                 logger.error("Failed to apply firewall rules")
         except Exception as e:
