@@ -103,15 +103,22 @@ systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 systemctl restart systemd-journald 2>/dev/null || true
 
 # Stop services during configuration and kill any zombie processes
-# IMPORTANT: Add trap to restart nginx if script fails
+# IMPORTANT: Add trap to restart ALL services if script fails or exits
 cleanup_on_exit() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo -e "${RED}Script failed with exit code $exit_code - restarting services...${NC}"
+        echo -e "${RED}Script exited with code $exit_code - ensuring services are running...${NC}"
     fi
-    # Always ensure nginx and php-fpm are running when script exits
+    # Always ensure critical services are running when script exits
+    echo -e "${YELLOW}Ensuring services are started...${NC}"
+    systemctl start dnsmasq 2>/dev/null || true
     systemctl start nginx 2>/dev/null || true
-    systemctl start php*-fpm 2>/dev/null || true
+    # Find and start php-fpm regardless of version
+    PHP_FPM=$(systemctl list-unit-files | grep -oP 'php[\d.]*-fpm\.service' | head -n1)
+    if [ -n "$PHP_FPM" ]; then
+        systemctl start "$PHP_FPM" 2>/dev/null || true
+    fi
+    systemctl start irongate 2>/dev/null || true
 }
 trap cleanup_on_exit EXIT
 
@@ -3516,15 +3523,13 @@ echo -e "${YELLOW}Setting up service watchdog...${NC}"
 mkdir -p /etc/systemd/system/dnsmasq.service.d
 
 cat > /etc/systemd/system/dnsmasq.service.d/override.conf << EOF
-[Service]
-Restart=on-failure
-RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
 [Unit]
 StartLimitIntervalSec=60
 StartLimitBurst=3
+
+[Service]
+Restart=on-failure
+RestartSec=5
 EOF
 
 #######################################
