@@ -6643,21 +6643,57 @@ fi
 #######################################
 echo -e "${YELLOW}Configuring Nginx...${NC}"
 
-# Detect PHP-FPM socket from PHP version (more reliable than searching for files that may not exist during install)
-# PHP_VERSION was already detected at line ~96
+# Detect PHP-FPM socket - MUST get this right or web UI breaks
+# Method 1: Use PHP_VERSION detected at start of script
 if [ -n "$PHP_VERSION" ]; then
     PHP_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
-else
-    # Fallback: try to find existing socket
-    PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
-    if [ -z "$PHP_SOCK" ]; then
-        PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
-    fi
-    if [ -z "$PHP_SOCK" ]; then
-        # Last resort: derive from php-fpm service
-        PHP_SOCK="/run/php/php-fpm.sock"
+    echo -e "  Method 1: Using PHP_VERSION ($PHP_VERSION)"
+fi
+
+# Method 2: If PHP_VERSION empty, detect from php command now
+if [ -z "$PHP_SOCK" ] || [ ! -S "$PHP_SOCK" ]; then
+    DETECTED_PHP=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+    if [ -n "$DETECTED_PHP" ]; then
+        PHP_SOCK="/run/php/php${DETECTED_PHP}-fpm.sock"
+        echo -e "  Method 2: Detected PHP $DETECTED_PHP"
     fi
 fi
+
+# Method 3: Look for existing socket file (services might be running)
+if [ -z "$PHP_SOCK" ] || [ ! -S "$PHP_SOCK" ]; then
+    FOUND_SOCK=$(find /run/php/ /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+    if [ -n "$FOUND_SOCK" ]; then
+        PHP_SOCK="$FOUND_SOCK"
+        echo -e "  Method 3: Found socket $FOUND_SOCK"
+    fi
+fi
+
+# Method 4: Check what PHP-FPM package is installed
+if [ -z "$PHP_SOCK" ]; then
+    PKG_PHP=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+    if [ -n "$PKG_PHP" ]; then
+        PHP_SOCK="/run/php/php${PKG_PHP}-fpm.sock"
+        echo -e "  Method 4: From package php${PKG_PHP}-fpm"
+    fi
+fi
+
+# Method 5: Last resort - common defaults
+if [ -z "$PHP_SOCK" ]; then
+    for v in 8.3 8.2 8.1 8.0 7.4; do
+        if [ -f "/etc/php/$v/fpm/php-fpm.conf" ]; then
+            PHP_SOCK="/run/php/php${v}-fpm.sock"
+            echo -e "  Method 5: Found config for PHP $v"
+            break
+        fi
+    done
+fi
+
+# Final fallback
+if [ -z "$PHP_SOCK" ]; then
+    PHP_SOCK="/run/php/php-fpm.sock"
+    echo -e "  ${RED}WARNING: Could not detect PHP version, using default${NC}"
+fi
+
 echo -e "PHP-FPM Socket: ${GREEN}$PHP_SOCK${NC}"
 
 cat > /etc/nginx/sites-available/irongate << EOF
@@ -6735,7 +6771,40 @@ echo -e "PHP-FPM Service: ${GREEN}$PHP_FPM_SERVICE${NC}"
 
 systemctl enable dnsmasq nginx $PHP_FPM_SERVICE
 systemctl restart $PHP_FPM_SERVICE
+sleep 1
 systemctl restart nginx
+
+# CRITICAL: Verify web UI is working, fix if not
+echo -e "${YELLOW}Verifying web UI...${NC}"
+sleep 2
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
+
+if [ "$HTTP_CODE" != "200" ]; then
+    echo -e "${RED}Web UI not responding (HTTP $HTTP_CODE), attempting fix...${NC}"
+    
+    # Get PHP version again to be sure
+    FIX_PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+    if [ -z "$FIX_PHP_VER" ]; then
+        FIX_PHP_VER=$(dpkg -l 2>/dev/null | grep -oP 'php\d+\.\d+-fpm' | head -n1 | grep -oP '\d+\.\d+')
+    fi
+    
+    if [ -n "$FIX_PHP_VER" ]; then
+        echo -e "  Fixing nginx config for PHP $FIX_PHP_VER..."
+        sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${FIX_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
+        systemctl restart php${FIX_PHP_VER}-fpm
+        systemctl restart nginx
+        sleep 2
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
+    fi
+fi
+
+if [ "$HTTP_CODE" = "200" ]; then
+    echo -e "${GREEN}  ✓ Web UI is working${NC}"
+else
+    echo -e "${RED}  ✗ Web UI still not responding - check logs:${NC}"
+    echo -e "    journalctl -u nginx -n 10 --no-pager"
+    echo -e "    journalctl -u $PHP_FPM_SERVICE -n 10 --no-pager"
+fi
 
 # Test dnsmasq config before starting
 echo -e "${YELLOW}Validating dnsmasq configuration...${NC}"
@@ -6828,3 +6897,6 @@ echo -e "${GREEN}  SAFE TO RE-RUN: Preserves all settings & data${NC}"
 echo -e "${GREEN}  GitHub: ${IRONGATE_REPO}${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
+
+# Final restart to ensure web UI is online
+systemctl restart nginx 2>/dev/null || true
