@@ -6584,13 +6584,20 @@ fi
 #######################################
 echo -e "${YELLOW}Configuring Nginx...${NC}"
 
-# Detect PHP-FPM socket dynamically
-PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
-if [ -z "$PHP_SOCK" ]; then
-    PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
-fi
-if [ -z "$PHP_SOCK" ]; then
-    PHP_SOCK="/run/php/php-fpm.sock"
+# Detect PHP-FPM socket from PHP version (more reliable than searching for files that may not exist during install)
+# PHP_VERSION was already detected at line ~96
+if [ -n "$PHP_VERSION" ]; then
+    PHP_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+else
+    # Fallback: try to find existing socket
+    PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+    if [ -z "$PHP_SOCK" ]; then
+        PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n1)
+    fi
+    if [ -z "$PHP_SOCK" ]; then
+        # Last resort: derive from php-fpm service
+        PHP_SOCK="/run/php/php-fpm.sock"
+    fi
 fi
 echo -e "PHP-FPM Socket: ${GREEN}$PHP_SOCK${NC}"
 
