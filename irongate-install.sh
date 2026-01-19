@@ -538,7 +538,7 @@ function safeApplyConfig($db) {
     ob_start();
     $result = ['success' => true];
     try {
-        $result = safeApplyConfig($db);
+        $result = applyIrongateConfig($db);
     } catch (Exception $e) {
         $result = ['success' => false, 'error' => $e->getMessage()];
     } catch (Error $e) {
