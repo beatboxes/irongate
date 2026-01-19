@@ -458,6 +458,10 @@ echo -e "${YELLOW}Creating web application...${NC}"
 
 cat > /var/www/irongate/api.php << 'EOPHP'
 <?php
+// Suppress warnings/notices from corrupting JSON output
+error_reporting(0);
+ini_set('display_errors', 0);
+
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
@@ -466,6 +470,12 @@ header('Access-Control-Allow-Headers: Content-Type');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
+
+// Custom error handler to log errors without outputting them
+set_error_handler(function($severity, $message, $file, $line) {
+    error_log("Irongate API Error: $message in $file:$line");
+    return true; // Don't execute PHP's internal error handler
+});
 
 $db = new SQLite3('/var/www/irongate/dhcp.db');
 $action = $_GET['action'] ?? '';
@@ -1237,10 +1247,18 @@ switch ($action) {
             $stmt->bindValue(6, json_encode($data['can_access_groups'] ?? []), SQLITE3_TEXT);
             $result = $stmt->execute();
 
+            $configResult = ['success' => true];
             if ($result) {
-                applyIrongateConfig($db);
+                // Buffer output to prevent PHP warnings from corrupting JSON
+                ob_start();
+                try {
+                    $configResult = applyIrongateConfig($db);
+                } catch (Exception $e) {
+                    $configResult = ['success' => false, 'error' => $e->getMessage()];
+                }
+                ob_end_clean();
             }
-            echo json_encode(['success' => $result ? true : false]);
+            echo json_encode(['success' => $result ? true : false, 'config' => $configResult]);
         } elseif ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
             $id = $_GET['id'] ?? 0;
             $name = $_GET['name'] ?? '';
@@ -1274,8 +1292,15 @@ switch ($action) {
             }
             $result = $stmt->execute();
 
+            $configResult = ['success' => true];
             if ($result) {
-                applyIrongateConfig($db);
+                ob_start();
+                try {
+                    $configResult = applyIrongateConfig($db);
+                } catch (Exception $e) {
+                    $configResult = ['success' => false, 'error' => $e->getMessage()];
+                }
+                ob_end_clean();
             }
             echo json_encode(['success' => $result ? true : false]);
         } else {
@@ -1654,8 +1679,21 @@ function applyIrongateConfig($db) {
     }
 
     // Write config
-    @mkdir('/etc/irongate', 0755, true);
-    file_put_contents('/etc/irongate/config.yaml', $config);
+    @mkdir('/etc/irongate', 0775, true);
+    $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
+    if ($writeResult === false) {
+        // Try to fix permissions and retry
+        @chmod('/etc/irongate', 0775);
+        @chown('/etc/irongate', 'root');
+        @chgrp('/etc/irongate', 'www-data');
+        $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
+        if ($writeResult === false) {
+            return [
+                'success' => false,
+                'error' => 'Failed to write config file - check /etc/irongate permissions'
+            ];
+        }
+    }
     
     // Restart service
     exec('sudo systemctl restart irongate 2>&1', $output, $retval);
