@@ -119,6 +119,10 @@ cleanup_on_exit() {
         sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
     fi
     
+    # CRITICAL: Ensure IronGate is the ONLY enabled nginx site
+    rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+    ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
+    
     # Start services in correct order
     systemctl start dnsmasq 2>/dev/null || true
     [ -n "$TRAP_PHP_VER" ] && systemctl restart php${TRAP_PHP_VER}-fpm 2>/dev/null || true
@@ -6731,8 +6735,18 @@ server {
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+# CRITICAL: Remove ALL other sites and ensure only IronGate is enabled
+rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
+
+# Also remove the default site config entirely to prevent it from ever coming back
+rm -f /etc/nginx/sites-available/default 2>/dev/null || true
+
+# Verify the symlink exists
+if [ ! -L /etc/nginx/sites-enabled/irongate ]; then
+    echo -e "${RED}ERROR: Failed to create nginx symlink!${NC}"
+    ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
+fi
 
 #######################################
 # Configure log rotation
@@ -6755,6 +6769,14 @@ EOF
 # Enable and start services
 #######################################
 echo -e "${YELLOW}Starting services...${NC}"
+
+# Create nginx drop-in to ensure IronGate config is always active
+# This fixes the issue where nginx falls back to default page after crash/reboot
+mkdir -p /etc/systemd/system/nginx.service.d
+cat > /etc/systemd/system/nginx.service.d/irongate.conf << 'DROPINEOF'
+[Service]
+ExecStartPre=/bin/bash -c 'rm -f /etc/nginx/sites-enabled/default 2>/dev/null; ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate 2>/dev/null || true'
+DROPINEOF
 
 systemctl daemon-reload
 
