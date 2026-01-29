@@ -52,7 +52,7 @@ echo "║                                              ║"
 echo "║          🛡️  I R O N G A T E                ║"
 echo "║                                              ║"
 echo "║       Network Isolation System              ║"
-echo "║              ${IRONGATE_COMMIT}                          ║"
+printf "║              %-7s                          ║\n" "${IRONGATE_COMMIT}"
 echo "║                                              ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -386,15 +386,19 @@ EOSQL
 
     # Always fix hostnames with spaces in database (replace space with hyphen)
     echo -e "${YELLOW}  → Sanitizing hostnames in database...${NC}"
-    sqlite3 /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %';"
-    FIXED_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT changes();" 2>/dev/null || echo "0")
+    # Note: UPDATE and SELECT changes() must be in same session to get correct count
+    FIXED_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %'; SELECT changes();" 2>/dev/null || echo "0")
     echo -e "${GREEN}  ✓ Database hostnames sanitized${NC}"
     
     # Verify data wasn't lost
     VERIFY_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
     if [ "$VERIFY_COUNT" != "$DB_RESERVATION_COUNT" ]; then
         echo -e "${RED}WARNING: Reservation count changed! Restoring backup...${NC}"
-        cp /var/www/irongate/dhcp.db.bak.* /var/www/irongate/dhcp.db 2>/dev/null
+        # Get the most recent backup file (sorted by modification time)
+        LATEST_BACKUP=$(ls -t /var/www/irongate/dhcp.db.bak.* 2>/dev/null | head -n1)
+        if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP" ]; then
+            cp "$LATEST_BACKUP" /var/www/irongate/dhcp.db
+        fi
     fi
 else
     echo -e "${YELLOW}Creating new database${NC}"
@@ -2766,9 +2770,6 @@ cat > /var/www/irongate/index.html << 'EOHTML'
         function updateDashboardPool(){
             const start=document.getElementById('set-range-start').value;
             const end=document.getElementById('set-range-end').value;
-            const cidr=document.getElementById('set-cidr').value;
-            const hosts=Math.pow(2,32-parseInt(cidr))-2;
-            document.getElementById('dash-pool').textContent=hosts.toLocaleString();
             document.getElementById('dash-pool-range').textContent=start&&end?`${start} - ${end}`:'Not configured';
         }
         
@@ -6758,7 +6759,7 @@ cat > /etc/logrotate.d/dnsmasq << EOF
     compress
     missingok
     notifempty
-    create 644 root root
+    create 644 dnsmasq adm
     postrotate
         systemctl reload dnsmasq > /dev/null 2>&1 || true
     endscript
