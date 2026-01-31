@@ -216,6 +216,9 @@ log-facility=/var/log/dnsmasq.log
 
 # Static reservations
 conf-dir=/etc/dnsmasq.d/,*.conf
+
+# DHCP grace period notification for IronGate
+dhcp-script=/opt/irongate/dhcp-notify.sh
 EOF
 fi
 
@@ -246,6 +249,61 @@ fi
 
 # Clean up any old backup files in dnsmasq.d that could cause duplicate errors
 rm -f /etc/dnsmasq.d/*.bak.* 2>/dev/null || true
+
+#######################################
+# Create DHCP Grace Period Notification Script
+# This allows new DHCP clients to complete lease negotiation
+# before IronGate ARP enforcement kicks in
+#######################################
+echo -e "${YELLOW}Creating DHCP grace period notification script...${NC}"
+mkdir -p /var/run/irongate
+cat > /opt/irongate/dhcp-notify.sh << 'DHCPNOTIFY'
+#!/bin/bash
+# IronGate DHCP Notification Script
+# Called by dnsmasq when lease events occur
+# Arguments: $1=action (add|del|old), $2=MAC, $3=IP, $4=hostname
+
+ACTION="$1"
+MAC="$2"
+IP="$3"
+HOSTNAME="$4"
+GRACE_FILE="/var/run/irongate/dhcp_grace.list"
+GRACE_SECONDS=30
+
+mkdir -p /var/run/irongate
+
+case "$ACTION" in
+    add|old)
+        # New or renewed lease - add to grace period list
+        EXPIRY=$(($(date +%s) + GRACE_SECONDS))
+        
+        # Remove any existing entry for this MAC
+        if [ -f "$GRACE_FILE" ]; then
+            grep -v "^${MAC}," "$GRACE_FILE" > "${GRACE_FILE}.tmp" 2>/dev/null || true
+            mv "${GRACE_FILE}.tmp" "$GRACE_FILE" 2>/dev/null || true
+        fi
+        
+        # Add new grace period entry
+        echo "${MAC},${IP},${EXPIRY}" >> "$GRACE_FILE"
+        
+        logger -t irongate "DHCP grace period: $MAC ($IP) - ${GRACE_SECONDS}s"
+        ;;
+    del)
+        # Lease released - remove from grace period
+        if [ -f "$GRACE_FILE" ]; then
+            grep -v "^${MAC}," "$GRACE_FILE" > "${GRACE_FILE}.tmp" 2>/dev/null || true
+            mv "${GRACE_FILE}.tmp" "$GRACE_FILE" 2>/dev/null || true
+        fi
+        logger -t irongate "DHCP lease released: $MAC ($IP)"
+        ;;
+esac
+
+exit 0
+DHCPNOTIFY
+
+chmod +x /opt/irongate/dhcp-notify.sh
+chown root:root /opt/irongate/dhcp-notify.sh
+echo -e "${GREEN}  ✓ DHCP grace period script created${NC}"
 
 #######################################
 # Migration from older versions
@@ -4194,6 +4252,11 @@ class Irongate:
         self.blockchain = None
         self.blockchain_enabled = False
         
+        # DHCP grace period tracking - prevents ARP spoofing during DHCP negotiation
+        self.dhcp_grace_file = '/var/run/irongate/dhcp_grace.list'
+        self.dhcp_grace_cache = {}  # MAC -> expiry timestamp
+        self.dhcp_grace_seconds = 30  # Default grace period
+        
     def load_config(self):
         try:
             with open(self.config_path) as f:
@@ -4271,6 +4334,51 @@ class Irongate:
             self.blockchain = None
             self.blockchain_enabled = False
     
+    def _is_in_dhcp_grace_period(self, mac):
+        """Check if a MAC address is in DHCP grace period (recently got a lease).
+        
+        This prevents IronGate from ARP spoofing devices while they're still
+        completing DHCP negotiation, which would prevent them from receiving
+        their DHCPACK response.
+        """
+        mac_lower = mac.lower()
+        now = time.time()
+        
+        # Clean expired entries from cache
+        self.dhcp_grace_cache = {
+            m: exp for m, exp in self.dhcp_grace_cache.items() 
+            if exp > now
+        }
+        
+        # Check cache first
+        if mac_lower in self.dhcp_grace_cache:
+            remaining = int(self.dhcp_grace_cache[mac_lower] - now)
+            logger.debug(f"Grace period active for {mac}: {remaining}s remaining")
+            return True
+        
+        # Reload grace file periodically
+        try:
+            if os.path.exists(self.dhcp_grace_file):
+                with open(self.dhcp_grace_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split(',')
+                        if len(parts) >= 3:
+                            file_mac = parts[0].lower()
+                            try:
+                                expiry = int(parts[2])
+                            except ValueError:
+                                continue
+                            if expiry > now:
+                                self.dhcp_grace_cache[file_mac] = expiry
+                                if file_mac == mac_lower:
+                                    remaining = int(expiry - now)
+                                    logger.info(f"DHCP grace period active for {mac}: {remaining}s remaining")
+                                    return True
+        except Exception as e:
+            logger.debug(f"Grace file read error: {e}")
+        
+        return False
+    
     def _load_lan_devices(self):
         """Load all known LAN devices from dnsmasq leases file (excluding trusted/protected)"""
         new_lan_devices = []
@@ -4295,15 +4403,18 @@ class Irongate:
                             mac = parts[1].lower()
                             ip = parts[2]
                             
-                            # Exclude: protected, trusted, gateway, self
+                            # Exclude: protected, trusted, gateway, self, and devices in DHCP grace period
                             if (ip not in protected_ips and 
                                 mac not in protected_macs and
                                 ip not in trusted_ips and
                                 mac not in trusted_macs and
                                 ip != self.gateway_ip and 
                                 ip != self.local_ip and
-                                mac != local_mac_lower):
+                                mac != local_mac_lower and
+                                not self._is_in_dhcp_grace_period(mac)):
                                 new_lan_devices.append((ip, mac))
+                            elif self._is_in_dhcp_grace_period(mac):
+                                logger.debug(f"Skipping {ip} ({mac}) - in DHCP grace period")
             
             # Deduplicate by IP
             seen_ips = set()
@@ -4594,6 +4705,9 @@ class Irongate:
                     for lan_ip, lan_mac in current_lan_devices:
                         if not self.running:
                             return
+                        # Skip devices in DHCP grace period - let them complete DHCP first
+                        if self._is_in_dhcp_grace_period(lan_mac):
+                            continue
                         self._send_unicast_arp(
                             target_ip=lan_ip,
                             target_mac=lan_mac,
@@ -4673,6 +4787,13 @@ class Irongate:
                     requested_ip = arp.pdst
                     requester_mac = arp.hwsrc.lower()
                     requester_ip = arp.psrc
+                    
+                    # ═══════════════════════════════════════════════════════
+                    # DHCP GRACE PERIOD: Skip devices completing DHCP negotiation
+                    # This prevents blocking DHCPACK responses to new clients
+                    # ═══════════════════════════════════════════════════════
+                    if self._is_in_dhcp_grace_period(requester_mac):
+                        return
                     
                     # ═══════════════════════════════════════════════════════
                     # LAYER 8: Blockchain verification (if enabled)
@@ -6418,12 +6539,15 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
+ExecStartPre=/bin/mkdir -p /var/run/irongate
 ExecStartPre=/bin/sleep 2
+ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
 ExecStop=/bin/kill -9 \$MAINPID
 TimeoutStopSec=3
 Restart=on-failure
 RestartSec=5
+RuntimeDirectory=irongate
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -6883,6 +7007,7 @@ echo -e "  ${GREEN}🔗 DHCP${NC}         - Configure DHCP server settings"
 echo -e "  ${GREEN}📋 Leases${NC}       - View active DHCP leases"
 echo -e "  ${GREEN}📌 Reservations${NC} - Static IP reservations"
 echo -e "  ${GREEN}🛡️ Protection${NC}   - Enable/configure network isolation"
+echo -e "  ${GREEN}⏱️ Grace Period${NC}  - 30s delay for new DHCP clients (automatic)"
 echo -e "  ${GREEN}⬆️ Updates${NC}      - Check for updates, enable auto-update"
 echo ""
 echo -e "${CYAN}ZONES:${NC}"
