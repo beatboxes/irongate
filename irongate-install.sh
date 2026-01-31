@@ -1544,7 +1544,8 @@ switch ($action) {
         $remoteCommit = substr($data['sha'], 0, 7);
         $commitMessage = $data['commit']['message'] ?? '';
         $commitDate = $data['commit']['committer']['date'] ?? '';
-        $updateAvailable = ($currentCommit !== $remoteCommit && $currentCommit !== 'unknown' && $currentCommit !== 'local');
+        // Update available if: commits differ OR current is unknown/local (needs refresh)
+        $updateAvailable = ($currentCommit !== $remoteCommit || $currentCommit === 'unknown' || $currentCommit === 'local');
         
         // Update last check time
         setSetting($db, 'last_update_check', date('Y-m-d H:i:s'));
@@ -6691,23 +6692,41 @@ log "Current: $CURRENT_COMMIT, Remote: $REMOTE_COMMIT"
 # Update last check time
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
-# Compare commits
-if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; then
-    log "Update available! Downloading..."
-    
+# Compare commits - update if different OR if current is unknown/local (fresh install or dev version)
+if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] || [ "$CURRENT_COMMIT" = "unknown" ] || [ "$CURRENT_COMMIT" = "local" ]; then
+    if [ "$CURRENT_COMMIT" = "$REMOTE_COMMIT" ]; then
+        log "Already on latest commit but current state is '$CURRENT_COMMIT', re-running installer..."
+    else
+        log "Update available! Downloading..."
+    fi
+
     # Store the target commit BEFORE running update (in case script fails to set it)
     sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$REMOTE_COMMIT');" 2>/dev/null
     log "Set target commit to $REMOTE_COMMIT"
-    
+
     # Download and run installer
     SCRIPT_PATH="/tmp/irongate-update.sh"
     curl -sf -H "User-Agent: Irongate-Updater" "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
-    
+
     if [ -f "$SCRIPT_PATH" ]; then
         chmod +x "$SCRIPT_PATH"
         log "Running installer..."
         bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
-        log "Update complete!"
+        UPDATE_EXIT_CODE=$?
+        log "Installer finished with exit code: $UPDATE_EXIT_CODE"
+
+        # Restart all irongate services after update
+        log "Restarting services..."
+        systemctl restart irongate 2>/dev/null || log "Note: irongate service not active"
+        systemctl restart nginx 2>/dev/null || log "Warning: Failed to restart nginx"
+
+        # Restart PHP-FPM (detect version)
+        PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+        if [ -n "$PHP_VER" ]; then
+            systemctl restart php${PHP_VER}-fpm 2>/dev/null || log "Warning: Failed to restart PHP-FPM"
+        fi
+
+        log "Update complete! All services restarted."
     else
         log "ERROR: Failed to download update script"
         exit 1
