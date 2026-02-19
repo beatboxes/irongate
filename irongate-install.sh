@@ -99,6 +99,13 @@ echo -e "PHP Version: ${GREEN}$PHP_VERSION${NC}"
 # Enable persistent journaling (logs survive reboots for debugging)
 echo -e "${YELLOW}Enabling persistent journaling...${NC}"
 mkdir -p /var/log/journal
+if [ -f /etc/systemd/journald.conf ]; then
+    if grep -q "^#\?Storage=" /etc/systemd/journald.conf; then
+        sed -i 's/^#\?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
+    else
+        echo "Storage=persistent" >> /etc/systemd/journald.conf
+    fi
+fi
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 systemctl restart systemd-journald 2>/dev/null || true
 
@@ -769,8 +776,11 @@ function generateDnsmasqConfig($db) {
     $config .= "log-facility=/var/log/dnsmasq.log\n\n";
     
     $config .= "# Static reservations\n";
-    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n";
-    
+    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n\n";
+
+    $config .= "# DHCP grace period notification for IronGate\n";
+    $config .= "dhcp-script=/opt/irongate/dhcp-notify.sh\n";
+
     return $config;
 }
 
@@ -4142,6 +4152,8 @@ mkdir -p /etc/systemd/system/dnsmasq.service.d
 
 cat > /etc/systemd/system/dnsmasq.service.d/override.conf << EOF
 [Unit]
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
@@ -6534,16 +6546,16 @@ ln -sf /opt/irongate/irongate-blockchain /usr/local/bin/irongate-blockchain
 cat > /etc/systemd/system/irongate.service << EOF
 [Unit]
 Description=Irongate Network Isolation
-After=network.target dnsmasq.service
-Wants=network.target
+After=network-online.target dnsmasq.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStartPre=/bin/mkdir -p /var/run/irongate
 ExecStartPre=/bin/sleep 2
 ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
-ExecStop=/bin/kill -9 \$MAINPID
-TimeoutStopSec=3
+ExecStop=/bin/kill -SIGTERM \$MAINPID
+TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=irongate
