@@ -99,14 +99,19 @@ echo -e "PHP Version: ${GREEN}$PHP_VERSION${NC}"
 # Enable persistent journaling (logs survive reboots for debugging)
 echo -e "${YELLOW}Enabling persistent journaling...${NC}"
 mkdir -p /var/log/journal
-if [ -f /etc/systemd/journald.conf ]; then
-    if grep -q "^#\?Storage=" /etc/systemd/journald.conf; then
-        sed -i 's/^#\?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
-    else
-        echo "Storage=persistent" >> /etc/systemd/journald.conf
-    fi
-fi
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+# Set journal storage to persistent (Armbian defaults to volatile/RAM-only)
+if grep -q '^Storage=volatile' /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i 's/^Storage=volatile/Storage=persistent/' /etc/systemd/journald.conf
+elif ! grep -q '^Storage=persistent' /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i 's/^#Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
+fi
+# Cap journal size to avoid filling SD card
+if grep -q '^#SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=50M/' /etc/systemd/journald.conf
+elif ! grep -q '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
+    echo "SystemMaxUse=50M" >> /etc/systemd/journald.conf
+fi
 systemctl restart systemd-journald 2>/dev/null || true
 
 # Stop services during configuration and kill any zombie processes
@@ -775,11 +780,11 @@ function generateDnsmasqConfig($db) {
     $config .= "log-dhcp\n";
     $config .= "log-facility=/var/log/dnsmasq.log\n\n";
     
-    $config .= "# Static reservations\n";
-    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n\n";
-
     $config .= "# DHCP grace period notification for IronGate\n";
-    $config .= "dhcp-script=/opt/irongate/dhcp-notify.sh\n";
+    $config .= "dhcp-script=/opt/irongate/dhcp-notify.sh\n\n";
+
+    $config .= "# Static reservations\n";
+    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n";
 
     return $config;
 }
@@ -907,23 +912,7 @@ function getRecentLogs($lines = 100) {
         $debug[] = "File size: $fileSize bytes";
         
         if ($fileSize > 0) {
-            // Try direct read first
-            if (is_readable($logFile)) {
-                $content = @file_get_contents($logFile);
-                if ($content !== false && strlen($content) > 0) {
-                    $allLines = explode("\n", $content);
-                    $allLines = array_filter($allLines, function($l) { return strlen(trim($l)) > 0; });
-                    if (count($allLines) > 0) {
-                        $recentLines = array_slice($allLines, -$lines);
-                        foreach ($recentLines as $line) {
-                            $logs[] = htmlspecialchars(trim($line));
-                        }
-                        return array_reverse($logs);
-                    }
-                }
-            }
-            
-            // Try tail command as fallback
+            // Try tail command first (efficient for large files)
             $tailCmd = "/usr/bin/tail -n $lines " . escapeshellarg($logFile) . " 2>&1";
             $tailOutput = [];
             exec($tailCmd, $tailOutput, $tailRet);
@@ -937,6 +926,22 @@ function getRecentLogs($lines = 100) {
                 }
                 if (count($logs) > 0) {
                     return array_reverse($logs);
+                }
+            }
+
+            // Fall back to direct read
+            if (is_readable($logFile)) {
+                $content = @file_get_contents($logFile);
+                if ($content !== false && strlen($content) > 0) {
+                    $allLines = explode("\n", $content);
+                    $allLines = array_filter($allLines, function($l) { return strlen(trim($l)) > 0; });
+                    if (count($allLines) > 0) {
+                        $recentLines = array_slice($allLines, -$lines);
+                        foreach ($recentLines as $line) {
+                            $logs[] = htmlspecialchars(trim($line));
+                        }
+                        return array_reverse($logs);
+                    }
                 }
             }
         } else {
@@ -1038,10 +1043,15 @@ function getDiagnostics() {
     $diag['interface_exists'] = ($ifaceRetval === 0);
     $diag['interface_status'] = implode("\n", $ifaceOutput);
     
-    // Check file permissions
-    $diag['config_writable'] = is_writable('/etc/dnsmasq.conf');
-    $diag['leases_writable'] = is_writable('/var/lib/dnsmasq/dnsmasq.leases');
-    $diag['log_writable'] = is_writable('/var/log/dnsmasq.log');
+    // Check file permissions (from dnsmasq's perspective, not www-data's)
+    $dnsmasqUser = posix_getpwnam('dnsmasq');
+    $dnsmasqUid = $dnsmasqUser ? $dnsmasqUser['uid'] : null;
+    
+    $leasesStat = @stat('/var/lib/dnsmasq/dnsmasq.leases');
+    $diag['leases_writable'] = $leasesStat && $dnsmasqUid !== null && $leasesStat['uid'] === $dnsmasqUid && ($leasesStat['mode'] & 0200);
+    
+    $logStat = @stat('/var/log/dnsmasq.log');
+    $diag['log_writable'] = $logStat && $dnsmasqUid !== null && $logStat['uid'] === $dnsmasqUid && ($logStat['mode'] & 0200);
     
     // Get recent journal errors
     exec('journalctl -u dnsmasq -p err -n 10 --no-pager 2>&1', $errOutput);
@@ -1075,13 +1085,20 @@ function autoRepair() {
     // Fix common permission issues
     exec('sudo chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>&1');
     exec('sudo chmod 644 /var/lib/dnsmasq/dnsmasq.leases 2>&1');
-    exec('sudo chmod 644 /var/log/dnsmasq.log 2>&1');
+    exec('sudo chmod 664 /var/log/dnsmasq.log 2>&1');
     $repairs[] = 'Fixed file permissions';
     
-    // Kill any zombie dnsmasq processes
-    exec('sudo pkill -9 dnsmasq 2>&1');
-    usleep(500000);
-    $repairs[] = 'Killed stale processes';
+    // Only kill dnsmasq if it is in a failed/stuck state, not if running fine
+    exec('systemctl is-active dnsmasq 2>&1', $activeCheck, $activeRet);
+    if ($activeRet !== 0) {
+        exec('logger -t irongate-autorepair "dnsmasq is-active returned '.$activeRet.', killing stale processes"');
+        exec('sudo pkill -9 dnsmasq 2>&1');
+        usleep(500000);
+        $repairs[] = 'Killed stale dnsmasq processes';
+    } else {
+        exec('logger -t irongate-autorepair "dnsmasq is-active returned 0, skipping kill"');
+        $repairs[] = 'Service already running, skipped kill';
+    }
     
     // Try to start the service
     exec('sudo systemctl start dnsmasq 2>&1', $output, $retval);
@@ -4160,6 +4177,11 @@ StartLimitBurst=3
 [Service]
 Restart=on-failure
 RestartSec=5
+# Clear resolvconf hooks — dnsmasq runs with port=0 (DNS disabled),
+# and systemd-networkd is disabled, so resolvconf calls always fail
+# with "Unit dbus-org.freedesktop.network1.service not found"
+ExecStartPost=
+ExecStop=
 EOF
 
 #######################################
@@ -4216,8 +4238,18 @@ import yaml
 import time
 import signal
 import logging
+import subprocess
 import threading
 from pathlib import Path
+
+# Import Scapy at module level (avoids per-call import overhead in hot loops)
+SCAPY_AVAILABLE = False
+try:
+    from scapy.all import Ether, ARP, sendp, sniff, srp, conf as scapy_conf
+    scapy_conf.verb = 0
+    SCAPY_AVAILABLE = True
+except ImportError:
+    pass  # Warning logged after logger is initialized
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4268,6 +4300,8 @@ class Irongate:
         self.dhcp_grace_file = '/var/run/irongate/dhcp_grace.list'
         self.dhcp_grace_cache = {}  # MAC -> expiry timestamp
         self.dhcp_grace_seconds = 30  # Default grace period
+        self._dhcp_grace_load_interval = 5  # Seconds between file reloads
+        self._dhcp_grace_last_load = 0  # Timestamp of last file reload
         
     def load_config(self):
         try:
@@ -4346,29 +4380,12 @@ class Irongate:
             self.blockchain = None
             self.blockchain_enabled = False
     
-    def _is_in_dhcp_grace_period(self, mac):
-        """Check if a MAC address is in DHCP grace period (recently got a lease).
-        
-        This prevents IronGate from ARP spoofing devices while they're still
-        completing DHCP negotiation, which would prevent them from receiving
-        their DHCPACK response.
-        """
-        mac_lower = mac.lower()
+    def _reload_dhcp_grace_file(self):
+        """Reload the DHCP grace file from disk (rate-limited by _dhcp_grace_load_interval)."""
         now = time.time()
-        
-        # Clean expired entries from cache
-        self.dhcp_grace_cache = {
-            m: exp for m, exp in self.dhcp_grace_cache.items() 
-            if exp > now
-        }
-        
-        # Check cache first
-        if mac_lower in self.dhcp_grace_cache:
-            remaining = int(self.dhcp_grace_cache[mac_lower] - now)
-            logger.debug(f"Grace period active for {mac}: {remaining}s remaining")
-            return True
-        
-        # Reload grace file periodically
+        if now - self._dhcp_grace_last_load < self._dhcp_grace_load_interval:
+            return
+        self._dhcp_grace_last_load = now
         try:
             if os.path.exists(self.dhcp_grace_file):
                 with open(self.dhcp_grace_file, 'r') as f:
@@ -4382,13 +4399,40 @@ class Irongate:
                                 continue
                             if expiry > now:
                                 self.dhcp_grace_cache[file_mac] = expiry
-                                if file_mac == mac_lower:
-                                    remaining = int(expiry - now)
-                                    logger.info(f"DHCP grace period active for {mac}: {remaining}s remaining")
-                                    return True
         except Exception as e:
             logger.debug(f"Grace file read error: {e}")
-        
+
+    def _is_in_dhcp_grace_period(self, mac):
+        """Check if a MAC address is in DHCP grace period (recently got a lease).
+
+        This prevents IronGate from ARP spoofing devices while they're still
+        completing DHCP negotiation, which would prevent them from receiving
+        their DHCPACK response.
+        """
+        mac_lower = mac.lower()
+        now = time.time()
+
+        # Clean expired entries from cache
+        self.dhcp_grace_cache = {
+            m: exp for m, exp in self.dhcp_grace_cache.items()
+            if exp > now
+        }
+
+        # Check cache first
+        if mac_lower in self.dhcp_grace_cache:
+            remaining = int(self.dhcp_grace_cache[mac_lower] - now)
+            logger.debug(f"Grace period active for {mac}: {remaining}s remaining")
+            return True
+
+        # Reload grace file if interval has elapsed
+        self._reload_dhcp_grace_file()
+
+        # Check cache again after reload
+        if mac_lower in self.dhcp_grace_cache:
+            remaining = int(self.dhcp_grace_cache[mac_lower] - now)
+            logger.info(f"DHCP grace period active for {mac}: {remaining}s remaining")
+            return True
+
         return False
     
     def _load_lan_devices(self):
@@ -4416,17 +4460,19 @@ class Irongate:
                             ip = parts[2]
                             
                             # Exclude: protected, trusted, gateway, self, and devices in DHCP grace period
-                            if (ip not in protected_ips and 
-                                mac not in protected_macs and
-                                ip not in trusted_ips and
-                                mac not in trusted_macs and
-                                ip != self.gateway_ip and 
-                                ip != self.local_ip and
-                                mac != local_mac_lower and
-                                not self._is_in_dhcp_grace_period(mac)):
-                                new_lan_devices.append((ip, mac))
-                            elif self._is_in_dhcp_grace_period(mac):
+                            if (ip in protected_ips or
+                                mac in protected_macs or
+                                ip in trusted_ips or
+                                mac in trusted_macs or
+                                ip == self.gateway_ip or
+                                ip == self.local_ip or
+                                mac == local_mac_lower):
+                                continue
+                            in_grace = self._is_in_dhcp_grace_period(mac)
+                            if in_grace:
                                 logger.debug(f"Skipping {ip} ({mac}) - in DHCP grace period")
+                            else:
+                                new_lan_devices.append((ip, mac))
             
             # Deduplicate by IP
             seen_ips = set()
@@ -4446,13 +4492,15 @@ class Irongate:
     
     def setup_kernel(self):
         """Enable IP forwarding"""
-        os.system('sysctl -w net.ipv4.ip_forward=1 2>/dev/null')
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     def _get_mac(self, ip):
         """Resolve MAC address via ARP request"""
         try:
-            from scapy.all import Ether, ARP, srp, conf
-            conf.verb = 0
+            if not SCAPY_AVAILABLE:
+                logger.error("Scapy not available, cannot resolve MAC")
+                return None
             ans, _ = srp(
                 Ether(dst='ff:ff:ff:ff:ff:ff')/ARP(pdst=ip),
                 timeout=3, verbose=0, iface=self.interface
@@ -4463,19 +4511,20 @@ class Irongate:
             logger.error(f"Failed to resolve MAC for {ip}: {e}")
         return None
     
+    def _build_unicast_arp_packet(self, target_ip, target_mac, spoof_ip):
+        """Build a UNICAST ARP reply packet without sending it."""
+        return Ether(dst=target_mac, src=self.local_mac) / ARP(
+            op=2,
+            pdst=target_ip,
+            hwdst=target_mac,
+            psrc=spoof_ip,
+            hwsrc=self.local_mac
+        )
+
     def _send_unicast_arp(self, target_ip, target_mac, spoof_ip):
         """Send UNICAST ARP reply to specific target only."""
         try:
-            from scapy.all import Ether, ARP, sendp, conf
-            conf.verb = 0
-            
-            pkt = Ether(dst=target_mac, src=self.local_mac) / ARP(
-                op=2,
-                pdst=target_ip,
-                hwdst=target_mac,
-                psrc=spoof_ip,
-                hwsrc=self.local_mac
-            )
+            pkt = self._build_unicast_arp_packet(target_ip, target_mac, spoof_ip)
             sendp(pkt, iface=self.interface, verbose=False)
             return True
         except Exception as e:
@@ -4484,10 +4533,7 @@ class Irongate:
     
     def _restore_arp_tables(self):
         """Restore legitimate ARP mappings on shutdown"""
-        try:
-            from scapy.all import Ether, ARP, sendp, conf
-            conf.verb = 0
-        except ImportError:
+        if not SCAPY_AVAILABLE:
             logger.warning("scapy not available, cannot restore ARP tables")
             return
         
@@ -4597,8 +4643,12 @@ class Irongate:
         
         logger.info("Setting up local static ARP entries...")
         for dev_ip, dev_mac, zone in self.protected_devices:
-            os.system(f"ip neigh replace {dev_ip} lladdr {dev_mac} dev {self.interface} nud permanent 2>/dev/null")
-        os.system(f"ip neigh replace {self.gateway_ip} lladdr {self.gateway_mac} dev {self.interface} nud permanent 2>/dev/null")
+            subprocess.run(['ip', 'neigh', 'replace', dev_ip, 'lladdr', dev_mac,
+                           'dev', self.interface, 'nud', 'permanent'],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['ip', 'neigh', 'replace', self.gateway_ip, 'lladdr', self.gateway_mac,
+                       'dev', self.interface, 'nud', 'permanent'],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # Layer: Firewall (nftables zone-based rules)
         if self.layer_firewall:
@@ -4687,60 +4737,63 @@ class Irongate:
             try:
                 # Get current snapshot of lan_devices to avoid race condition
                 current_lan_devices = list(self.lan_devices)
-                
-                # Rate limiting: add micro-delay for large networks
-                # This prevents flooding the network with ARP packets
-                packet_delay = 0
-                total_packets = len(self.protected_devices) * (1 + len(current_lan_devices))
-                if total_packets > 500:
-                    packet_delay = 0.002  # 2ms delay = ~500 packets/sec max
-                elif total_packets > 200:
-                    packet_delay = 0.001  # 1ms delay
-                
+
+                # Pre-filter DHCP grace MACs once per cycle (not per packet)
+                grace_macs = set()
+                for lan_ip, lan_mac in current_lan_devices:
+                    if self._is_in_dhcp_grace_period(lan_mac):
+                        grace_macs.add(lan_mac)
+
+                # Build all packets for this cycle
+                packets = []
+
                 for dev_ip, dev_mac, zone in self.protected_devices:
                     if not self.running:
                         return
-                    
+
                     # Tell protected device: "Gateway is at Irongate's MAC"
                     # This routes their outbound traffic through Irongate
-                    self._send_unicast_arp(
+                    packets.append(self._build_unicast_arp_packet(
                         target_ip=dev_ip,
                         target_mac=dev_mac,
                         spoof_ip=self.gateway_ip
-                    )
-                    
+                    ))
+
                     # DO NOT tell gateway about protected devices
                     # Firewalla needs to see real MACs to route traffic properly
-                    
+
                     # Tell ALL LAN devices: "Protected device is at Irongate's MAC"
                     # This intercepts any LAN device trying to reach protected servers
                     for lan_ip, lan_mac in current_lan_devices:
                         if not self.running:
                             return
                         # Skip devices in DHCP grace period - let them complete DHCP first
-                        if self._is_in_dhcp_grace_period(lan_mac):
+                        if lan_mac in grace_macs:
                             continue
-                        self._send_unicast_arp(
+                        packets.append(self._build_unicast_arp_packet(
                             target_ip=lan_ip,
                             target_mac=lan_mac,
                             spoof_ip=dev_ip
-                        )
-                        if packet_delay:
-                            time.sleep(packet_delay)
-                
+                        ))
+
+                # Send packets in chunks of 256 (single socket session per chunk)
+                chunk_size = 256
+                for i in range(0, len(packets), chunk_size):
+                    if not self.running:
+                        return
+                    chunk = packets[i:i + chunk_size]
+                    sendp(chunk, iface=self.interface, verbose=False)
+
                 # More aggressive poisoning interval for better protection
                 time.sleep(0.3)
-                
+
             except Exception as e:
                 logger.error(f"ARP spoof error: {e}")
                 time.sleep(5)
     
     def _arp_defense_loop(self):
         """Monitor ARP and counter protected devices announcing real MACs"""
-        try:
-            from scapy.all import Ether, ARP, sniff, sendp, conf
-            conf.verb = 0
-        except ImportError:
+        if not SCAPY_AVAILABLE:
             logger.warning("scapy not available for ARP defense")
             return
         
@@ -4868,8 +4921,7 @@ class Irongate:
                                 op=2, pdst=requester_ip, hwdst=requester_mac,
                                 psrc=requested_ip, hwsrc=self.local_mac
                             )
-                            for _ in range(5):
-                                sendp(reply, iface=self.interface, verbose=False)
+                            sendp(reply, iface=self.interface, verbose=False, count=5)
                             return
                         
                         # verification['verified'] is None = blockchain unavailable
@@ -4897,8 +4949,7 @@ class Irongate:
                             psrc=requested_ip, hwsrc=self.local_mac
                         )
                         # Burst of 5 packets to overwhelm real reply
-                        for _ in range(5):
-                            sendp(reply, iface=self.interface, verbose=False)
+                        sendp(reply, iface=self.interface, verbose=False, count=5)
                 
                 # Handle ARP Replies: "X is at MAC Y"
                 elif arp.op == 2:
@@ -4923,8 +4974,7 @@ class Irongate:
                             psrc=sender_ip, hwsrc=self.local_mac
                         )
                         # Burst of 5 packets to override the real MAC in ARP cache
-                        for _ in range(5):
-                            sendp(counter, iface=self.interface, verbose=False)
+                        sendp(counter, iface=self.interface, verbose=False, count=5)
                             
             except Exception:
                 pass
@@ -4941,7 +4991,7 @@ class Irongate:
             try:
                 # Long timeout with stop_filter - keeps promiscuous mode stable
                 sniff(iface=self.interface, filter="arp", prn=handle_arp,
-                      store=False, timeout=30, stop_filter=should_stop)
+                      store=False, timeout=300, stop_filter=should_stop)
             except Exception as e:
                 if self.running:
                     logger.debug(f"Sniff restart: {e}")
@@ -5338,6 +5388,9 @@ class IrongateBlockchain:
         self.allow_rogue_devices = self.config.get('allow_rogue_devices', False)
         self._cache = {}
         self._cache_time = {}
+        self._global_state_cache = None  # Cached global state list
+        self._global_state_cache_time = 0  # Timestamp of last global state fetch
+        self._global_state_cache_ttl = 15  # Seconds to cache global state
         self._admin_key = None
         self._admin_address = None
         
@@ -5410,6 +5463,16 @@ class IrongateBlockchain:
         self._cache[mac] = data
         self._cache_time[mac] = time.time()
     
+    def _get_global_state(self) -> List:
+        """Get application global state, with 15s TTL caching."""
+        now = time.time()
+        if self._global_state_cache is not None and (now - self._global_state_cache_time) < self._global_state_cache_ttl:
+            return self._global_state_cache
+        app_info = self.algod_client.application_info(self.app_id)
+        self._global_state_cache = app_info.get('params', {}).get('global-state', [])
+        self._global_state_cache_time = now
+        return self._global_state_cache
+
     def _parse_device_value(self, value_bytes: bytes) -> Optional[Dict]:
         """Parse device data from blockchain storage format"""
         try:
@@ -5462,6 +5525,17 @@ class IrongateBlockchain:
         # Check cache first (fast path)
         cached = self._get_cached(mac)
         if cached:
+            # Negative cache hit - device was previously not found
+            if cached.get('_not_registered'):
+                return {
+                    'verified': False,
+                    'result': VerificationResult.NOT_REGISTERED,
+                    'mac': mac,
+                    'ip': ip,
+                    'trust_score': 0,
+                    'cached': True,
+                    'details': f"Device {mac} not registered on blockchain (cached)"
+                }
             if cached.get('ip') == ip:
                 return {
                     'verified': True,
@@ -5483,11 +5557,10 @@ class IrongateBlockchain:
                     'cached': True,
                     'details': f"ALERT: MAC {mac} registered with IP {cached.get('ip')}, seen at {ip}"
                 }
-        
-        # Query blockchain
+
+        # Query blockchain (uses cached global state with 15s TTL)
         try:
-            app_info = self.algod_client.application_info(self.app_id)
-            global_state = app_info.get('params', {}).get('global-state', [])
+            global_state = self._get_global_state()
             
             for item in global_state:
                 # Decode key (MAC address)
@@ -5532,7 +5605,8 @@ class IrongateBlockchain:
                                     'details': f"SPOOFING DETECTED: {mac} should be at {device['ip']}"
                                 }
             
-            # Device not found in registry
+            # Device not found in registry - cache the negative result
+            self._set_cached(mac, {'_not_registered': True})
             return {
                 'verified': False,
                 'result': VerificationResult.NOT_REGISTERED,
@@ -5742,11 +5816,10 @@ class IrongateBlockchain:
         """Get all registered devices from blockchain"""
         if not self.enabled:
             return []
-        
+
         devices = []
         try:
-            app_info = self.algod_client.application_info(self.app_id)
-            global_state = app_info.get('params', {}).get('global-state', [])
+            global_state = self._get_global_state()
             
             for item in global_state:
                 try:
@@ -6554,7 +6627,7 @@ Type=simple
 ExecStartPre=/bin/mkdir -p /var/run/irongate
 ExecStartPre=/bin/sleep 2
 ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
-ExecStop=/bin/kill -SIGTERM \$MAINPID
+ExecStop=/bin/kill -15 \$MAINPID
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
