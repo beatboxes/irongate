@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+Irongate Blockchain CLI - Manage Layer 8 device registry
+
+Usage:
+    irongate-blockchain status          Show blockchain status
+    irongate-blockchain list            List all registered devices  
+    irongate-blockchain register        Register a device
+    irongate-blockchain revoke <mac>    Revoke a device
+    irongate-blockchain verify <mac> <ip>  Verify a device
+    irongate-blockchain sync            Sync devices from config to blockchain
+"""
+
+import sys
+import os
+import yaml
+import argparse
+
+# Add irongate path
+sys.path.insert(0, '/opt/irongate')
+
+def load_config():
+    """Load Irongate config"""
+    try:
+        with open('/etc/irongate/config.yaml') as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        sys.exit(1)
+
+def get_blockchain():
+    """Get blockchain instance"""
+    try:
+        from blockchain import IrongateBlockchain, MIDNIGHT_AVAILABLE
+        if not MIDNIGHT_AVAILABLE:
+            print("Midnight blockchain support unavailable!")
+            sys.exit(1)
+        
+        config = load_config()
+        bc_config = config.get('blockchain', {})
+        return IrongateBlockchain(bc_config)
+    except ImportError as e:
+        print(f"Failed to import blockchain module: {e}")
+        sys.exit(1)
+
+def cmd_status(args):
+    """Show blockchain status"""
+    bc = get_blockchain()
+    stats = bc.get_stats()
+    
+    print("=" * 50)
+    print("IRONGATE LAYER 8 BLOCKCHAIN STATUS")
+    print("=" * 50)
+    
+    print(f"\nSDK Available: {'✓ Yes' if stats.get('sdk_available') else '✗ No'}")
+    print(f"Enabled: {'✓ Yes' if stats.get('enabled') else '✗ No'}")
+    print(f"Network: {stats.get('network', 'N/A')}")
+    print(f"Contract: {stats.get('contract_address', 'Not configured')}")
+    print(f"Indexer: {stats.get('indexer_url', 'N/A')}")
+    print(f"Chain Height: {stats.get('chain_height', 'N/A')}")
+    print(f"Write Support: {'✓ Yes' if stats.get('write_supported') else '✗ No'}")
+    
+    if stats.get('enabled'):
+        print(f"Connected: {'✓ Yes' if stats.get('connected') else '✗ No'}")
+        if stats.get('network_round'):
+            print(f"Network Round: {stats.get('network_round')}")
+        print(f"Cache Size: {stats.get('cache_size')} devices")
+        print(f"Cache TTL: {stats.get('cache_ttl')}s")
+        print(f"Audit Logging: {'✓ On' if stats.get('audit_logging') else '✗ Off'}")
+        print(f"Rogue Devices: {'✓ Allowed (Public WiFi Mode)' if stats.get('allow_rogue_devices') else '✗ Blocked (Strict Mode)'}")
+
+def cmd_list(args):
+    """List all registered devices"""
+    bc = get_blockchain()
+    
+    if not bc.enabled:
+        print("Blockchain not enabled. Configure in /etc/irongate/config.yaml")
+        return
+    
+    devices = bc.get_all_devices()
+    
+    print("=" * 70)
+    print("BLOCKCHAIN REGISTERED DEVICES")
+    print("=" * 70)
+    
+    if not devices:
+        print("\nNo devices registered on blockchain.")
+        return
+    
+    print(f"\n{'MAC':<20} {'IP':<16} {'Zone':<12} {'Hostname':<20}")
+    print("-" * 70)
+    
+    for dev in devices:
+        print(f"{dev.mac:<20} {dev.ip:<16} {dev.zone:<12} {dev.hostname:<20}")
+    
+    print(f"\nTotal: {len(devices)} devices")
+
+def cmd_register(args):
+    """Register a device on blockchain"""
+    bc = get_blockchain()
+    
+    if not bc.enabled:
+        print("Blockchain not enabled.")
+        return
+    
+    if not bc._admin_key:
+        print("Admin mnemonic not configured in config.yaml")
+        return
+    
+    # Get device info
+    mac = args.mac or input("MAC address: ").strip()
+    ip = args.ip or input("IP address: ").strip()
+    zone = args.zone or input("Zone (isolated/servers/trusted): ").strip() or "isolated"
+    hostname = args.hostname or input("Hostname: ").strip() or "device"
+    
+    print(f"\nRegistering device:")
+    print(f"  MAC: {mac}")
+    print(f"  IP: {ip}")
+    print(f"  Zone: {zone}")
+    print(f"  Hostname: {hostname}")
+    
+    confirm = input("\nConfirm? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    
+    result = bc.register_device(mac, ip, zone, hostname)
+    
+    if result.get('success'):
+        print(f"\n✓ Device registered successfully!")
+        print(f"  Transaction: {result.get('tx_id')}")
+        print(f"  Explorer: {result.get('explorer_url')}")
+    else:
+        print(f"\n✗ Registration failed: {result.get('error')}")
+
+def cmd_revoke(args):
+    """Revoke a device from blockchain"""
+    bc = get_blockchain()
+    
+    if not bc.enabled:
+        print("Blockchain not enabled.")
+        return
+    
+    if not bc._admin_key:
+        print("Admin mnemonic not configured.")
+        return
+    
+    mac = args.mac
+    
+    confirm = input(f"Revoke device {mac}? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    
+    result = bc.revoke_device(mac)
+    
+    if result.get('success'):
+        print(f"\n✓ Device revoked!")
+        print(f"  Transaction: {result.get('tx_id')}")
+    else:
+        print(f"\n✗ Revocation failed: {result.get('error')}")
+
+def cmd_verify(args):
+    """Verify a device against blockchain"""
+    bc = get_blockchain()
+    
+    if not bc.enabled:
+        print("Blockchain not enabled.")
+        return
+    
+    result = bc.verify_device(args.mac, args.ip)
+    
+    print("=" * 50)
+    print("DEVICE VERIFICATION RESULT")
+    print("=" * 50)
+    
+    print(f"\nMAC: {args.mac}")
+    print(f"IP: {args.ip}")
+    print(f"\nVerified: {'✓ YES' if result.get('verified') else '✗ NO'}")
+    print(f"Result: {result.get('result')}")
+    print(f"Trust Score: {result.get('trust_score', 0)}/100")
+    
+    if result.get('zone'):
+        print(f"Zone: {result.get('zone')}")
+    if result.get('hostname'):
+        print(f"Hostname: {result.get('hostname')}")
+    if result.get('details'):
+        print(f"Details: {result.get('details')}")
+
+def cmd_sync(args):
+    """Sync devices from config to blockchain"""
+    bc = get_blockchain()
+    config = load_config()
+    
+    if not bc.enabled:
+        print("Blockchain not enabled.")
+        return
+    
+    if not bc._admin_key:
+        print("Admin mnemonic not configured.")
+        return
+    
+    devices = config.get('devices', [])
+    if not devices:
+        print("No devices in config to sync.")
+        return
+    
+    print(f"Syncing {len(devices)} devices to blockchain...")
+    
+    success = 0
+    failed = 0
+    
+    for dev in devices:
+        mac = dev.get('mac', '').lower()
+        ip = dev.get('ip', '')
+        zone = dev.get('zone', 'isolated')
+        hostname = dev.get('hostname', 'device')
+        
+        if not mac or not ip:
+            continue
+        
+        # Check if already registered
+        existing = bc.verify_device(mac, ip)
+        if existing.get('verified'):
+            print(f"  ✓ {mac} already registered")
+            success += 1
+            continue
+        
+        result = bc.register_device(mac, ip, zone, hostname)
+        if result.get('success'):
+            print(f"  ✓ Registered {mac} ({ip})")
+            success += 1
+        else:
+            print(f"  ✗ Failed {mac}: {result.get('error')}")
+            failed += 1
+    
+    print(f"\nSync complete: {success} success, {failed} failed")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Irongate Layer 8 Blockchain Management',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    irongate-blockchain status
+    irongate-blockchain list
+    irongate-blockchain register --mac aa:bb:cc:dd:ee:ff --ip 192.168.1.100 --zone servers
+    irongate-blockchain revoke aa:bb:cc:dd:ee:ff
+    irongate-blockchain verify aa:bb:cc:dd:ee:ff 192.168.1.100
+    irongate-blockchain sync
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # status
+    subparsers.add_parser('status', help='Show blockchain status')
+    
+    # list
+    subparsers.add_parser('list', help='List registered devices')
+    
+    # register
+    reg_parser = subparsers.add_parser('register', help='Register a device')
+    reg_parser.add_argument('--mac', help='MAC address')
+    reg_parser.add_argument('--ip', help='IP address')
+    reg_parser.add_argument('--zone', help='Zone (isolated/servers/trusted)')
+    reg_parser.add_argument('--hostname', help='Hostname')
+    
+    # revoke
+    rev_parser = subparsers.add_parser('revoke', help='Revoke a device')
+    rev_parser.add_argument('mac', help='MAC address to revoke')
+    
+    # verify
+    ver_parser = subparsers.add_parser('verify', help='Verify a device')
+    ver_parser.add_argument('mac', help='MAC address')
+    ver_parser.add_argument('ip', help='IP address')
+    
+    # sync
+    subparsers.add_parser('sync', help='Sync config devices to blockchain')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    commands = {
+        'status': cmd_status,
+        'list': cmd_list,
+        'register': cmd_register,
+        'revoke': cmd_revoke,
+        'verify': cmd_verify,
+        'sync': cmd_sync,
+    }
+    
+    try:
+        commands[args.command](args)
+    except NotImplementedError as exc:
+        print("\nThis command is not available:\n  %s" % exc)
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()

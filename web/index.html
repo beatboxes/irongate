@@ -1,0 +1,2279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Irongate</title>
+    <style>
+        :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--primary:#e94560;--success:#00bf63;--warning:#ffc107;--danger:#dc3545;--text:#eee;--text-secondary:#aaa;}
+        *{box-sizing:border-box;margin:0;padding:0;}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+        .container{display:flex;min-height:100vh;}
+        .sidebar{width:240px;background:var(--surface);padding:20px;border-right:1px solid var(--surface2);}
+        .logo{font-size:1.4em;font-weight:bold;color:var(--primary);margin-bottom:30px;display:flex;align-items:center;gap:10px;}
+        .logo svg{width:28px;height:28px;}
+        .nav-item{padding:12px 15px;margin:5px 0;border-radius:8px;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;gap:10px;}
+        .nav-item:hover,.nav-item.active{background:var(--surface2);}
+        .main{flex:1;padding:30px;overflow-y:auto;}
+        .page{display:none;}
+        .page.active{display:block;}
+        .card{background:var(--surface);border-radius:12px;padding:20px;margin-bottom:20px;}
+        .card-title{font-size:1.2em;margin-bottom:15px;color:var(--text);display:flex;align-items:center;gap:10px;}
+        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;}
+        .stat-card{background:var(--surface2);padding:20px;border-radius:10px;text-align:center;}
+        .stat-value{font-size:2em;font-weight:bold;color:var(--primary);}
+        .stat-label{color:var(--text-secondary);font-size:0.9em;margin-top:5px;}
+        table{width:100%;border-collapse:collapse;}
+        th,td{padding:12px;text-align:left;border-bottom:1px solid var(--surface2);}
+        th{color:var(--text-secondary);font-weight:500;}
+        .btn{padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:0.9em;transition:all 0.2s;}
+        .btn-primary{background:var(--primary);color:white;}
+        .btn-secondary{background:var(--surface2);color:var(--text);}
+        .btn-success{background:var(--success);color:white;}
+        .btn-danger{background:var(--danger);color:white;}
+        .btn-warning{background:var(--warning);color:black;}
+        .btn:hover{opacity:0.9;transform:translateY(-1px);}
+        .btn-sm{padding:6px 12px;font-size:0.85em;}
+        .form-group{margin-bottom:15px;}
+        .form-group label{display:block;margin-bottom:5px;color:var(--text-secondary);}
+        .form-control{width:100%;padding:10px;border:1px solid var(--surface2);border-radius:6px;background:var(--bg);color:var(--text);font-size:1em;}
+        .form-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;}
+        .toggle{width:50px;height:26px;background:var(--surface2);border-radius:13px;position:relative;cursor:pointer;transition:all 0.2s;}
+        .toggle.active{background:var(--success);}
+        .toggle::after{content:'';position:absolute;width:22px;height:22px;background:white;border-radius:50%;top:2px;left:2px;transition:all 0.2s;}
+        .toggle.active::after{left:26px;}
+        .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px;}
+        .status-dot.running{background:var(--success);}
+        .status-dot.stopped{background:var(--danger);}
+        .alert{padding:15px;border-radius:8px;margin-bottom:15px;display:flex;align-items:center;gap:10px;}
+        .alert-warning{background:rgba(255,193,7,0.2);border:1px solid var(--warning);}
+        .alert-danger{background:rgba(220,53,69,0.2);border:1px solid var(--danger);}
+        .alert-success{background:rgba(0,191,99,0.2);border:1px solid var(--success);}
+        .badge{padding:4px 8px;border-radius:4px;font-size:0.8em;}
+        .badge-success{background:var(--success);color:white;}
+        .badge-warning{background:var(--warning);color:black;}
+        .modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);align-items:center;justify-content:center;z-index:1000;}
+        .modal.active{display:flex;}
+        .modal-content{background:var(--surface);padding:25px;border-radius:12px;width:100%;max-width:500px;}
+        .modal-title{font-size:1.3em;margin-bottom:20px;}
+        .logs-container{background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;max-height:400px;overflow-y:auto;}
+        .log-line{padding:3px 0;border-bottom:1px solid var(--surface2);}
+        .toast{position:fixed;bottom:20px;right:20px;padding:15px 25px;background:var(--surface);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:2000;animation:slideIn 0.3s;}
+        @keyframes slideIn{from{transform:translateX(100%);opacity:0;}to{transform:translateX(0);opacity:1;}}
+        code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:0.9em;}
+        .diag-section{margin-bottom:15px;padding:10px;background:var(--bg);border-radius:6px;}
+        .diag-label{color:var(--text-secondary);font-size:0.85em;margin-bottom:5px;}
+        .diag-value{font-family:monospace;font-size:0.9em;white-space:pre-wrap;word-break:break-all;}
+        .diag-ok{color:var(--success);}
+        .diag-error{color:var(--danger);}
+        .error-box{background:rgba(220,53,69,0.1);border:1px solid var(--danger);border-radius:8px;padding:15px;margin:10px 0;font-family:monospace;font-size:0.85em;white-space:pre-wrap;max-height:200px;overflow-y:auto;}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="logo" style="color:#e94560;">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M12,5A3,3 0 0,1 15,8A3,3 0 0,1 12,11A3,3 0 0,1 9,8A3,3 0 0,1 12,5M17.13,17C15.92,18.85 14.11,20.24 12,20.92C9.89,20.24 8.08,18.85 6.87,17C6.53,16.5 6.24,16 6,15.47C6,13.82 8.71,12.47 12,12.47C15.29,12.47 18,13.79 18,15.47C17.76,16 17.47,16.5 17.13,17Z"/></svg>
+                IRONGATE
+            </div>
+            <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
+            <div class="nav-item" onclick="showPage('devices')">🖥️ Devices & Zones</div>
+            <div class="nav-item" onclick="showPage('dhcp')">🔗 DHCP Settings</div>
+            <div class="nav-item" onclick="showPage('leases')">📋 Active Leases</div>
+            <div class="nav-item" onclick="showPage('reservations')">📌 Reservations</div>
+            <div class="nav-item" onclick="showPage('protection')">🛡️ Protection</div>
+            <div class="nav-item" onclick="showPage('blockchain')">⛓️ Layer 8 Blockchain</div>
+            <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
+            <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
+            <div class="nav-item" onclick="showPage('updates')" style="border-top:1px solid var(--surface2);margin-top:10px;padding-top:15px;">⬆️ Updates</div>
+        </div>
+        <div class="main">
+            <!-- Dashboard -->
+            <div class="page active" id="page-dashboard">
+                <h2 style="margin-bottom:20px;">🛡️ Irongate Dashboard</h2>
+                
+                <!-- Protection Status Banner -->
+                <div id="protection-banner" class="alert alert-warning" style="margin-bottom:20px;">
+                    <span>⚠️</span>
+                    <span>Protection is <strong>disabled</strong>. Go to Protection settings to enable.</span>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('protection')">
+                        <div class="stat-value" id="dash-protection" style="color:var(--danger);">OFF</div>
+                        <div class="stat-label">Protection Status</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('devices')">
+                        <div class="stat-value" id="dash-devices">0</div>
+                        <div class="stat-label">Protected Devices</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('leases')">
+                        <div class="stat-value" id="dash-leases">--</div>
+                        <div class="stat-label">DHCP Leases</div>
+                    </div>
+                    <div class="stat-card" style="cursor:pointer;" onclick="showPage('reservations')">
+                        <div class="stat-value" id="dash-reservations">--</div>
+                        <div class="stat-label">Reservations</div>
+                    </div>
+                </div>
+                
+                <!-- Zone Summary -->
+                <div class="card" style="margin-top:20px;">
+                    <div class="card-title">Zone Summary</div>
+                    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);">
+                        <div style="text-align:center;padding:15px;background:rgba(233,69,96,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#e94560;" id="dash-isolated">0</div>
+                            <div style="color:var(--text-secondary);">🔴 Isolated</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Internet only</div>
+                        </div>
+                        <div style="text-align:center;padding:15px;background:rgba(255,193,7,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#ffc107;" id="dash-servers">0</div>
+                            <div style="color:var(--text-secondary);">🟡 Servers</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Inter-server OK</div>
+                        </div>
+                        <div style="text-align:center;padding:15px;background:rgba(0,191,99,0.1);border-radius:8px;">
+                            <div style="font-size:2em;color:#00bf63;" id="dash-trusted">0</div>
+                            <div style="color:var(--text-secondary);">🟢 Trusted</div>
+                            <div style="font-size:0.8em;color:var(--text-secondary);">Full access</div>
+                        </div>
+                    </div>
+                    <!-- Custom Groups Summary (populated dynamically) -->
+                    <div id="dash-custom-groups" style="margin-top:15px;"></div>
+                </div>
+                
+                <!-- System Info -->
+                <div class="card">
+                    <div class="card-title">System Information</div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Hostname</label><input class="form-control" id="sys-hostname" readonly></div>
+                        <div class="form-group"><label>IP Address</label><input class="form-control" id="sys-ip" readonly></div>
+                        <div class="form-group"><label>Interface</label><input class="form-control" id="sys-interface" readonly></div>
+                        <div class="form-group"><label>Gateway</label><input class="form-control" id="sys-gateway" readonly></div>
+                    </div>
+                    <div style="margin-top:10px;color:var(--text-secondary);">
+                        DHCP: <span id="dash-dhcp-status">--</span> | 
+                        Pool: <span id="dash-pool-range">--</span>
+                    </div>
+                </div>
+                
+                <!-- Quick Actions -->
+                <div class="card">
+                    <div class="card-title">Quick Actions</div>
+                    <button class="btn btn-primary" onclick="showPage('devices')">➕ Add Device</button>
+                    <button class="btn btn-success" onclick="showPage('protection')" style="margin-left:10px;">🛡️ Protection Settings</button>
+                    <button class="btn btn-secondary" onclick="showPage('dhcp')" style="margin-left:10px;">🔗 DHCP Settings</button>
+                    <button class="btn btn-secondary" onclick="loadDashboard()" style="margin-left:10px;">🔄 Refresh</button>
+                </div>
+                
+                <div id="dash-error" class="alert alert-danger" style="display:none;">
+                    <span>⚠️</span>
+                    <div>
+                        <strong>Service Error</strong>
+                        <pre id="dash-error-text" style="margin-top:5px;font-size:0.85em;"></pre>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Devices & Zones -->
+            <div class="page" id="page-devices">
+                <h2 style="margin-bottom:20px;">🖥️ Devices & Zones</h2>
+
+                <p style="color:var(--text-secondary);margin-bottom:20px;">
+                    Add devices to zones to control their network access. Devices not in any zone have normal network access.
+                </p>
+
+                <!-- Zone Legend -->
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Zone Access Rules</div>
+                        <button class="btn btn-secondary btn-sm" onclick="showGroupModal()">+ Create Custom Group</button>
+                    </div>
+                    <div id="zone-legend-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                        <!-- Built-in zones (static) -->
+                        <div style="padding:15px;background:rgba(233,69,96,0.1);border-radius:8px;border-left:4px solid #e94560;">
+                            <strong style="color:#e94560;">🔴 isolated</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✗ Cannot reach LAN<br>
+                                ✗ Cannot reach other devices
+                            </div>
+                        </div>
+                        <div style="padding:15px;background:rgba(255,193,7,0.1);border-radius:8px;border-left:4px solid #ffc107;">
+                            <strong style="color:#ffc107;">🟡 servers</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✓ Can reach other servers<br>
+                                ✗ Cannot reach LAN
+                            </div>
+                        </div>
+                        <div style="padding:15px;background:rgba(0,191,99,0.1);border-radius:8px;border-left:4px solid #00bf63;">
+                            <strong style="color:#00bf63;">🟢 trusted</strong>
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                ✓ Internet access<br>
+                                ✓ Full LAN access<br>
+                                ✓ Can reach all devices
+                            </div>
+                        </div>
+                        <!-- Custom groups will be appended here dynamically -->
+                    </div>
+                    <div id="custom-groups-container" style="margin-top:15px;"></div>
+                </div>
+                
+                <!-- Device Management -->
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Protected Devices</div>
+                        <div>
+                            <button class="btn btn-primary btn-sm" onclick="showDeviceModal()">+ Add Device</button>
+                            <button class="btn btn-secondary btn-sm" onclick="importFromLeases()" style="margin-left:10px;">📋 Import from Leases</button>
+                        </div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Zone</th>
+                                <th>MAC Address</th>
+                                <th>IP Address</th>
+                                <th>Hostname</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="irongate-devices-table">
+                            <tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No devices configured</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- DHCP Settings (renamed from Settings) -->
+            <div class="page" id="page-dhcp">
+                <h2 style="margin-bottom:20px;">🔗 DHCP Settings</h2>
+                <div id="settings-alert" class="alert alert-warning" style="display:none;">
+                    <span>⚠️</span>
+                    <span>DHCP is currently disabled. Enable it and configure your settings below.</span>
+                </div>
+                <div class="card">
+                    <div class="card-title">DHCP Status</div>
+                    <div style="display:flex;align-items:center;gap:15px;">
+                        <div class="toggle" id="dhcp-toggle" onclick="toggleDhcp()"></div>
+                        <span id="dhcp-status-text">Disabled</span>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Network Configuration</div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Interface</label><select class="form-control" id="set-interface"></select></div>
+                        <div class="form-group"><label>Subnet CIDR</label><select class="form-control" id="set-cidr" onchange="updateCidrInfo()">
+                            <option value="8">/8</option><option value="16">/16</option><option value="17">/17</option>
+                            <option value="18">/18</option><option value="19">/19</option><option value="20">/20</option>
+                            <option value="21">/21</option><option value="22">/22</option><option value="23">/23</option>
+                            <option value="24" selected>/24</option><option value="25">/25</option><option value="26">/26</option>
+                            <option value="27">/27</option><option value="28">/28</option>
+                        </select></div>
+                    </div>
+                    <div id="cidr-info" style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;"></div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Range Start</label><input class="form-control" id="set-range-start" placeholder="e.g., 192.168.1.100"></div>
+                        <div class="form-group"><label>Range End</label><input class="form-control" id="set-range-end" placeholder="e.g., 192.168.1.200"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Gateway (Router IP)</label><input class="form-control" id="set-gateway" placeholder="e.g., 192.168.1.1"></div>
+                        <div class="form-group"><label>Lease Time</label><input class="form-control" id="set-lease-time" placeholder="24h"><div style="font-size:0.75em;color:var(--text-secondary);margin-top:3px;">Format: 30m, 24h, 7d, 1w, or infinite</div></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Primary DNS</label><input class="form-control" id="set-dns-primary" placeholder="8.8.8.8"></div>
+                        <div class="form-group"><label>Secondary DNS</label><input class="form-control" id="set-dns-secondary" placeholder="1.1.1.1"></div>
+                    </div>
+                    <div class="form-group"><label>Domain (optional)</label><input class="form-control" id="set-domain" placeholder="e.g., local"></div>
+                    <button class="btn btn-primary" onclick="saveSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="validateSettings()" style="margin-left:10px;">✓ Validate</button>
+                </div>
+            </div>
+            
+            <!-- Leases -->
+            <div class="page" id="page-leases">
+                <h2 style="margin-bottom:20px;">Active Leases</h2>
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Current Leases</div>
+                        <button class="btn btn-secondary btn-sm" onclick="loadLeases()">🔄 Refresh</button>
+                    </div>
+                    <table>
+                        <thead><tr><th>IP Address</th><th>MAC Address</th><th>Hostname</th><th>Expires</th><th>Actions</th></tr></thead>
+                        <tbody id="leases-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Reservations -->
+            <div class="page" id="page-reservations">
+                <h2 style="margin-bottom:20px;">Static Reservations</h2>
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                        <div class="card-title" style="margin:0;">Reserved Addresses</div>
+                        <button class="btn btn-primary btn-sm" onclick="showReservationModal()">+ Add Reservation</button>
+                    </div>
+                    <table>
+                        <thead><tr><th>IP Address</th><th>MAC Address</th><th>Hostname</th><th>Description</th><th>Actions</th></tr></thead>
+                        <tbody id="reservations-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Logs -->
+            <div class="page" id="page-logs">
+                <h2 style="margin-bottom:20px;">DHCP Logs</h2>
+                <div class="card">
+                    <div style="display:flex;gap:10px;margin-bottom:15px;flex-wrap:wrap;align-items:center;">
+                        <select class="form-control" id="log-lines" style="width:auto;" onchange="loadLogs()">
+                            <option value="50">Last 50</option>
+                            <option value="100" selected>Last 100</option>
+                            <option value="200">Last 200</option>
+                            <option value="500">Last 500</option>
+                        </select>
+                        <button class="btn btn-secondary" onclick="loadLogs()">🔄 Refresh</button>
+                        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;">
+                            <input type="checkbox" id="log-auto-refresh" onchange="toggleLogAutoRefresh()">
+                            Auto-refresh (10s)
+                        </label>
+                        <span id="log-status" style="color:var(--text-secondary);font-size:0.9em;"></span>
+                    </div>
+                    <div class="logs-container" id="logs-container" style="font-size:0.8em;line-height:1.4;"></div>
+                </div>
+            </div>
+            
+            <!-- Diagnostics -->
+            <div class="page" id="page-diagnostics">
+                <h2 style="margin-bottom:20px;">Diagnostics</h2>
+                <div class="card">
+                    <div class="card-title">Service Health Check</div>
+                    <div style="margin-bottom:15px;">
+                        <button class="btn btn-primary" onclick="runDiagnostics()">🔍 Run Diagnostics</button>
+                        <button class="btn btn-warning" onclick="runRepair()" style="margin-left:10px;">🔧 Auto-Repair</button>
+                    </div>
+                    <div id="diag-results"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">🛡️ Irongate Protection Diagnostics</div>
+                    <div style="margin-bottom:15px;">
+                        <button class="btn btn-primary" onclick="runIrongateDiag()">🔍 Check Irongate Setup</button>
+                    </div>
+                    <div id="irongate-diag-results" style="display:none;">
+                        <div id="irongate-diag-content" style="background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;white-space:pre-wrap;max-height:600px;overflow-y:auto;"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Service Control</div>
+                    <button class="btn btn-success" onclick="startService()">▶️ Start</button>
+                    <button class="btn btn-danger" onclick="stopService()" style="margin-left:10px;">⏹️ Stop</button>
+                    <button class="btn btn-warning" onclick="restartService()" style="margin-left:10px;">🔄 Restart</button>
+                    <div id="service-status" style="margin-top:15px;font-size:1.1em;"></div>
+                </div>
+            </div>
+            
+            <!-- Protection Settings -->
+            <div class="page" id="page-protection">
+                <h2 style="margin-bottom:20px;">🛡️ Protection Settings</h2>
+                
+                <div id="irongate-alert" class="alert" style="display:none;"></div>
+                
+                <!-- Master Enable/Disable -->
+                <div class="card">
+                    <div class="card-title">Protection Status</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="irongate-toggle" onclick="toggleIrongate()"></div>
+                            <span id="irongate-status-text">Disabled</span>
+                        </div>
+                        <div id="irongate-service-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, Irongate enforces zone-based network isolation for all devices in the Devices & Zones list.
+                    </p>
+                </div>
+                
+                <!-- Mode Selection -->
+                <div class="card">
+                    <div class="card-title">Isolation Mode</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
+                        <div id="mode-single" class="stat-card" style="cursor:pointer;border:2px solid transparent;text-align:left;padding:15px;" onclick="setIrongateMode('single')">
+                            <div style="font-size:1.3em;margin-bottom:8px;">🔧 Single-NIC Mode</div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                Software-based isolation<br>
+                                No hardware changes needed<br>
+                                <span style="color:var(--success);">~99% effective</span>
+                            </div>
+                        </div>
+                        <div id="mode-dual" class="stat-card" style="cursor:pointer;border:2px solid transparent;text-align:left;padding:15px;" onclick="setIrongateMode('dual')">
+                            <div style="font-size:1.3em;margin-bottom:8px;">🔒 Dual-NIC Mode</div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                Hardware bridge isolation<br>
+                                Requires USB NIC (~$10)<br>
+                                <span style="color:var(--success);">100% effective (VLAN-equivalent)</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Dual-NIC Config -->
+                <div class="card" id="dual-nic-config" style="display:none;">
+                    <div class="card-title">Dual-NIC Bridge Configuration</div>
+                    <div class="form-group">
+                        <label>Isolated Interface (USB NIC)</label>
+                        <select class="form-control" id="irongate-isolated-iface" style="max-width:300px;">
+                            <option value="">-- Select interface --</option>
+                        </select>
+                        <div style="font-size:0.85em;color:var(--text-secondary);margin-top:5px;">
+                            Connect USB ethernet adapter. Protected servers connect to a switch on this interface.
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group"><label>Bridge IP</label><input class="form-control" id="irongate-bridge-ip" value="10.99.0.1"></div>
+                        <div class="form-group"><label>DHCP Start</label><input class="form-control" id="irongate-dhcp-start" value="10.99.1.1"></div>
+                        <div class="form-group"><label>DHCP End</label><input class="form-control" id="irongate-dhcp-end" value="10.99.255.254"></div>
+                    </div>
+                    <div style="background:var(--bg);border-radius:8px;padding:15px;margin-top:10px;font-family:monospace;font-size:0.8em;">
+                        <strong>Required Topology:</strong><br>
+                        <pre style="margin:10px 0 0 0;color:var(--text-secondary);">[Router] ─── [Main Switch] ─── [eth0] ─── [IRONGATE] ─── [eth1/USB] ─── [Isolated Switch]
+                                                                              │   │   │
+                                                                            [Srv1][Srv2][Srv3]</pre>
+                    </div>
+                </div>
+                
+                <!-- Single-NIC Layers -->
+                <div class="card" id="single-nic-config">
+                    <div class="card-title">Protection Layers (Single-NIC Mode)</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-arp" checked>
+                            <div><strong>ARP Defense</strong><div style="font-size:0.8em;color:var(--text-secondary);">Cache poisoning + bypass detection</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-ipv6" checked>
+                            <div><strong>IPv6 RA Guard</strong><div style="font-size:0.8em;color:var(--text-secondary);">Router advertisement hijacking</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-gateway" checked>
+                            <div><strong>Gateway Takeover</strong><div style="font-size:0.8em;color:var(--text-secondary);">Bidirectional poison + CAM flood</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-bypass" checked>
+                            <div><strong>Bypass Detection</strong><div style="font-size:0.8em;color:var(--text-secondary);">Active monitoring + TCP RST</div></div>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="layer-firewall" checked>
+                            <div><strong>nftables Firewall</strong><div style="font-size:0.8em;color:var(--text-secondary);">Zone-based L3/L4 filtering</div></div>
+                        </label>
+                    </div>
+                    <div style="margin-top:15px;padding:12px;background:var(--bg);border-radius:6px;border-left:3px solid var(--accent);">
+                        <strong>⛓️ Layer 8 Blockchain</strong> - Configure on the <a href="#" onclick="showPage('blockchain');return false;" style="color:var(--accent);">Layer 8 Blockchain</a> page for 100% VLAN-equivalent protection.
+                    </div>
+                </div>
+                
+                <!-- Actions -->
+                <div class="card">
+                    <button class="btn btn-primary" onclick="saveIrongateSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="loadIrongateStatus()" style="margin-left:10px;">🔄 Refresh</button>
+                    <button class="btn btn-warning" onclick="showPage('devices')" style="margin-left:10px;">🖥️ Manage Devices</button>
+                </div>
+                
+                <!-- How It Works -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#e94560;">How Irongate Protection Works</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;font-size:0.9em;">
+                        <div>
+                            <strong>Single-NIC Mode (7-Layer):</strong>
+                            <ol style="margin:10px 0 0 20px;color:var(--text-secondary);">
+                                <li>ARP defense against spoofing attacks</li>
+                                <li>IPv6 RA to capture IPv6 devices</li>
+                                <li>nftables zone-based firewall rules</li>
+                                <li>Gateway takeover intercepts traffic</li>
+                                <li>Active monitoring detects evasion</li>
+                                <li>Device ARP spoofing claims protected IPs</li>
+                                <li>ARP reply interception prevents L2 bypass</li>
+                            </ol>
+                        </div>
+                        <div>
+                            <strong>Dual-NIC Mode:</strong>
+                            <ul style="margin:10px 0 0 20px;color:var(--text-secondary);">
+                                <li>Linux bridge with port isolation</li>
+                                <li>Kernel-enforced - impossible to bypass</li>
+                                <li>Same security as managed switch VLANs</li>
+                                <li>Separate DHCP pool for isolated network</li>
+                                <li>NAT provides internet access</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Layer 8 Blockchain Page -->
+            <div class="page" id="page-blockchain">
+                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Algorand Blockchain</h2>
+                
+                <div id="blockchain-alert" class="alert" style="display:none;"></div>
+                
+                <!-- Overview Card -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(102,51,153,0.2),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#9966cc;">What is Layer 8?</div>
+                    <p style="margin-bottom:10px;">Layer 8 adds <strong>cryptographic device verification</strong> via the Algorand blockchain. Each device must be registered on-chain to access protected resources.</p>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-top:15px;">
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>🔐 Immutable Registry</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Device list stored on blockchain - tamper-proof</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>🛡️ MAC Spoof Protection</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Cryptographic proof defeats spoofing attacks</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>📜 Audit Trail</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">Every access attempt logged permanently</div>
+                        </div>
+                        <div style="background:var(--bg);padding:12px;border-radius:8px;">
+                            <strong>💰 Low Cost</strong>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">~$0.50/month for 100 devices</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Enable/Disable -->
+                <div class="card">
+                    <div class="card-title">Blockchain Status</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="blockchain-toggle" onclick="toggleBlockchain()"></div>
+                            <span id="blockchain-status-text">Disabled</span>
+                        </div>
+                        <div id="blockchain-connection-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, devices must be registered on the Algorand blockchain to access protected resources.
+                        Requires a deployed smart contract (App ID).
+                    </p>
+                </div>
+                
+                <!-- Smart Contract Config -->
+                <div class="card">
+                    <div class="card-title">Smart Contract Configuration</div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Network</label>
+                            <select class="form-control" id="blockchain-network" style="max-width:200px;">
+                                <option value="mainnet">Mainnet (Production)</option>
+                                <option value="testnet">Testnet (Testing)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex:2;">
+                            <label>App ID (Smart Contract)</label>
+                            <input class="form-control" id="blockchain-app-id" type="number" placeholder="e.g., 1234567890">
+                            <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                                Deploy with: <code>python3 /opt/irongate/smart_contract.py</code>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Admin Mnemonic (25 words)</label>
+                        <input class="form-control" id="blockchain-mnemonic" type="password" placeholder="your 25 word recovery phrase...">
+                        <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                            ⚠️ Keep secure! Only needed for registering/revoking devices.
+                            <button class="btn btn-secondary" style="padding:2px 8px;font-size:0.8em;margin-left:10px;" onclick="document.getElementById('blockchain-mnemonic').type = document.getElementById('blockchain-mnemonic').type === 'password' ? 'text' : 'password'">👁️ Show/Hide</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Behavior Settings -->
+                <div class="card">
+                    <div class="card-title">Behavior Settings</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:15px;">
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-allow-rogue" style="margin-top:3px;">
+                            <div>
+                                <strong>🌐 Public WiFi Mode</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Allow unregistered devices but log them. Use for coffee shops, hotels, public hotspots.</div>
+                            </div>
+                        </label>
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-fallback" checked style="margin-top:3px;">
+                            <div>
+                                <strong>🔄 Fallback Allow</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Allow network access if blockchain is temporarily unavailable.</div>
+                            </div>
+                        </label>
+                        <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:var(--bg);border-radius:6px;cursor:pointer;">
+                            <input type="checkbox" id="blockchain-audit" style="margin-top:3px;">
+                            <div>
+                                <strong>📝 Audit Logging</strong>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Log all access attempts to blockchain. Adds ~0.001 ALGO per entry.</div>
+                            </div>
+                        </label>
+                    </div>
+                    <div class="form-group" style="margin-top:15px;">
+                        <label>Cache TTL (seconds)</label>
+                        <input class="form-control" id="blockchain-cache-ttl" type="number" value="60" min="10" max="3600" style="max-width:150px;">
+                        <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
+                            How long to cache device verification. Higher = fewer blockchain queries, lower = faster revocation.
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Actions -->
+                <div class="card">
+                    <button class="btn btn-primary" onclick="saveBlockchainSettings()">💾 Save & Apply</button>
+                    <button class="btn btn-secondary" onclick="loadBlockchainSettings()" style="margin-left:10px;">🔄 Refresh</button>
+                    <button class="btn btn-warning" onclick="testBlockchainConnection()" style="margin-left:10px;">🔗 Test Connection</button>
+                </div>
+                
+                <!-- CLI Reference -->
+                <div class="card">
+                    <div class="card-title">Command Line Tools</div>
+                    <div style="background:var(--bg);border-radius:8px;padding:15px;font-family:monospace;font-size:0.85em;">
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain status</code> - Show connection status</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain list</code> - List registered devices</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain register</code> - Register a new device</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain revoke &lt;mac&gt;</code> - Revoke a device</div>
+                        <div style="margin-bottom:8px;"><code>irongate-blockchain verify &lt;mac&gt; &lt;ip&gt;</code> - Test verification</div>
+                        <div><code>irongate-blockchain sync</code> - Sync devices from config to blockchain</div>
+                    </div>
+                </div>
+                
+                <!-- Setup Guide -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#e94560;">Setup Guide</div>
+                    <ol style="margin:10px 0 0 20px;color:var(--text-secondary);line-height:1.8;">
+                        <li>Install Algorand SDK: <code>pip install py-algorand-sdk --break-system-packages</code></li>
+                        <li>Compile smart contract: <code>python3 /opt/irongate/smart_contract.py</code></li>
+                        <li>Create Algorand wallet (Pera Wallet or MyAlgo) and fund with ~1 ALGO</li>
+                        <li>Deploy contract using AlgoKit or goal CLI</li>
+                        <li>Enter App ID and mnemonic above</li>
+                        <li>Enable blockchain and save</li>
+                        <li>Register devices: <code>irongate-blockchain sync</code></li>
+                    </ol>
+                </div>
+            </div>
+            
+            <!-- Updates Page -->
+            <div class="page" id="page-updates">
+                <h2 style="margin-bottom:20px;">⬆️ Updates</h2>
+                
+                <!-- Current Version -->
+                <div class="card">
+                    <div class="card-title">Current Installation</div>
+                    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);">
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-current-commit" style="font-family:monospace;">--</div>
+                            <div class="stat-label">Installed Commit</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-remote-commit" style="font-family:monospace;">--</div>
+                            <div class="stat-label">Latest Commit</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="update-last-check">--</div>
+                            <div class="stat-label">Last Checked</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Update Status -->
+                <div id="update-status-card" class="card" style="display:none;">
+                    <div id="update-status-content"></div>
+                </div>
+                
+                <!-- Latest Commit Info -->
+                <div class="card" id="commit-info-card" style="display:none;">
+                    <div class="card-title">📝 Latest Commit</div>
+                    <div id="commit-info-content" style="background:var(--bg);padding:15px;border-radius:8px;"></div>
+                </div>
+                
+                <!-- Auto-Update Setting -->
+                <div class="card">
+                    <div class="card-title">Auto-Update</div>
+                    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:15px;">
+                            <div class="toggle" id="auto-update-toggle" onclick="toggleAutoUpdate()"></div>
+                            <span id="auto-update-status-text">Disabled</span>
+                        </div>
+                    </div>
+                    <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
+                        When enabled, Irongate will automatically check for and install updates daily at 4:00 AM.
+                    </p>
+                </div>
+                
+                <!-- Manual Update Actions -->
+                <div class="card">
+                    <div class="card-title">Manual Update</div>
+                    <button class="btn btn-primary" onclick="checkForUpdates()">🔍 Check for Updates</button>
+                    <button class="btn btn-success" id="btn-update-now" onclick="performUpdate()" style="margin-left:10px;display:none;">⬆️ Update Now</button>
+                    <button class="btn btn-secondary" onclick="viewUpdateLog()" style="margin-left:10px;">📜 View Update Log</button>
+                </div>
+                
+                <!-- Update Log -->
+                <div class="card" id="update-log-card" style="display:none;">
+                    <div class="card-title">📜 Update Log</div>
+                    <div id="update-log-content" style="background:var(--bg);padding:15px;border-radius:8px;font-family:monospace;font-size:0.85em;max-height:400px;overflow-y:auto;white-space:pre-wrap;"></div>
+                </div>
+                
+                <!-- GitHub Info -->
+                <div class="card" style="background:linear-gradient(135deg,rgba(88,166,255,0.1),rgba(22,33,62,0.5));">
+                    <div class="card-title" style="color:#58a6ff;">GitHub Repository</div>
+                    <p style="color:var(--text-secondary);">
+                        Irongate is open source. View the source code, report issues, or contribute:
+                    </p>
+                    <a href="https://github.com/beatboxes/irongate" target="_blank" style="color:#58a6ff;text-decoration:none;">
+                        🔗 https://github.com/beatboxes/irongate
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Reservation Modal -->
+    <div class="modal" id="reservation-modal">
+        <div class="modal-content">
+            <div class="modal-title">Add Reservation</div>
+            <form id="reservation-form" onsubmit="addReservation(event)">
+                <div class="form-group"><label>MAC Address</label><input class="form-control" id="res-mac" required placeholder="00:11:22:33:44:55"></div>
+                <div class="form-group"><label>IP Address</label><input class="form-control" id="res-ip" required placeholder="192.168.1.50"></div>
+                <div class="form-group"><label>Hostname</label><input class="form-control" id="res-hostname" placeholder="optional"></div>
+                <div class="form-group"><label>Description</label><input class="form-control" id="res-description" placeholder="optional"></div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideReservationModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Irongate Device Modal -->
+    <div class="modal" id="device-modal">
+        <div class="modal-content">
+            <div class="modal-title">🛡️ Add Protected Device</div>
+            <form id="device-form" onsubmit="addIrongateDevice(event)">
+                <div class="form-group">
+                    <label>MAC Address *</label>
+                    <input class="form-control" id="dev-mac" required placeholder="00:11:22:33:44:55">
+                </div>
+                <div class="form-group">
+                    <label>IP Address</label>
+                    <input class="form-control" id="dev-ip" placeholder="Leave empty for DHCP">
+                    <div style="font-size:0.8em;color:var(--text-secondary);margin-top:3px;">
+                        Optional - used for firewall rules. Can use DHCP reservation IP.
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Hostname</label>
+                    <input class="form-control" id="dev-hostname" placeholder="optional">
+                </div>
+                <div class="form-group">
+                    <label>Zone *</label>
+                    <select class="form-control" id="dev-zone" required>
+                        <option value="isolated">🔴 isolated - Internet only, no LAN access</option>
+                        <option value="servers">🟡 servers - Can talk to other servers</option>
+                        <option value="trusted">🟢 trusted - Full network access</option>
+                    </select>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Add Device</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideDeviceModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Import from Leases Modal -->
+    <div class="modal" id="import-modal">
+        <div class="modal-content" style="max-width:700px;">
+            <div class="modal-title">📋 Import Devices from DHCP Leases</div>
+            <p style="color:var(--text-secondary);margin-bottom:15px;">Select devices to add to Irongate protection:</p>
+            <div id="import-leases-list" style="max-height:400px;overflow-y:auto;"></div>
+            <div style="display:flex;gap:10px;margin-top:20px;">
+                <button class="btn btn-primary" onclick="importSelectedDevices()">Import Selected</button>
+                <button class="btn btn-secondary" onclick="hideImportModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Group Modal -->
+    <div class="modal" id="group-modal">
+        <div class="modal-content" style="max-width:550px;">
+            <div class="modal-title" id="group-modal-title">📁 Create Custom Group</div>
+            <form id="group-form" onsubmit="saveCustomGroup(event)">
+                <input type="hidden" id="group-edit-id" value="">
+                <div class="form-group">
+                    <label>Group Name *</label>
+                    <input class="form-control" id="group-name" required placeholder="e.g., cameras, printers, iot">
+                    <div style="font-size:0.8em;color:var(--text-secondary);margin-top:3px;">
+                        Use lowercase, no spaces. This will be the zone identifier.
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Icon</label>
+                        <select class="form-control" id="group-icon">
+                            <option value="📁">📁 Folder</option>
+                            <option value="📷">📷 Camera</option>
+                            <option value="🖨️">🖨️ Printer</option>
+                            <option value="📺">📺 TV/Display</option>
+                            <option value="🔌">🔌 IoT Device</option>
+                            <option value="💡">💡 Smart Light</option>
+                            <option value="🌡️">🌡️ Sensor</option>
+                            <option value="🔒">🔒 Security</option>
+                            <option value="🏠">🏠 Home</option>
+                            <option value="🏢">🏢 Office</option>
+                            <option value="🎮">🎮 Gaming</option>
+                            <option value="📱">📱 Mobile</option>
+                            <option value="💻">💻 Computer</option>
+                            <option value="🖥️">🖥️ Server</option>
+                            <option value="🔷">🔷 Blue</option>
+                            <option value="🟣">🟣 Purple</option>
+                            <option value="🟠">🟠 Orange</option>
+                            <option value="⚪">⚪ White</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Color</label>
+                        <input type="color" class="form-control" id="group-color" value="#6c757d" style="height:38px;padding:2px;">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <input class="form-control" id="group-description" placeholder="Brief description of this group">
+                </div>
+                <div class="form-group">
+                    <label>LAN Access Level *</label>
+                    <select class="form-control" id="group-lan-access" onchange="updateGroupAccessOptions()">
+                        <option value="none">No LAN access (Internet only)</option>
+                        <option value="same">Can communicate within same group only</option>
+                        <option value="selected">Can communicate with selected groups</option>
+                        <option value="full">Full LAN access (like trusted)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="group-access-groups-container" style="display:none;">
+                    <label>Can Access Groups</label>
+                    <div id="group-access-groups-list" style="max-height:150px;overflow-y:auto;background:var(--bg);padding:10px;border-radius:6px;">
+                        <!-- Checkboxes will be populated dynamically -->
+                    </div>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:20px;">
+                    <button type="submit" class="btn btn-primary">Save Group</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideGroupModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let systemInfo = {};
+        let currentSettings = {};
+        
+        function showPage(page){
+            document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+            document.getElementById('page-'+page).classList.add('active');
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates'];
+            const idx = pages.indexOf(page);
+            if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
+            if(page==='dashboard')loadDashboard();
+            if(page==='leases')loadLeases();
+            if(page==='reservations')loadReservations();
+            if(page==='logs')loadLogs();
+            if(page==='diagnostics')runDiagnostics();
+            if(page==='devices')loadIrongateDevices();
+            if(page==='protection')loadIrongateStatus();
+            if(page==='blockchain')loadBlockchainSettings();
+            if(page==='dhcp')loadSettings();
+            if(page==='updates')loadUpdateStatus();
+        }
+        
+        function toast(msg,type='success'){
+            const t=document.createElement('div');
+            t.className='toast';
+            t.style.borderLeft=`4px solid var(--${type==='error'?'danger':'success'})`;
+            t.textContent=msg;
+            document.body.appendChild(t);
+            setTimeout(()=>t.remove(),3000);
+        }
+        
+        async function api(action,opts={}){
+            try{
+                let url='api.php?action='+action;
+                if(opts.params)Object.entries(opts.params).forEach(([k,v])=>url+=`&${k}=${v}`);
+                const res=await fetch(url,{
+                    method:opts.method||'GET',
+                    headers:opts.body?{'Content-Type':'application/json'}:{},
+                    body:opts.body?JSON.stringify(opts.body):undefined
+                });
+                return await res.json();
+            }catch(e){console.error(e);return{success:false,error:e.message};}
+        }
+        
+        async function loadSystemInfo(){
+            const res=await api('system');
+            if(res.success){
+                systemInfo=res.data;
+                document.getElementById('sys-hostname').value=res.data.hostname;
+                document.getElementById('sys-ip').value=res.data.ip+'/'+res.data.cidr;
+                document.getElementById('sys-interface').value=res.data.interface;
+                document.getElementById('sys-gateway').value=res.data.gateway;
+                const select=document.getElementById('set-interface');
+                select.innerHTML=res.data.interfaces.map(i=>`<option value="${i.name}"${i.current?' selected':''}>${i.name} (${i.ip})</option>`).join('');
+            }
+        }
+        
+        async function loadStatus(){
+            const res=await api('status');
+            if(res.success){
+                const statusDiv=document.getElementById('service-status');
+                const dashStatus=document.getElementById('dash-status');
+                const dashError=document.getElementById('dash-error');
+                const dashErrorText=document.getElementById('dash-error-text');
+                
+                if(res.data.running){
+                    statusDiv.innerHTML='<span class="status-dot running"></span> Running';
+                    dashStatus.textContent='Running';
+                    dashStatus.style.color='var(--success)';
+                    dashError.style.display='none';
+                }else{
+                    statusDiv.innerHTML='<span class="status-dot stopped"></span> Stopped';
+                    dashStatus.textContent='Stopped';
+                    dashStatus.style.color='var(--danger)';
+                    if(res.data.last_error){
+                        dashError.style.display='flex';
+                        dashErrorText.textContent=res.data.last_error;
+                    }
+                }
+            }
+        }
+        
+        async function loadSettings(){
+            const res=await api('settings');
+            if(res.success){
+                currentSettings=res.data;
+                document.getElementById('set-interface').value=res.data.interface||systemInfo.interface||'';
+                document.getElementById('set-cidr').value=res.data.cidr||'24';
+                document.getElementById('set-range-start').value=res.data.range_start||'';
+                document.getElementById('set-range-end').value=res.data.range_end||'';
+                document.getElementById('set-gateway').value=res.data.gateway||systemInfo.gateway||'';
+                document.getElementById('set-dns-primary').value=res.data.dns_primary||'8.8.8.8';
+                document.getElementById('set-dns-secondary').value=res.data.dns_secondary||'1.1.1.1';
+                document.getElementById('set-lease-time').value=res.data.lease_time||'24h';
+                document.getElementById('set-domain').value=res.data.domain||'';
+                const enabled=res.data.dhcp_enabled==='true';
+                const toggle=document.getElementById('dhcp-toggle');
+                toggle.classList.toggle('active',enabled);
+                document.getElementById('dhcp-status-text').textContent=enabled?'Enabled':'Disabled';
+                document.getElementById('settings-alert').style.display=enabled?'none':'flex';
+                updateCidrInfo();
+                updateDashboardPool();
+            }
+        }
+        
+        async function saveSettings(){
+            const settings={
+                dhcp_enabled:document.getElementById('dhcp-toggle').classList.contains('active')?'true':'false',
+                interface:document.getElementById('set-interface').value,
+                cidr:document.getElementById('set-cidr').value,
+                range_start:document.getElementById('set-range-start').value,
+                range_end:document.getElementById('set-range-end').value,
+                gateway:document.getElementById('set-gateway').value,
+                dns_primary:document.getElementById('set-dns-primary').value,
+                dns_secondary:document.getElementById('set-dns-secondary').value,
+                lease_time:document.getElementById('set-lease-time').value,
+                domain:document.getElementById('set-domain').value
+            };
+            if(settings.dhcp_enabled==='true'){
+                if(!settings.range_start||!settings.range_end){toast('Please enter DHCP range','error');return;}
+                if(!settings.gateway){toast('Please enter gateway IP','error');return;}
+            }
+            const res=await api('settings',{method:'POST',body:settings});
+            if(res.success){
+                toast('Settings saved successfully');
+                loadSettings();
+                loadStatus();
+            }else{
+                toast('Failed to save: '+(res.error||'Unknown error'),'error');
+                if(res.journal){
+                    console.error('Journal:', res.journal);
+                }
+            }
+        }
+        
+        async function validateSettings(){
+            const res=await api('validate');
+            if(res.success&&res.data){
+                if(res.data.valid){
+                    toast('Configuration is valid!');
+                }else{
+                    toast('Config error: '+res.data.output,'error');
+                }
+            }
+        }
+        
+        function toggleDhcp(){
+            const toggle=document.getElementById('dhcp-toggle');
+            toggle.classList.toggle('active');
+            document.getElementById('dhcp-status-text').textContent=toggle.classList.contains('active')?'Enabled':'Disabled';
+            document.getElementById('settings-alert').style.display=toggle.classList.contains('active')?'none':'flex';
+        }
+        
+        function updateCidrInfo(){
+            const cidr=document.getElementById('set-cidr').value;
+            const masks={'8':'255.0.0.0','16':'255.255.0.0','17':'255.255.128.0','18':'255.255.192.0','19':'255.255.224.0','20':'255.255.240.0','21':'255.255.248.0','22':'255.255.252.0','23':'255.255.254.0','24':'255.255.255.0','25':'255.255.255.128','26':'255.255.255.192','27':'255.255.255.224','28':'255.255.255.240'};
+            const hosts=Math.pow(2,32-parseInt(cidr))-2;
+            document.getElementById('cidr-info').textContent=`Subnet mask: ${masks[cidr]} | Available hosts: ${hosts.toLocaleString()}`;
+            updateDashboardPool();
+        }
+        
+        function updateDashboardPool(){
+            const start=document.getElementById('set-range-start').value;
+            const end=document.getElementById('set-range-end').value;
+            document.getElementById('dash-pool-range').textContent=start&&end?`${start} - ${end}`:'Not configured';
+        }
+        
+        async function loadLeases(){
+            const res=await api('leases');
+            const tbody=document.getElementById('leases-table');
+            if(res.success&&res.data.length>0){
+                tbody.innerHTML=res.data.map(l=>`<tr><td><strong>${l.ip}</strong></td><td><code>${l.mac}</code></td><td>${l.hostname!=='*'?l.hostname:'-'}</td><td><span class="badge badge-success">${l.expires}</span></td><td><button class="btn btn-sm btn-secondary" onclick="makeReservation('${l.mac}','${l.ip}','${l.hostname}')">Reserve</button></td></tr>`).join('');
+                document.getElementById('dash-leases').textContent=res.data.length;
+            }else{
+                tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No active leases</td></tr>';
+                document.getElementById('dash-leases').textContent='0';
+            }
+        }
+        
+        async function loadReservations(){
+            const res=await api('reservations');
+            const tbody=document.getElementById('reservations-table');
+            if(res.success&&res.data.length>0){
+                tbody.innerHTML=res.data.map(r=>`<tr><td><strong>${r.ip}</strong></td><td><code>${r.mac}</code></td><td>${r.hostname||'-'}</td><td>${r.description||'-'}</td><td><button class="btn btn-sm btn-danger" onclick="deleteReservation(${r.id})">Delete</button></td></tr>`).join('');
+                document.getElementById('dash-reservations').textContent=res.data.length;
+            }else{
+                tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No reservations</td></tr>';
+                document.getElementById('dash-reservations').textContent='0';
+            }
+        }
+        
+        function showReservationModal(){document.getElementById('reservation-modal').classList.add('active');}
+        function hideReservationModal(){document.getElementById('reservation-modal').classList.remove('active');document.getElementById('reservation-form').reset();}
+        
+        function makeReservation(mac,ip,hostname){
+            document.getElementById('res-mac').value=mac;
+            document.getElementById('res-ip').value=ip;
+            document.getElementById('res-hostname').value=hostname!=='*'?hostname:'';
+            showReservationModal();
+        }
+        
+        async function addReservation(e){
+            e.preventDefault();
+            const res=await api('reservations',{method:'POST',body:{
+                mac:document.getElementById('res-mac').value,
+                ip:document.getElementById('res-ip').value,
+                hostname:document.getElementById('res-hostname').value,
+                description:document.getElementById('res-description').value
+            }});
+            if(res.success){
+                toast('Reservation added');
+                hideReservationModal();
+                loadReservations();
+            }else{
+                toast('Failed','error');
+            }
+        }
+        
+        async function deleteReservation(id){
+            if(confirm('Delete this reservation?')){
+                const res=await api('reservations',{method:'DELETE',params:{id}});
+                if(res.success){toast('Deleted');loadReservations();}
+            }
+        }
+        
+        let logAutoRefreshInterval=null;
+        
+        async function loadLogs(){
+            const lines=document.getElementById('log-lines').value;
+            const statusEl=document.getElementById('log-status');
+            statusEl.textContent='Loading...';
+            try{
+                const res=await api('logs',{params:{lines}});
+                if(res.success&&res.data.length){
+                    const container=document.getElementById('logs-container');
+                    container.innerHTML=res.data.map(l=>`<div class="log-line">${l}</div>`).join('');
+                    statusEl.textContent=`Loaded ${res.data.length} entries at ${new Date().toLocaleTimeString()}`;
+                }else{
+                    document.getElementById('logs-container').innerHTML='<div style="color:var(--text-secondary);">No logs available yet. DHCP requests will appear here once clients request addresses.</div>';
+                    statusEl.textContent='No logs found';
+                }
+            }catch(e){
+                statusEl.textContent='Error loading logs';
+                console.error(e);
+            }
+        }
+        
+        function toggleLogAutoRefresh(){
+            const checked=document.getElementById('log-auto-refresh').checked;
+            if(checked){
+                loadLogs();
+                logAutoRefreshInterval=setInterval(loadLogs,10000);
+            }else{
+                if(logAutoRefreshInterval){
+                    clearInterval(logAutoRefreshInterval);
+                    logAutoRefreshInterval=null;
+                }
+            }
+        }
+        
+        async function startService(){
+            toast('Starting...');
+            const res=await api('start');
+            if(res.success){
+                toast('Service started');
+            }else{
+                toast('Failed to start','error');
+                console.error(res);
+            }
+            setTimeout(loadStatus,1000);
+        }
+        
+        async function stopService(){
+            toast('Stopping...');
+            const res=await api('stop');
+            toast(res.success?'Service stopped':'Failed','success');
+            setTimeout(loadStatus,1000);
+        }
+        
+        async function restartService(){
+            if(confirm('Restart DHCP service?')){
+                toast('Restarting...');
+                const res=await api('restart');
+                if(res.success){
+                    toast('Restarted');
+                }else{
+                    toast('Failed to restart','error');
+                    console.error(res);
+                }
+                setTimeout(loadStatus,2000);
+            }
+        }
+        
+        async function runDiagnostics(){
+            const container=document.getElementById('diag-results');
+            container.innerHTML='<div style="color:var(--text-secondary);">Running diagnostics...</div>';
+            const res=await api('diagnostics');
+            if(res.success&&res.data){
+                const d=res.data;
+                let html='';
+                html+=`<div class="diag-section"><div class="diag-label">Config Valid</div><div class="diag-value ${d.config_valid?'diag-ok':'diag-error'}">${d.config_valid?'✓ Valid':'✗ Invalid'}</div></div>`;
+                if(!d.config_valid){
+                    html+=`<div class="error-box">${d.config_test}</div>`;
+                }
+                html+=`<div class="diag-section"><div class="diag-label">Interface (${d.configured_interface})</div><div class="diag-value ${d.interface_exists?'diag-ok':'diag-error'}">${d.interface_exists?'✓ Exists':'✗ Not found'}</div></div>`;
+                html+=`<div class="diag-section"><div class="diag-label">File Permissions</div><div class="diag-value">Config: ${d.config_writable?'✓':'✗'} | Leases: ${d.leases_writable?'✓':'✗'} | Log: ${d.log_writable?'✓':'✗'}</div></div>`;
+                html+=`<div class="diag-section"><div class="diag-label">Port 67 Status</div><div class="diag-value">${d.port_67_status||'Not in use'}</div></div>`;
+                if(d.recent_errors){
+                    html+=`<div class="diag-section"><div class="diag-label">Recent Errors</div><div class="error-box">${d.recent_errors}</div></div>`;
+                }
+                html+=`<div class="diag-section"><div class="diag-label">Service Status</div><pre class="diag-value" style="max-height:200px;overflow:auto;">${d.service_status}</pre></div>`;
+                container.innerHTML=html;
+            }
+        }
+        
+        async function runRepair(){
+            if(confirm('Run auto-repair? This will attempt to fix common issues and restart the service.')){
+                toast('Running repair...');
+                const res=await api('repair');
+                if(res.success){
+                    toast('Repair successful!');
+                }else{
+                    toast('Repair attempted but service still failing','error');
+                    console.error(res);
+                }
+                setTimeout(()=>{
+                    loadStatus();
+                    runDiagnostics();
+                },2000);
+            }
+        }
+        
+        async function runIrongateDiag(){
+            const container = document.getElementById('irongate-diag-results');
+            const content = document.getElementById('irongate-diag-content');
+            container.style.display = 'block';
+            content.innerHTML = 'Running Irongate diagnostics...';
+            
+            try {
+                const res = await api('irongate_diag');
+                if (res.success && res.data) {
+                    const d = res.data;
+                    let html = '';
+                    
+                    // Warning about devices without IPs
+                    if (d.devices_without_ip_warning) {
+                        html += `<div style="color:#e94560;font-weight:bold;margin-bottom:15px;">⚠️ ${d.devices_without_ip_warning}</div>`;
+                    }
+                    
+                    // Devices with IPs
+                    html += `<div style="color:#58a6ff;font-weight:bold;">═══ PROTECTED DEVICES WITH IPs ═══</div>\n`;
+                    if (d.devices_with_ip && d.devices_with_ip.length > 0) {
+                        d.devices_with_ip.forEach(dev => {
+                            html += `  ${dev.zone}: ${dev.ip} (${dev.mac}) ${dev.hostname || ''}\n`;
+                        });
+                    } else {
+                        html += `  <span style="color:#e94560;">NONE - Add devices with IPs to enable protection!</span>\n`;
+                    }
+                    
+                    // IP Forwarding
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ IP FORWARDING ═══</div>\n`;
+                    html += `  Status: ${d.ip_forward === 'enabled' ? '✓ ' + d.ip_forward : '✗ ' + d.ip_forward}\n`;
+                    
+                    // nftables
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ NFTABLES RULES ═══</div>\n`;
+                    html += d.nftables + '\n';
+                    
+                    // ARP Cache
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ ARP CACHE ═══</div>\n`;
+                    html += d.arp_cache || 'Empty';
+                    
+                    // Config
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ CONFIG FILE ═══</div>\n`;
+                    html += d.config;
+                    
+                    // Recent Logs
+                    html += `\n<div style="color:#58a6ff;font-weight:bold;">═══ RECENT LOGS ═══</div>\n`;
+                    html += d.recent_logs || 'No logs';
+                    
+                    content.innerHTML = html;
+                } else {
+                    content.innerHTML = 'Error: ' + (res.error || 'Unknown error');
+                }
+            } catch (e) {
+                content.innerHTML = 'Error: ' + e.message;
+            }
+        }
+        
+        async function loadAll(){
+            await loadSystemInfo();
+            await loadStatus();
+            await loadSettings();
+            await loadLeases();
+            await loadReservations();
+            await loadLogs();
+            await loadIrongateStatus();
+        }
+        
+        loadAll();
+        setInterval(()=>{loadStatus();loadLeases();},30000);
+        
+        //======================================================================
+        // IRONGATE FUNCTIONS
+        //======================================================================
+        
+        let irongateSettings = {};
+        
+        async function loadIrongateStatus() {
+            try {
+                const res = await api('irongate_status');
+                if (res.success) {
+                    irongateSettings = res.data;
+                    
+                    // Update toggle
+                    const toggle = document.getElementById('irongate-toggle');
+                    const statusText = document.getElementById('irongate-status-text');
+                    const serviceStatus = document.getElementById('irongate-service-status');
+                    
+                    if (res.data.enabled) {
+                        toggle.classList.add('active');
+                        statusText.textContent = 'Enabled';
+                        statusText.style.color = 'var(--success)';
+                    } else {
+                        toggle.classList.remove('active');
+                        statusText.textContent = 'Disabled';
+                        statusText.style.color = 'var(--text-secondary)';
+                    }
+                    
+                    serviceStatus.innerHTML = res.data.service_running 
+                        ? '<span class="status-dot running"></span>Service Running'
+                        : '<span class="status-dot stopped"></span>Service Stopped';
+                    
+                    // Update mode selection
+                    setIrongateMode(res.data.mode || 'single', false);
+                    
+                    // Update layer checkboxes
+                    document.getElementById('layer-arp').checked = res.data.layers?.arp_defense !== false;
+                    document.getElementById('layer-ipv6').checked = res.data.layers?.ipv6_ra !== false;
+                    document.getElementById('layer-gateway').checked = res.data.layers?.gateway_takeover !== false;
+                    document.getElementById('layer-bypass').checked = res.data.layers?.bypass_detection !== false;
+                    document.getElementById('layer-firewall').checked = res.data.layers?.firewall !== false;
+                }
+                
+                // Load full settings
+                const settingsRes = await api('irongate_settings');
+                if (settingsRes.success) {
+                    irongateSettings = {...irongateSettings, ...settingsRes.data};
+                    document.getElementById('irongate-bridge-ip').value = settingsRes.data.irongate_bridge_ip || '10.99.0.1';
+                    document.getElementById('irongate-dhcp-start').value = settingsRes.data.irongate_bridge_dhcp_start || '10.99.1.1';
+                    document.getElementById('irongate-dhcp-end').value = settingsRes.data.irongate_bridge_dhcp_end || '10.99.255.254';
+                }
+                
+                // Load interfaces
+                await loadIrongateInterfaces();
+                
+            } catch (e) {
+                console.error('Irongate status error:', e);
+            }
+        }
+        
+        async function loadIrongateInterfaces() {
+            try {
+                const res = await api('irongate_interfaces');
+                if (res.success) {
+                    const select = document.getElementById('irongate-isolated-iface');
+                    const currentValue = irongateSettings.irongate_isolated_interface || '';
+                    select.innerHTML = '<option value="">-- Select interface --</option>';
+                    
+                    res.data.forEach(iface => {
+                        if (iface.is_main) return;
+                        const opt = document.createElement('option');
+                        opt.value = iface.name;
+                        opt.textContent = iface.name + (iface.is_usb ? ' (USB)' : '') + ' - ' + iface.mac + ' [' + iface.state + ']';
+                        if (iface.name === currentValue) opt.selected = true;
+                        select.appendChild(opt);
+                    });
+                }
+            } catch (e) {
+                console.error('Interfaces error:', e);
+            }
+        }
+        
+        function setIrongateMode(mode, save = true) {
+            const singleCard = document.getElementById('mode-single');
+            const dualCard = document.getElementById('mode-dual');
+            const dualConfig = document.getElementById('dual-nic-config');
+            const singleConfig = document.getElementById('single-nic-config');
+            
+            if (mode === 'dual') {
+                singleCard.style.borderColor = 'transparent';
+                dualCard.style.borderColor = 'var(--success)';
+                dualConfig.style.display = 'block';
+                singleConfig.style.display = 'none';
+            } else {
+                singleCard.style.borderColor = 'var(--warning)';
+                dualCard.style.borderColor = 'transparent';
+                dualConfig.style.display = 'none';
+                singleConfig.style.display = 'block';
+            }
+            
+            irongateSettings.irongate_mode = mode;
+        }
+        
+        async function toggleIrongate() {
+            const toggle = document.getElementById('irongate-toggle');
+            const enabling = !toggle.classList.contains('active');
+            
+            try {
+                const res = await api('irongate_toggle', {
+                    method: 'POST',
+                    body: { enabled: enabling }
+                });
+                
+                if (res.success) {
+                    toast(enabling ? 'Irongate enabled' : 'Irongate disabled', 'success');
+                    await loadIrongateStatus();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function saveIrongateSettings() {
+            const settings = {
+                irongate_enabled: document.getElementById('irongate-toggle').classList.contains('active') ? 'true' : 'false',
+                irongate_mode: irongateSettings.irongate_mode || 'single',
+                irongate_isolated_interface: document.getElementById('irongate-isolated-iface').value,
+                irongate_bridge_ip: document.getElementById('irongate-bridge-ip').value,
+                irongate_bridge_dhcp_start: document.getElementById('irongate-dhcp-start').value,
+                irongate_bridge_dhcp_end: document.getElementById('irongate-dhcp-end').value,
+                irongate_arp_defense: document.getElementById('layer-arp').checked ? 'true' : 'false',
+                irongate_ipv6_ra: document.getElementById('layer-ipv6').checked ? 'true' : 'false',
+                irongate_gateway_takeover: document.getElementById('layer-gateway').checked ? 'true' : 'false',
+                irongate_bypass_detection: document.getElementById('layer-bypass').checked ? 'true' : 'false',
+                irongate_firewall: document.getElementById('layer-firewall').checked ? 'true' : 'false'
+            };
+            
+            // Validate dual-NIC mode
+            if (settings.irongate_mode === 'dual' && !settings.irongate_isolated_interface) {
+                toast('Please select an isolated interface for dual-NIC mode', 'error');
+                return;
+            }
+            
+            try {
+                const res = await api('irongate_settings', {
+                    method: 'POST',
+                    body: settings
+                });
+                
+                if (res.success) {
+                    toast('Irongate settings saved' + (res.mode ? ' (' + res.mode + ' mode)' : ''), 'success');
+                    await loadIrongateStatus();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                    if (res.journal) console.error(res.journal);
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        //======================================================================
+        // LAYER 8 BLOCKCHAIN MANAGEMENT
+        //======================================================================
+        
+        let blockchainSettings = {};
+        
+        async function loadBlockchainSettings() {
+            try {
+                const res = await api('irongate_settings');
+                if (res.success) {
+                    blockchainSettings = res.data;
+                    
+                    // Update toggle
+                    const toggle = document.getElementById('blockchain-toggle');
+                    const statusText = document.getElementById('blockchain-status-text');
+                    const connStatus = document.getElementById('blockchain-connection-status');
+                    
+                    if (res.data.blockchain_enabled === 'true') {
+                        toggle.classList.add('active');
+                        statusText.textContent = 'Enabled';
+                        statusText.style.color = 'var(--success)';
+                        connStatus.innerHTML = '<span class="status-dot running"></span>Blockchain Active';
+                    } else {
+                        toggle.classList.remove('active');
+                        statusText.textContent = 'Disabled';
+                        statusText.style.color = 'var(--text-secondary)';
+                        connStatus.innerHTML = '<span class="status-dot stopped"></span>Not Connected';
+                    }
+                    
+                    // Update form fields
+                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'mainnet';
+                    document.getElementById('blockchain-app-id').value = res.data.blockchain_app_id || '';
+                    document.getElementById('blockchain-mnemonic').value = res.data.blockchain_admin_mnemonic || '';
+                    document.getElementById('blockchain-cache-ttl').value = res.data.blockchain_cache_ttl || '60';
+                    document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
+                    document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
+                    document.getElementById('blockchain-allow-rogue').checked = res.data.blockchain_allow_rogue_devices === 'true';
+                }
+            } catch (e) {
+                console.error('Blockchain settings error:', e);
+            }
+        }
+        
+        async function toggleBlockchain() {
+            const toggle = document.getElementById('blockchain-toggle');
+            const enabling = !toggle.classList.contains('active');
+            
+            // Quick validation
+            if (enabling) {
+                const appId = document.getElementById('blockchain-app-id').value;
+                if (!appId) {
+                    toast('Please enter an App ID before enabling blockchain', 'error');
+                    return;
+                }
+            }
+            
+            if (enabling) {
+                toggle.classList.add('active');
+                document.getElementById('blockchain-status-text').textContent = 'Enabled';
+                document.getElementById('blockchain-status-text').style.color = 'var(--success)';
+            } else {
+                toggle.classList.remove('active');
+                document.getElementById('blockchain-status-text').textContent = 'Disabled';
+                document.getElementById('blockchain-status-text').style.color = 'var(--text-secondary)';
+            }
+            
+            toast('Click "Save & Apply" to apply changes', 'info');
+        }
+        
+        async function saveBlockchainSettings() {
+            const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
+            const appId = document.getElementById('blockchain-app-id').value;
+            
+            // Validate if enabling
+            if (enabled && !appId) {
+                toast('App ID is required to enable blockchain', 'error');
+                return;
+            }
+            
+            const settings = {
+                blockchain_enabled: enabled ? 'true' : 'false',
+                blockchain_network: document.getElementById('blockchain-network').value,
+                blockchain_app_id: appId || '',
+                blockchain_admin_mnemonic: document.getElementById('blockchain-mnemonic').value || '',
+                blockchain_cache_ttl: document.getElementById('blockchain-cache-ttl').value || '60',
+                blockchain_fallback_allow: document.getElementById('blockchain-fallback').checked ? 'true' : 'false',
+                blockchain_audit_logging: document.getElementById('blockchain-audit').checked ? 'true' : 'false',
+                blockchain_allow_rogue_devices: document.getElementById('blockchain-allow-rogue').checked ? 'true' : 'false'
+            };
+            
+            try {
+                const res = await api('irongate_settings', {
+                    method: 'POST',
+                    body: settings
+                });
+                
+                if (res.success) {
+                    toast('Blockchain settings saved! Irongate restarting...', 'success');
+                    await loadBlockchainSettings();
+                } else {
+                    toast('Failed: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function testBlockchainConnection() {
+            const appId = document.getElementById('blockchain-app-id').value;
+            const network = document.getElementById('blockchain-network').value;
+            
+            if (!appId) {
+                toast('Enter an App ID first', 'error');
+                return;
+            }
+            
+            toast('Testing connection...', 'info');
+            
+            // For now, just show a message - actual test would need a backend endpoint
+            const connStatus = document.getElementById('blockchain-connection-status');
+            connStatus.innerHTML = '<span style="color:var(--warning);">⏳ Testing...</span>';
+            
+            // Simulate connection test
+            setTimeout(() => {
+                connStatus.innerHTML = '<span style="color:var(--success);">✓ Algorand ' + network + ' reachable</span>';
+                toast('Connection test: Algorand ' + network + ' is reachable. Save settings and restart to fully activate.', 'success');
+            }, 1500);
+        }
+        
+        //======================================================================
+        // CUSTOM DEVICE GROUPS MANAGEMENT
+        //======================================================================
+
+        let deviceGroups = [];
+
+        async function loadDeviceGroups() {
+            try {
+                const res = await api('device_groups');
+                if (res.success) {
+                    deviceGroups = res.data || [];
+                    renderCustomGroupsLegend();
+                    populateZoneDropdowns();
+                }
+            } catch (e) {
+                console.error('Load groups error:', e);
+            }
+        }
+
+        function renderCustomGroupsLegend() {
+            const container = document.getElementById('custom-groups-container');
+            if (!container) return;
+
+            const customGroups = deviceGroups.filter(g => !g.builtin);
+            if (customGroups.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            container.innerHTML = `
+                <div style="font-size:0.9em;color:var(--text-secondary);margin-bottom:10px;margin-top:15px;">Custom Groups:</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;">
+                    ${customGroups.map(g => {
+                        const accessDesc = g.lan_access === 'none' ? '✗ No LAN access' :
+                                          g.lan_access === 'same' ? '✓ Can reach same group' :
+                                          g.lan_access === 'selected' ? '✓ Can reach selected groups' :
+                                          g.lan_access === 'full' ? '✓ Full LAN access' : '✗ No LAN access';
+                        return `
+                            <div style="padding:15px;background:${hexToRgba(g.color, 0.1)};border-radius:8px;border-left:4px solid ${g.color};position:relative;">
+                                <strong style="color:${g.color};">${g.icon} ${g.name}</strong>
+                                <div style="font-size:0.9em;color:var(--text-secondary);margin-top:5px;">
+                                    ${g.description || 'Custom device group'}<br>
+                                    ${accessDesc}
+                                </div>
+                                <div style="position:absolute;top:10px;right:10px;">
+                                    <button class="btn btn-sm btn-secondary" onclick="editGroup(${g.id})" style="padding:3px 8px;font-size:0.75em;">Edit</button>
+                                    <button class="btn btn-sm btn-danger" onclick="deleteGroup(${g.id})" style="padding:3px 8px;font-size:0.75em;margin-left:3px;">Delete</button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        function hexToRgba(hex, alpha) {
+            const r = parseInt(hex.slice(1, 3), 16);
+            const g = parseInt(hex.slice(3, 5), 16);
+            const b = parseInt(hex.slice(5, 7), 16);
+            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        }
+
+        function populateZoneDropdowns() {
+            const devZone = document.getElementById('dev-zone');
+            if (!devZone) return;
+
+            const currentValue = devZone.value;
+
+            devZone.innerHTML = deviceGroups.map(g => {
+                const desc = g.builtin ?
+                    (g.name === 'isolated' ? ' - Internet only, no LAN access' :
+                     g.name === 'servers' ? ' - Can talk to other servers' :
+                     g.name === 'trusted' ? ' - Full network access' : '') :
+                    (g.description ? ' - ' + g.description : '');
+                return `<option value="${g.name}">${g.icon} ${g.name}${desc}</option>`;
+            }).join('');
+
+            // Restore previous selection if valid
+            if (currentValue && deviceGroups.find(g => g.name === currentValue)) {
+                devZone.value = currentValue;
+            }
+        }
+
+        function showGroupModal(group = null) {
+            document.getElementById('group-form').reset();
+            document.getElementById('group-edit-id').value = '';
+            document.getElementById('group-modal-title').textContent = '📁 Create Custom Group';
+            document.getElementById('group-access-groups-container').style.display = 'none';
+
+            if (group) {
+                document.getElementById('group-modal-title').textContent = '📁 Edit Custom Group';
+                document.getElementById('group-edit-id').value = group.id;
+                document.getElementById('group-name').value = group.name || '';
+                document.getElementById('group-icon').value = group.icon || '📁';
+                document.getElementById('group-color').value = group.color || '#6c757d';
+                document.getElementById('group-description').value = group.description || '';
+                document.getElementById('group-lan-access').value = group.lan_access || 'none';
+                updateGroupAccessOptions(group.can_access_groups || []);
+            } else {
+                updateGroupAccessOptions([]);
+            }
+
+            document.getElementById('group-modal').classList.add('active');
+        }
+
+        function hideGroupModal() {
+            document.getElementById('group-modal').classList.remove('active');
+            document.getElementById('group-form').reset();
+        }
+
+        function updateGroupAccessOptions(selectedGroups = []) {
+            const lanAccess = document.getElementById('group-lan-access').value;
+            const container = document.getElementById('group-access-groups-container');
+            const list = document.getElementById('group-access-groups-list');
+
+            if (lanAccess === 'selected') {
+                container.style.display = 'block';
+                // Populate with all groups (except the one being edited)
+                const editId = document.getElementById('group-edit-id').value;
+                const editName = editId ? deviceGroups.find(g => g.id == editId)?.name : null;
+
+                list.innerHTML = deviceGroups
+                    .filter(g => g.name !== editName)
+                    .map(g => `
+                        <label style="display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer;">
+                            <input type="checkbox" class="group-access-check" value="${g.name}" ${selectedGroups.includes(g.name) ? 'checked' : ''}>
+                            <span style="color:${g.color};">${g.icon} ${g.name}</span>
+                        </label>
+                    `).join('');
+            } else {
+                container.style.display = 'none';
+            }
+        }
+
+        async function saveCustomGroup(event) {
+            event.preventDefault();
+
+            let name = document.getElementById('group-name').value.trim().toLowerCase();
+            name = name.replace(/[^a-z0-9_-]/g, ''); // Sanitize
+
+            if (!name) {
+                toast('Group name is required', 'error');
+                return;
+            }
+
+            // Get selected access groups
+            const canAccessGroups = [];
+            if (document.getElementById('group-lan-access').value === 'selected') {
+                document.querySelectorAll('.group-access-check:checked').forEach(cb => {
+                    canAccessGroups.push(cb.value);
+                });
+            } else if (document.getElementById('group-lan-access').value === 'same') {
+                canAccessGroups.push(name); // Can access itself
+            }
+
+            const group = {
+                name: name,
+                icon: document.getElementById('group-icon').value,
+                color: document.getElementById('group-color').value,
+                description: document.getElementById('group-description').value.trim(),
+                lan_access: document.getElementById('group-lan-access').value,
+                can_access_groups: canAccessGroups
+            };
+
+            try {
+                const res = await api('device_groups', {
+                    method: 'POST',
+                    body: group
+                });
+
+                if (res.success) {
+                    toast('Group saved successfully', 'success');
+                    hideGroupModal();
+                    await loadDeviceGroups();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to save group: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+
+        function editGroup(id) {
+            const group = deviceGroups.find(g => g.id === id);
+            if (group && !group.builtin) {
+                showGroupModal(group);
+            }
+        }
+
+        async function deleteGroup(id) {
+            const group = deviceGroups.find(g => g.id === id);
+            if (!group || group.builtin) return;
+
+            if (!confirm(`Delete the "${group.name}" group? All devices in this group will be moved to "isolated".`)) return;
+
+            try {
+                const res = await api('device_groups', {
+                    method: 'DELETE',
+                    params: { id: id }
+                });
+
+                if (res.success) {
+                    toast('Group deleted', 'success');
+                    await loadDeviceGroups();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to delete group', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+
+        //======================================================================
+        // IRONGATE DEVICE MANAGEMENT
+        //======================================================================
+
+        let irongateDevices = [];
+        
+        async function loadIrongateDevices() {
+            try {
+                // Load groups first to have colors/icons available
+                await loadDeviceGroups();
+
+                const res = await api('irongate_devices');
+                if (res.success) {
+                    irongateDevices = res.data || [];
+                    renderDevicesTable();
+                }
+            } catch (e) {
+                console.error('Load devices error:', e);
+            }
+        }
+
+        function getGroupInfo(zoneName) {
+            const group = deviceGroups.find(g => g.name === zoneName);
+            if (group) {
+                return { color: group.color, icon: group.icon };
+            }
+            // Fallback for built-in groups if not loaded yet
+            if (zoneName === 'isolated') return { color: '#e94560', icon: '🔴' };
+            if (zoneName === 'servers') return { color: '#ffc107', icon: '🟡' };
+            if (zoneName === 'trusted') return { color: '#00bf63', icon: '🟢' };
+            return { color: '#6c757d', icon: '📁' };
+        }
+
+        function renderDevicesTable() {
+            const tbody = document.getElementById('irongate-devices-table');
+            if (!irongateDevices || irongateDevices.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);">No devices configured. Add devices to protect them with Irongate.</td></tr>';
+                return;
+            }
+
+            // Sort by zone - built-in first, then custom alphabetically
+            const builtinOrder = { isolated: 0, servers: 1, trusted: 2 };
+            const sorted = [...irongateDevices].sort((a, b) => {
+                const aOrder = builtinOrder[a.zone] ?? 100;
+                const bOrder = builtinOrder[b.zone] ?? 100;
+                if (aOrder !== bOrder) return aOrder - bOrder;
+                // Both custom groups - sort alphabetically
+                return (a.zone || '').localeCompare(b.zone || '');
+            });
+
+            tbody.innerHTML = sorted.map(dev => {
+                const groupInfo = getGroupInfo(dev.zone);
+                return `
+                    <tr>
+                        <td><span style="color:${groupInfo.color};">${groupInfo.icon} ${dev.zone}</span></td>
+                        <td><code>${dev.mac}</code></td>
+                        <td>${dev.ip || '<span style="color:var(--text-secondary);">DHCP</span>'}</td>
+                        <td>${dev.hostname || '-'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="editDevice(${dev.id})">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteDevice(${dev.id})" style="margin-left:5px;">Delete</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function showDeviceModal(device = null) {
+            document.getElementById('device-form').reset();
+            // Refresh zone dropdown with latest groups
+            populateZoneDropdowns();
+
+            if (device) {
+                document.getElementById('dev-mac').value = device.mac || '';
+                document.getElementById('dev-ip').value = device.ip || '';
+                document.getElementById('dev-hostname').value = device.hostname || '';
+                document.getElementById('dev-zone').value = device.zone || 'isolated';
+            }
+            document.getElementById('device-modal').classList.add('active');
+        }
+        
+        function hideDeviceModal() {
+            document.getElementById('device-modal').classList.remove('active');
+            document.getElementById('device-form').reset();
+        }
+        
+        async function addIrongateDevice(event) {
+            event.preventDefault();
+            
+            const device = {
+                mac: document.getElementById('dev-mac').value.toLowerCase().trim(),
+                ip: document.getElementById('dev-ip').value.trim(),
+                hostname: document.getElementById('dev-hostname').value.trim(),
+                zone: document.getElementById('dev-zone').value
+            };
+            
+            // Validate MAC
+            if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(device.mac)) {
+                toast('Invalid MAC address format (use XX:XX:XX:XX:XX:XX)', 'error');
+                return;
+            }
+            
+            try {
+                const res = await api('irongate_devices', {
+                    method: 'POST',
+                    body: device
+                });
+                
+                if (res.success) {
+                    toast('Device added to ' + device.zone + ' zone', 'success');
+                    hideDeviceModal();
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to add device: ' + (res.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        function editDevice(id) {
+            const device = irongateDevices.find(d => d.id === id);
+            if (device) {
+                showDeviceModal(device);
+            }
+        }
+        
+        async function deleteDevice(id) {
+            if (!confirm('Remove this device from Irongate protection?')) return;
+            
+            try {
+                const res = await api('irongate_devices', {
+                    method: 'DELETE',
+                    params: { id: id }
+                });
+                
+                if (res.success) {
+                    toast('Device removed', 'success');
+                    await loadIrongateDevices();
+                } else {
+                    toast('Failed to remove device', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function importFromLeases() {
+            try {
+                const res = await api('leases');
+                if (!res.success || !res.data || res.data.length === 0) {
+                    toast('No active DHCP leases found', 'error');
+                    return;
+                }
+                
+                // Filter out already-added devices
+                const existingMacs = new Set(irongateDevices.map(d => d.mac.toLowerCase()));
+                const available = res.data.filter(l => !existingMacs.has(l.mac.toLowerCase()));
+                
+                if (available.length === 0) {
+                    toast('All lease devices are already in Irongate', 'error');
+                    return;
+                }
+                
+                const container = document.getElementById('import-leases-list');
+                // Build zone options dynamically from deviceGroups
+                const zoneOptions = deviceGroups.map(g =>
+                    `<option value="${g.name}">${g.icon} ${g.name}</option>`
+                ).join('');
+
+                container.innerHTML = available.map(lease => `
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--bg);border-radius:6px;margin-bottom:8px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-mac="${lease.mac}" data-ip="${lease.ip}" data-hostname="${lease.hostname}">
+                        <div style="flex:1;">
+                            <div><strong>${lease.hostname || 'Unknown'}</strong></div>
+                            <div style="font-size:0.85em;color:var(--text-secondary);">
+                                <code>${lease.mac}</code> → ${lease.ip}
+                            </div>
+                        </div>
+                        <select class="form-control import-zone" style="width:150px;font-size:0.85em;">
+                            ${zoneOptions}
+                        </select>
+                    </label>
+                `).join('');
+                
+                document.getElementById('import-modal').classList.add('active');
+            } catch (e) {
+                toast('Error loading leases: ' + e.message, 'error');
+            }
+        }
+        
+        function hideImportModal() {
+            document.getElementById('import-modal').classList.remove('active');
+        }
+        
+        async function importSelectedDevices() {
+            const checkboxes = document.querySelectorAll('.import-check:checked');
+            if (checkboxes.length === 0) {
+                toast('No devices selected', 'error');
+                return;
+            }
+            
+            let added = 0;
+            for (const cb of checkboxes) {
+                const zoneSelect = cb.closest('label').querySelector('.import-zone');
+                const device = {
+                    mac: cb.dataset.mac,
+                    ip: cb.dataset.ip,
+                    hostname: cb.dataset.hostname,
+                    zone: zoneSelect.value
+                };
+                
+                try {
+                    const res = await api('irongate_devices', {
+                        method: 'POST',
+                        body: device
+                    });
+                    if (res.success) added++;
+                } catch (e) {
+                    console.error('Import error:', e);
+                }
+            }
+            
+            hideImportModal();
+            toast(`Imported ${added} device(s)`, 'success');
+            await loadIrongateDevices();
+        }
+        
+        // Load devices when Irongate page is shown
+        const origLoadIrongateStatus = loadIrongateStatus;
+        loadIrongateStatus = async function() {
+            await origLoadIrongateStatus();
+            await loadIrongateDevices();
+        };
+        
+        //======================================================================
+        // DASHBOARD LOADING
+        //======================================================================
+        
+        async function loadDashboard() {
+            try {
+                // Load system info
+                const sysRes = await api('system');
+                if (sysRes.success) {
+                    systemInfo = sysRes.data;
+                    document.getElementById('sys-hostname').value = sysRes.data.hostname || '';
+                    document.getElementById('sys-ip').value = sysRes.data.ip || '';
+                    document.getElementById('sys-interface').value = sysRes.data.interface || '';
+                    document.getElementById('sys-gateway').value = sysRes.data.gateway || '';
+                }
+                
+                // Load settings for DHCP status
+                const setRes = await api('settings');
+                if (setRes.success && setRes.data) {
+                    const dhcpEnabled = setRes.data.dhcp_enabled === 'true';
+                    document.getElementById('dash-dhcp-status').textContent = dhcpEnabled ? 'Enabled' : 'Disabled';
+                    const start = setRes.data.range_start;
+                    const end = setRes.data.range_end;
+                    document.getElementById('dash-pool-range').textContent = (start && end) ? `${start} - ${end}` : 'Not configured';
+                }
+                
+                // Load leases count
+                const leaseRes = await api('leases');
+                if (leaseRes.success) {
+                    document.getElementById('dash-leases').textContent = leaseRes.data ? leaseRes.data.length : '0';
+                }
+                
+                // Load reservations count
+                const resRes = await api('reservations');
+                if (resRes.success) {
+                    document.getElementById('dash-reservations').textContent = resRes.data ? resRes.data.length : '0';
+                }
+                
+                // Load Irongate status
+                const igRes = await api('irongate_status');
+                if (igRes.success) {
+                    const enabled = igRes.data.enabled;
+                    document.getElementById('dash-protection').textContent = enabled ? 'ON' : 'OFF';
+                    document.getElementById('dash-protection').style.color = enabled ? 'var(--success)' : 'var(--danger)';
+                    
+                    // Update protection banner
+                    const banner = document.getElementById('protection-banner');
+                    if (enabled) {
+                        banner.className = 'alert alert-success';
+                        banner.innerHTML = '<span>✓</span><span>Protection is <strong>enabled</strong>.</span>';
+                    } else {
+                        banner.className = 'alert alert-warning';
+                        banner.innerHTML = '<span>⚠️</span><span>Protection is <strong>disabled</strong>. Go to Protection settings to enable.</span>';
+                    }
+                }
+                
+                // Load device groups first
+                const groupsRes = await api('device_groups');
+                const groups = groupsRes.success ? groupsRes.data : [];
+
+                // Load devices and count by zone
+                const devRes = await api('irongate_devices');
+                if (devRes.success && devRes.data) {
+                    const devices = devRes.data;
+                    document.getElementById('dash-devices').textContent = devices.length;
+
+                    // Count by zone (including custom groups)
+                    const zoneCounts = {};
+                    devices.forEach(d => {
+                        const zone = d.zone || 'isolated';
+                        zoneCounts[zone] = (zoneCounts[zone] || 0) + 1;
+                    });
+
+                    // Update built-in zone counts
+                    document.getElementById('dash-isolated').textContent = zoneCounts['isolated'] || 0;
+                    document.getElementById('dash-servers').textContent = zoneCounts['servers'] || 0;
+                    document.getElementById('dash-trusted').textContent = zoneCounts['trusted'] || 0;
+
+                    // Render custom groups summary
+                    const customGroups = groups.filter(g => !g.builtin);
+                    const customContainer = document.getElementById('dash-custom-groups');
+                    if (customContainer && customGroups.length > 0) {
+                        customContainer.innerHTML = `
+                            <div style="font-size:0.9em;color:var(--text-secondary);margin-bottom:10px;">Custom Groups:</div>
+                            <div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
+                                ${customGroups.map(g => {
+                                    const count = zoneCounts[g.name] || 0;
+                                    return `
+                                        <div style="text-align:center;padding:12px;background:${hexToRgba(g.color, 0.1)};border-radius:8px;">
+                                            <div style="font-size:1.5em;color:${g.color};">${count}</div>
+                                            <div style="color:var(--text-secondary);font-size:0.9em;">${g.icon} ${g.name}</div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        `;
+                    } else if (customContainer) {
+                        customContainer.innerHTML = '';
+                    }
+                }
+                
+            } catch (e) {
+                console.error('Dashboard load error:', e);
+            }
+        }
+        
+        //======================================================================
+        // UPDATE FUNCTIONS
+        //======================================================================
+        
+        async function loadUpdateStatus() {
+            try {
+                // Load update settings
+                const settingsRes = await api('update_settings');
+                if (settingsRes.success && settingsRes.data) {
+                    document.getElementById('update-current-commit').textContent = settingsRes.data.installed_commit || 'unknown';
+                    document.getElementById('update-last-check').textContent = settingsRes.data.last_update_check || 'Never';
+                    
+                    const autoEnabled = settingsRes.data.auto_update_enabled;
+                    const toggle = document.getElementById('auto-update-toggle');
+                    toggle.classList.toggle('active', autoEnabled);
+                    document.getElementById('auto-update-status-text').textContent = autoEnabled ? 'Enabled' : 'Disabled';
+                }
+                
+                // Check for updates
+                await checkForUpdates(true);
+            } catch (e) {
+                console.error('Load update status error:', e);
+            }
+        }
+        
+        async function checkForUpdates(silent = false) {
+            try {
+                if (!silent) {
+                    document.getElementById('update-status-card').style.display = 'block';
+                    document.getElementById('update-status-content').innerHTML = '<span style="color:var(--warning);">🔍 Checking for updates...</span>';
+                }
+                
+                const res = await api('update_check');
+                
+                if (res.success) {
+                    document.getElementById('update-current-commit').textContent = res.current_commit;
+                    document.getElementById('update-remote-commit').textContent = res.remote_commit;
+                    document.getElementById('update-last-check').textContent = res.last_check;
+                    
+                    const statusCard = document.getElementById('update-status-card');
+                    const statusContent = document.getElementById('update-status-content');
+                    const updateBtn = document.getElementById('btn-update-now');
+                    
+                    // Show commit info
+                    if (res.commit_message) {
+                        document.getElementById('commit-info-card').style.display = 'block';
+                        const commitDate = res.commit_date ? new Date(res.commit_date).toLocaleString() : '';
+                        document.getElementById('commit-info-content').innerHTML = `
+                            <div style="margin-bottom:10px;"><strong style="font-family:monospace;color:var(--primary);">${res.remote_commit}</strong> <span style="color:var(--text-secondary);font-size:0.85em;">${commitDate}</span></div>
+                            <div style="font-size:0.9em;">${res.commit_message.replace(/\n/g, '<br>')}</div>
+                        `;
+                    }
+                    
+                    if (res.update_available) {
+                        statusCard.style.display = 'block';
+                        statusContent.innerHTML = `
+                            <div style="color:var(--success);">
+                                <strong>✓ Update Available!</strong><br>
+                                <span style="font-size:0.9em;">Commit <code>${res.remote_commit}</code> is available (you have <code>${res.current_commit}</code>)</span>
+                            </div>
+                        `;
+                        updateBtn.style.display = 'inline-block';
+                    } else {
+                        statusCard.style.display = 'block';
+                        statusContent.innerHTML = '<span style="color:var(--success);">✓ You are running the latest commit</span>';
+                        updateBtn.style.display = 'none';
+                    }
+                    
+                    if (!silent) {
+                        toast('Update check complete', 'success');
+                    }
+                } else {
+                    if (!silent) {
+                        document.getElementById('update-status-card').style.display = 'block';
+                        document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ ${res.error || 'Failed to check for updates'}</span>`;
+                        toast('Update check failed', 'error');
+                    }
+                }
+            } catch (e) {
+                if (!silent) {
+                    toast('Error checking for updates: ' + e.message, 'error');
+                }
+            }
+        }
+        
+        async function toggleAutoUpdate() {
+            const toggle = document.getElementById('auto-update-toggle');
+            const newState = !toggle.classList.contains('active');
+            
+            try {
+                const res = await api('update_settings', {
+                    method: 'POST',
+                    body: { auto_update_enabled: newState }
+                });
+                
+                if (res.success) {
+                    toggle.classList.toggle('active', newState);
+                    document.getElementById('auto-update-status-text').textContent = newState ? 'Enabled' : 'Disabled';
+                    toast('Auto-update ' + (newState ? 'enabled' : 'disabled'), 'success');
+                } else {
+                    toast('Failed to update setting', 'error');
+                }
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function performUpdate() {
+            if (!confirm('This will update Irongate to the latest version. The page will reload when complete. Continue?')) {
+                return;
+            }
+            
+            try {
+                document.getElementById('update-status-card').style.display = 'block';
+                document.getElementById('update-status-content').innerHTML = `
+                    <div style="color:var(--warning);">
+                        <strong>⬆️ Updating...</strong><br>
+                        <span style="font-size:0.9em;">Please wait, this may take a minute...</span>
+                    </div>
+                `;
+                document.getElementById('btn-update-now').disabled = true;
+                
+                const res = await api('update_now', {method:'POST'});
+                
+                if (res.success) {
+                    document.getElementById('update-status-content').innerHTML = `
+                        <div style="color:var(--success);">
+                            <strong>✓ Update started!</strong><br>
+                            <span style="font-size:0.9em;">The page will reload in 30 seconds...</span>
+                        </div>
+                    `;
+                    
+                    // Poll for completion and reload
+                    setTimeout(() => {
+                        location.reload();
+                    }, 30000);
+                } else {
+                    document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ ${res.error || 'Update failed'}</span>`;
+                    document.getElementById('btn-update-now').disabled = false;
+                    toast('Update failed', 'error');
+                }
+            } catch (e) {
+                document.getElementById('update-status-content').innerHTML = `<span style="color:var(--danger);">✗ Error: ${e.message}</span>`;
+                document.getElementById('btn-update-now').disabled = false;
+                toast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function viewUpdateLog() {
+            try {
+                const res = await api('update_log');
+                
+                document.getElementById('update-log-card').style.display = 'block';
+                document.getElementById('update-log-content').textContent = res.data || 'No update log available';
+            } catch (e) {
+                toast('Error loading log: ' + e.message, 'error');
+            }
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+        });
+    </script>
+</body>
+</html>

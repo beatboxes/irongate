@@ -1,0 +1,28 @@
+# DHCP Server Configuration
+# Configure via Web UI at http://$(hostname -I | awk '{print $1}')
+
+# Interface - will be set by web UI
+interface=$INTERFACE
+bind-dynamic
+
+# Disable DNS (DHCP only)
+port=0
+
+# DHCP disabled until configured via web UI
+# dhcp-range will be added by web UI
+
+# Lease file
+dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases
+
+# Be authoritative
+dhcp-authoritative
+
+# Logging
+log-dhcp
+log-facility=/var/log/dnsmasq.log
+
+# Static reservations
+conf-dir=/etc/dnsmasq.d/,*.conf
+
+# DHCP grace period notification for IronGate
+dhcp-script=/opt/irongate/dhcp-notify.sh

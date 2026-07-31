@@ -1,0 +1,7 @@
+# Optional, for the retained legacy Algorand contract (src/smart_contract.py) only.
+#
+# The engine and the current Midnight Layer 8 do NOT need these. Install them only
+# if you want to compile or inspect the historical Algorand contract.
+
+py-algorand-sdk
+pyteal

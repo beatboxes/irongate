@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Runtime state - never commit a real device database
+*.db
+*.sqlite
+*.sqlite3
+dhcp.db*
+
+# Backups produced by the installer and by in-place edits
+*.bak
+*.bak.*
+*.orig
+*.old
+*.save
+
+# Editor / OS
+*.swp
+*.swo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and E2E output
+.env
+e2e-results.txt

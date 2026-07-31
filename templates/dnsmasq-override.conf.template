@@ -1,0 +1,14 @@
+[Unit]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Clear resolvconf hooks — dnsmasq runs with port=0 (DNS disabled),
+# and systemd-networkd is disabled, so resolvconf calls always fail
+# with "Unit dbus-org.freedesktop.network1.service not found"
+ExecStartPost=
+ExecStop=

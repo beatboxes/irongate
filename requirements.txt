@@ -1,0 +1,9 @@
+# IronGate engine runtime dependencies.
+#
+# Layer 8 (Midnight) deliberately has NO dependency: it talks to the public
+# Midnight indexer over HTTPS GraphQL using only the Python standard library,
+# so no SDK, wallet or key material is needed on the device.
+
+PyYAML
+scapy
+netifaces

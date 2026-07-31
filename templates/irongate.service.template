@@ -1,0 +1,19 @@
+[Unit]
+Description=Irongate Network Isolation
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/run/irongate
+ExecStartPre=/bin/sleep 2
+ExecStart=/opt/irongate/venv/bin/python /opt/irongate/irongate.py
+ExecStop=/bin/kill -15 \$MAINPID
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=irongate
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

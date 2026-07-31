@@ -1,0 +1,46 @@
+# Irongate Configuration
+# Generated: $(date)
+
+mode: "single"
+
+network:
+  interface: "$INTERFACE"
+  local_ip: "$CURRENT_IP"
+  local_mac: "$LOCAL_MAC"
+  gateway_ip: "$CURRENT_GATEWAY"
+  gateway_mac: "$GATEWAY_MAC"
+
+layers:
+  arp_defense: true
+  ipv6_ra: true
+  gateway_takeover: true
+  bypass_detection: true
+  firewall: true
+
+# Layer 8: Midnight Blockchain Verification (OPTIONAL)
+# Cryptographic device authentication against an on-chain registry.
+# Set enabled: true and configure contract_address to activate.
+# The read path is unauthenticated, so no key material is stored on this host.
+blockchain:
+  enabled: false
+  # preprod | preview | mainnet | undeployed
+  network: "preprod"
+  # Address of the deployed Midnight device-registry contract (required if enabled)
+  contract_address: null
+  # Override the indexer endpoint; null uses the preset for the chosen network
+  indexer_url: null
+  # Cache TTL in seconds (reduces blockchain queries)
+  cache_ttl: 60
+  # When the chain cannot be consulted: true = undecided, defer to Layers 1-7;
+  # false = fail closed and block. It never means 'treat as verified'.
+  fallback_allow: true
+  # Log all access attempts to blockchain audit trail
+  audit_logging: false
+  # PUBLIC WIFI MODE: Allow unregistered devices but log them
+  # When true: devices not registered on-chain are allowed but logged
+  # When false: devices not registered on-chain are BLOCKED (default)
+  # Useful for: coffee shops, hotels, public hotspots
+  allow_rogue_devices: false
+
+devices:
+$DEVICES_YAML

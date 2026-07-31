@@ -1,0 +1,34 @@
+# Stage A - isolated. The DHCP server runs here and MUST NOT reach any real network.
+#
+# The network is declared external so that docker/run-e2e.sh can create it and PROVE
+# it is isolated before any container starts dnsmasq. Do not run `docker compose up`
+# directly; use `bash docker/run-e2e.sh`, which performs that check first.
+#
+# Create it manually with:
+#   docker network create --internal --subnet 10.99.0.0/24 irongate-e2e
+
+networks:
+  irongate-e2e:
+    external: true
+    name: irongate-e2e
+
+services:
+  irongate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: irongate-e2e:latest
+    container_name: irongate-e2e-engine
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      irongate-e2e:
+        ipv4_address: 10.99.0.2
+    command: ["/bin/bash","/opt/irongate/stage-a.sh"]
+
+  client:
+    image: irongate-e2e:latest
+    container_name: irongate-e2e-client
+    depends_on: [irongate]
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks: [irongate-e2e]
+    command: ["/bin/bash","/opt/irongate/stage-a-client.sh"]

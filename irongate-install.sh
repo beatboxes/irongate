@@ -2,6 +2,23 @@
 
 #######################################
 # IRONGATE - Network Isolation System
+#
+# This script is a self-contained installer: it carries the whole codebase in
+# heredocs and can deploy IronGate on its own.
+#
+#   sudo bash irongate-install.sh
+#
+# The same code is also committed as ordinary files under src/, web/, config/
+# and templates/ so it can be reviewed, diffed and opened in an editor. This
+# script remains the source of truth. After changing a heredoc here, run:
+#
+#   python3 tools/heredoc_sync.py --extract
+#
+# and `bash tools/check-sync.sh` will confirm the two copies still agree.
+#
+# Do not rename this file. irongate-updater.sh and the web UI's update action
+# both fetch it from the repository by this exact name; renaming it breaks
+# automatic updates on every deployed instance.
 # 
 # A complete network security appliance:
 #   • Zone-based device isolation
@@ -4754,15 +4771,18 @@ class Irongate:
         self.threads.append(t3)
         logger.info("LAN device refresh started")
         
-        # Layer: IPv6 RA Guard (TODO: implement if not already)
+        # Layer: IPv6 RA Guard - NOT IMPLEMENTED.
+        # The config flag is read and reported, but no router-advertisement
+        # guarding is performed anywhere in this engine. Do not rely on it.
         if self.layer_ipv6_ra:
-            logger.info("Layer: IPv6 RA Guard - ACTIVE")
+            logger.info("Layer: IPv6 RA Guard - ENABLED IN CONFIG, NOT IMPLEMENTED")
         else:
             logger.info("Layer: IPv6 RA Guard - DISABLED")
         
-        # Layer: Bypass Detection (TODO: implement active probing)
+        # Layer: Bypass Detection - NOT IMPLEMENTED.
+        # No active probing is performed. The flag is reported only.
         if self.layer_bypass_detection:
-            logger.info("Layer: Bypass Detection - ACTIVE")
+            logger.info("Layer: Bypass Detection - ENABLED IN CONFIG, NOT IMPLEMENTED")
         else:
             logger.info("Layer: Bypass Detection - DISABLED")
         

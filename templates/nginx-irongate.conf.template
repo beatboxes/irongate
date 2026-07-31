@@ -1,0 +1,44 @@
+server {
+    listen $WEBUI_PORT;
+    server_name _;
+    root /var/www/irongate;
+    index index.html;
+    
+    # Timeouts to prevent hung connections
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+    
+    # Limit request size
+    client_max_body_size 10M;
+    
+    # irongate-audit: block source and database artifacts from being served.
+    # Backup files (api.php.bak.<ts>) do not end in .php, so the php location
+    # never claims them and \`location /\` returned them as plaintext source.
+    # The SQLite device database was likewise downloadable in full.
+    location ~* \.(bak|old|orig|swp|save|sql|sqlite|sqlite3|db)(\.[0-9]+)?\$ {
+        deny all;
+        return 403;
+    }
+
+    location / { try_files \$uri \$uri/ =404; }
+    
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$PHP_SOCK;
+        
+        # PHP timeouts - prevent hung requests from blocking workers
+        fastcgi_connect_timeout 10s;
+        fastcgi_send_timeout 30s;
+        fastcgi_read_timeout 30s;
+    }
+    
+    location ~ /\.ht { deny all; }
+    
+    # Health check endpoint
+    location /health {
+        access_log off;
+        return 200 "OK";
+        add_header Content-Type text/plain;
+    }
+}
