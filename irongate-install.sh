@@ -582,6 +582,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $db = new SQLite3('/var/www/irongate/dhcp.db');
+// irongate-audit: without a busy timeout, a concurrent php-fpm worker holding
+// the write lock made this connection fail immediately, silently dropping
+// setting writes and config regeneration under load.
+$db->busyTimeout(5000);
 $action = $_GET['action'] ?? '';
 
 // Helper functions
@@ -1277,6 +1281,13 @@ switch ($action) {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
             foreach ($data as $key => $value) {
+                // irongate-audit: the Midnight read path needs no key material.
+                // Refuse to persist secret-bearing keys so a mnemonic can never
+                // re-enter the settings table (and from there an unauthenticated
+                // read and a world-readable config.yaml).
+                if (preg_match('/mnemonic|private_key|secret|passphrase|seed/i', $key)) {
+                    continue;
+                }
                 if (strpos($key, 'irongate_') === 0 || strpos($key, 'blockchain_') === 0) {
                     setSetting($db, $key, $value);
                 }
@@ -1289,8 +1300,9 @@ switch ($action) {
                       'irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end',
                       'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
                       'irongate_bypass_detection', 'irongate_firewall',
-                      'blockchain_enabled', 'blockchain_network', 'blockchain_app_id',
-                      'blockchain_admin_mnemonic', 'blockchain_cache_ttl', 'blockchain_fallback_allow',
+                      'blockchain_enabled', 'blockchain_network',
+                      'blockchain_contract_address', 'blockchain_indexer_url',
+                      'blockchain_cache_ttl', 'blockchain_fallback_allow',
                       'blockchain_audit_logging', 'blockchain_allow_rogue_devices'] as $key) {
                 $settings[$key] = getSetting($db, $key);
             }
@@ -1616,6 +1628,14 @@ switch ($action) {
         break;
     
     case 'update_now':
+        // irongate-audit: this action runs a downloaded script as root. As a
+        // GET it was reachable by any link, prefetch or cross-origin form,
+        // turning a page visit into root code execution. Require POST.
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            http_response_code(405);
+            echo json_encode(['success' => false, 'error' => 'update_now requires POST']);
+            break;
+        }
         // Perform update
         $repoRaw = 'https://raw.githubusercontent.com/beatboxes/irongate/main';
         $githubApi = 'https://api.github.com/repos/beatboxes/irongate/commits/main';
@@ -1679,6 +1699,16 @@ switch ($action) {
         ]]);
 }
 
+// irongate-audit: emit an arbitrary value as a safe YAML scalar.
+// JSON string escaping is a valid subset of YAML 1.2 double-quoted style, so
+// this neutralises the newlines, quotes and backslashes that previously let a
+// stored setting (group name, description, zone, interface...) inject arbitrary
+// YAML into /etc/irongate/config.yaml. A crafted value could add or rewrite
+// engine directives, or make the file unparseable so the engine died on restart.
+function yamlScalar($v) {
+    return json_encode((string)$v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
 // Irongate config generator
 function applyIrongateConfig($db) {
     $settings = getAllSettings($db);
@@ -1692,37 +1722,38 @@ function applyIrongateConfig($db) {
     $mode = $settings['irongate_mode'] ?? 'single';
     $interface = $settings['interface'] ?: trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
     $gateway = $settings['gateway'] ?: trim(shell_exec("ip route | grep default | awk '{print \$3}' | head -n1"));
-    $localIp = trim(shell_exec("ip -4 addr show $interface 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -n1"));
-    $localMac = trim(shell_exec("ip link show $interface 2>/dev/null | awk '/ether/ {print \$2}'"));
+    $localIp = trim(shell_exec("ip -4 addr show " . escapeshellarg($interface) . " 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -n1"));
+    $localMac = trim(shell_exec("ip link show " . escapeshellarg($interface) . " 2>/dev/null | awk '/ether/ {print \$2}'"));
     
     // Get gateway MAC - try ARP cache first, then arping
-    $gatewayMac = trim(shell_exec("ip neigh show | grep '$gateway ' | awk '{print \$5}' | head -n1"));
+    $gatewayMac = trim(shell_exec("ip neigh show | grep " . escapeshellarg($gateway . ' ') . " | awk '{print \$5}' | head -n1"));
     if (empty($gatewayMac)) {
-        exec("arping -c 1 -I $interface $gateway 2>/dev/null", $arpOutput);
-        $gatewayMac = trim(shell_exec("ip neigh show | grep '$gateway ' | awk '{print \$5}' | head -n1"));
+        exec("arping -c 1 -I " . escapeshellarg($interface) . " "
+             . escapeshellarg($gateway) . " 2>/dev/null", $arpOutput);
+        $gatewayMac = trim(shell_exec("ip neigh show | grep " . escapeshellarg($gateway . ' ') . " | awk '{print \$5}' | head -n1"));
     }
     
     // Generate YAML config
     $config = "# Irongate Configuration\n";
     $config .= "# Generated: " . date('Y-m-d H:i:s') . "\n\n";
     $config .= "network:\n";
-    $config .= "  interface: \"$interface\"\n";
-    $config .= "  local_ip: \"$localIp\"\n";
-    $config .= "  local_mac: \"$localMac\"\n";
-    $config .= "  gateway_ip: \"$gateway\"\n";
-    $config .= "  gateway_mac: \"$gatewayMac\"\n\n";
+    $config .= "  interface: " . yamlScalar($interface) . "\n";
+    $config .= "  local_ip: " . yamlScalar($localIp) . "\n";
+    $config .= "  local_mac: " . yamlScalar($localMac) . "\n";
+    $config .= "  gateway_ip: " . yamlScalar($gateway) . "\n";
+    $config .= "  gateway_mac: " . yamlScalar($gatewayMac) . "\n\n";
     
-    $config .= "mode: \"$mode\"\n\n";
+    $config .= "mode: " . yamlScalar($mode) . "\n\n";
     
     if ($mode === 'dual') {
         $config .= "bridge:\n";
         $config .= "  enabled: true\n";
-        $config .= "  isolated_interface: \"" . ($settings['irongate_isolated_interface'] ?? '') . "\"\n";
+        $config .= "  isolated_interface: " . yamlScalar($settings['irongate_isolated_interface'] ?? '') . "\n";
         $config .= "  bridge_name: \"br-irongate\"\n";
-        $config .= "  bridge_ip: \"" . ($settings['irongate_bridge_ip'] ?? '10.99.0.1') . "\"\n";
+        $config .= "  bridge_ip: " . yamlScalar($settings['irongate_bridge_ip'] ?? '10.99.0.1') . "\n";
         $config .= "  bridge_netmask: \"255.255.0.0\"\n";
-        $config .= "  dhcp_start: \"" . ($settings['irongate_bridge_dhcp_start'] ?? '10.99.1.1') . "\"\n";
-        $config .= "  dhcp_end: \"" . ($settings['irongate_bridge_dhcp_end'] ?? '10.99.255.254') . "\"\n";
+        $config .= "  dhcp_start: " . yamlScalar($settings['irongate_bridge_dhcp_start'] ?? '10.99.1.1') . "\n";
+        $config .= "  dhcp_end: " . yamlScalar($settings['irongate_bridge_dhcp_end'] ?? '10.99.255.254') . "\n";
         $config .= "  port_isolation: true\n\n";
     }
     
@@ -1734,21 +1765,30 @@ function applyIrongateConfig($db) {
     $config .= "  firewall: " . (($settings['irongate_firewall'] ?? 'true') === 'true' ? 'true' : 'false') . "\n\n";
     
     // Layer 8: Blockchain settings
-    $config .= "# Layer 8: Algorand Blockchain Verification\n";
+    // irongate-audit: migrated from Algorand to Midnight. The Midnight read path
+    // is unauthenticated, so app_id and admin_mnemonic are gone entirely - the
+    // mnemonic was previously persisted in the settings table, returned by an
+    // unauthenticated API action, and written in plaintext into this
+    // world-readable config file.
+    $config .= "# Layer 8: Midnight Blockchain Verification\n";
     $config .= "blockchain:\n";
     $config .= "  enabled: " . (($settings['blockchain_enabled'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
-    $config .= "  network: \"" . ($settings['blockchain_network'] ?? 'mainnet') . "\"\n";
-    $appId = $settings['blockchain_app_id'] ?? '';
-    if (!empty($appId) && $appId !== 'null') {
-        $config .= "  app_id: " . intval($appId) . "\n";
-    } else {
-        $config .= "  app_id: null\n";
+    $network = $settings['blockchain_network'] ?? 'preprod';
+    if (!in_array($network, ['preprod', 'preview', 'mainnet', 'undeployed'], true)) {
+        $network = 'preprod';
     }
-    $mnemonic = $settings['blockchain_admin_mnemonic'] ?? '';
-    if (!empty($mnemonic) && $mnemonic !== 'null') {
-        $config .= "  admin_mnemonic: \"" . $mnemonic . "\"\n";
+    $config .= "  network: " . yamlScalar($network) . "\n";
+    $contract = $settings['blockchain_contract_address'] ?? '';
+    if (!empty($contract) && $contract !== 'null') {
+        $config .= "  contract_address: " . yamlScalar($contract) . "\n";
     } else {
-        $config .= "  admin_mnemonic: null\n";
+        $config .= "  contract_address: null\n";
+    }
+    $indexer = $settings['blockchain_indexer_url'] ?? '';
+    if (!empty($indexer) && $indexer !== 'null') {
+        $config .= "  indexer_url: " . yamlScalar($indexer) . "\n";
+    } else {
+        $config .= "  indexer_url: null\n";
     }
     $config .= "  cache_ttl: " . intval($settings['blockchain_cache_ttl'] ?? 60) . "\n";
     $config .= "  fallback_allow: " . (($settings['blockchain_fallback_allow'] ?? 'true') === 'true' ? 'true' : 'false') . "\n";
@@ -1766,13 +1806,13 @@ function applyIrongateConfig($db) {
     $config .= "custom_groups:\n";
     if (!empty($customGroups)) {
         foreach ($customGroups as $group) {
-            $config .= "  - name: \"" . $group['name'] . "\"\n";
-            $config .= "    color: \"" . $group['color'] . "\"\n";
-            $config .= "    icon: \"" . $group['icon'] . "\"\n";
-            $config .= "    description: \"" . ($group['description'] ?? '') . "\"\n";
-            $config .= "    lan_access: \"" . ($group['lan_access'] ?? 'none') . "\"\n";
+            $config .= "  - name: " . yamlScalar($group['name']) . "\n";
+            $config .= "    color: " . yamlScalar($group['color']) . "\n";
+            $config .= "    icon: " . yamlScalar($group['icon']) . "\n";
+            $config .= "    description: " . yamlScalar($group['description'] ?? '') . "\n";
+            $config .= "    lan_access: " . yamlScalar($group['lan_access'] ?? 'none') . "\n";
             $canAccess = json_decode($group['can_access_groups'] ?? '[]', true) ?: [];
-            $config .= "    can_access_groups: [" . implode(', ', array_map(function($g) { return '"' . $g . '"'; }, $canAccess)) . "]\n";
+            $config .= "    can_access_groups: [" . implode(', ', array_map(function($g) { return yamlScalar($g); }, $canAccess)) . "]\n";
         }
     } else {
         $config .= "  []\n";
@@ -1789,9 +1829,9 @@ function applyIrongateConfig($db) {
     $config .= "devices:\n";
     if (!empty($devices)) {
         foreach ($devices as $dev) {
-            $config .= "  - mac: \"" . $dev['mac'] . "\"\n";
-            $config .= "    ip: \"" . $dev['ip'] . "\"\n";
-            $config .= "    zone: \"" . $dev['zone'] . "\"\n";
+            $config .= "  - mac: " . yamlScalar($dev['mac']) . "\n";
+            $config .= "    ip: " . yamlScalar($dev['ip']) . "\n";
+            $config .= "    zone: " . yamlScalar($dev['zone']) . "\n";
         }
     } else {
         $config .= "  []\n";
@@ -4060,7 +4100,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 `;
                 document.getElementById('btn-update-now').disabled = true;
                 
-                const res = await api('update_now');
+                const res = await api('update_now', {method:'POST'});
                 
                 if (res.success) {
                     document.getElementById('update-status-content').innerHTML = `
@@ -4259,12 +4299,34 @@ logger = logging.getLogger('irongate')
 
 # Try to import blockchain module (optional)
 try:
-    from blockchain import IrongateBlockchain, VerificationResult, ALGORAND_AVAILABLE
+    from blockchain import IrongateBlockchain, VerificationResult, MIDNIGHT_AVAILABLE
     BLOCKCHAIN_MODULE_AVAILABLE = True
 except ImportError:
     BLOCKCHAIN_MODULE_AVAILABLE = False
-    ALGORAND_AVAILABLE = False
+    MIDNIGHT_AVAILABLE = False
     logger.info("Blockchain module not available - Layer 8 disabled")
+
+def _audit_log(blockchain, mac, ip, action, result):
+    """Best-effort Layer 8 audit write.
+
+    log_access raises NotImplementedError on a chain with no local write path
+    (Midnight needs a funded wallet plus a ZK proof server). handle_arp's outer
+    handler is `except Exception: pass`, so an unguarded raise here would abort
+    the remainder of the handler - in the STRICT branch that means the blocking
+    ARP reply further down would never be sent, silently disabling Layer 8
+    enforcement for every device. Contain the failure at the call site instead.
+    """
+    try:
+        blockchain.log_access(mac, ip, action, result)
+    except NotImplementedError:
+        if not getattr(blockchain, '_audit_warned', False):
+            logger.warning(
+                "Layer 8 audit logging is enabled but this chain has no write "
+                "path - continuing without an on-chain audit trail")
+            blockchain._audit_warned = True
+    except Exception as exc:
+        logger.debug("Layer 8 audit log failed (non-critical): %s", exc)
+
 
 # Global reference for signal handler
 irongate = None
@@ -4350,9 +4412,8 @@ class Irongate:
             logger.warning("Layer 8 Blockchain: Module not available")
             return
         
-        if not ALGORAND_AVAILABLE:
-            logger.warning("Layer 8 Blockchain: Algorand SDK not installed")
-            logger.warning("  Install with: pip install py-algorand-sdk")
+        if not MIDNIGHT_AVAILABLE:
+            logger.warning("Layer 8 Blockchain: Midnight support unavailable")
             return
         
         try:
@@ -4362,8 +4423,9 @@ class Irongate:
             if self.blockchain_enabled:
                 logger.info("━" * 50)
                 logger.info("LAYER 8 BLOCKCHAIN: ACTIVE")
-                logger.info(f"  Network: {blockchain_config.get('network', 'mainnet')}")
-                logger.info(f"  App ID: {blockchain_config.get('app_id')}")
+                logger.info(f"  Chain: Midnight")
+                logger.info(f"  Network: {blockchain_config.get('network', 'preprod')}")
+                logger.info(f"  Contract: {blockchain_config.get('contract_address')}")
                 logger.info(f"  Cache TTL: {blockchain_config.get('cache_ttl', 60)}s")
                 logger.info(f"  Audit Logging: {blockchain_config.get('audit_logging', False)}")
                 if blockchain_config.get('allow_rogue_devices', False):
@@ -4543,21 +4605,32 @@ class Irongate:
         
         logger.info("Restoring ARP tables...")
         
+        # irongate-audit (ENG-003): these sendp() calls were unguarded. This
+        # runs from the SIGTERM path, so one failure aborted the whole loop
+        # and every device after it kept Irongate's forged MAC in its ARP
+        # cache - traffic black-holed until those entries aged out, with the
+        # daemon already gone. Each device is now restored independently.
         for dev_ip, dev_mac, zone in self.protected_devices:
-            # Restore protected device's view of gateway
-            pkt = Ether(dst=dev_mac, src=self.gateway_mac) / ARP(
-                op=2, pdst=dev_ip, hwdst=dev_mac,
-                psrc=self.gateway_ip, hwsrc=self.gateway_mac
-            )
-            sendp(pkt, iface=self.interface, verbose=False, count=5)
+            try:
+                # Restore protected device's view of gateway
+                pkt = Ether(dst=dev_mac, src=self.gateway_mac) / ARP(
+                    op=2, pdst=dev_ip, hwdst=dev_mac,
+                    psrc=self.gateway_ip, hwsrc=self.gateway_mac
+                )
+                sendp(pkt, iface=self.interface, verbose=False, count=5)
+            except Exception as e:
+                logger.error(f"  ARP restore failed for {dev_ip} (gateway view): {e}")
             
             # Restore all LAN devices' view of protected device
             for lan_ip, lan_mac in self.lan_devices:
-                pkt = Ether(dst=lan_mac, src=dev_mac) / ARP(
-                    op=2, pdst=lan_ip, hwdst=lan_mac,
-                    psrc=dev_ip, hwsrc=dev_mac
-                )
-                sendp(pkt, iface=self.interface, verbose=False, count=3)
+                try:
+                    pkt = Ether(dst=lan_mac, src=dev_mac) / ARP(
+                        op=2, pdst=lan_ip, hwdst=lan_mac,
+                        psrc=dev_ip, hwsrc=dev_mac
+                    )
+                    sendp(pkt, iface=self.interface, verbose=False, count=3)
+                except Exception as e:
+                    logger.error(f"  ARP restore failed for {lan_ip} -> {dev_ip}: {e}")
             
             logger.info(f"  Restored: {dev_ip}")
         
@@ -4840,6 +4913,13 @@ class Irongate:
         if blockchain:
             logger.info("  Layer 8 Blockchain: ACTIVE - devices must be registered on-chain")
         
+        # irongate-audit (ENG-001): the packet callback below used to end in
+        # a bare `except Exception: pass`. A failing sendp() - socket buffer
+        # full, EPERM, interface flap - therefore stopped the spoof silently,
+        # so isolation could break with nothing at all in the journal.
+        # Rate-limited, because this runs once per ARP packet.
+        _arp_err = {'last': 0.0, 'suppressed': 0}
+
         def handle_arp(pkt):
             if ARP not in pkt:
                 return
@@ -4873,7 +4953,7 @@ class Irongate:
                             # Device is cryptographically verified on-chain
                             # Allow it through (don't spoof)
                             if blockchain.audit_logging:
-                                blockchain.log_access(
+                                _audit_log(blockchain, 
                                     requester_mac, requester_ip,
                                     f"arp_request:{requested_ip}",
                                     "allowed_blockchain"
@@ -4896,7 +4976,7 @@ class Irongate:
                                 
                                 # Still log to blockchain audit trail if enabled
                                 if blockchain.audit_logging:
-                                    blockchain.log_access(
+                                    _audit_log(blockchain, 
                                         requester_mac, requester_ip,
                                         f"arp_request:{requested_ip}",
                                         f"rogue_allowed_{result_str}"
@@ -4910,7 +4990,7 @@ class Irongate:
                             
                             # Log to blockchain audit trail
                             if blockchain.audit_logging:
-                                blockchain.log_access(
+                                _audit_log(blockchain, 
                                     requester_mac, requester_ip,
                                     f"arp_request:{requested_ip}",
                                     f"blocked_{result_str}"
@@ -4976,8 +5056,19 @@ class Irongate:
                         # Burst of 5 packets to override the real MAC in ARP cache
                         sendp(counter, iface=self.interface, verbose=False, count=5)
                             
-            except Exception:
-                pass
+            except Exception as e:
+                now = time.time()
+                if now - _arp_err['last'] > 60:
+                    if _arp_err['suppressed']:
+                        logger.warning(
+                            "ARP callback error: %s (%d further errors suppressed in the last 60s)",
+                            e, _arp_err['suppressed'])
+                    else:
+                        logger.warning("ARP callback error: %s", e)
+                    _arp_err['last'] = now
+                    _arp_err['suppressed'] = 0
+                else:
+                    _arp_err['suppressed'] += 1
         
         logger.info(f"ARP defense monitoring {len(protected_ips)} protected IPs")
         
@@ -5277,41 +5368,64 @@ echo -e "${YELLOW}Creating blockchain verification module...${NC}"
 cat > /opt/irongate/blockchain.py << 'BLOCKCHAINPY'
 #!/usr/bin/env python3
 """
-Irongate Layer 8: Algorand Blockchain Verification Module
+Irongate Layer 8: Midnight Blockchain Verification Module
 
-Provides cryptographic device authentication via Algorand blockchain.
-This achieves 100% VLAN-equivalent protection by:
-- Storing authorized devices in an immutable on-chain registry
-- Verifying device identity via cryptographic signatures
-- Creating tamper-proof audit trails of all access attempts
+Provides device authentication against an on-chain registry hosted on the
+Midnight blockchain (https://midnight.network).
 
 This module is OPTIONAL - Irongate works fully without it.
 Enable in config.yaml under 'blockchain:' section.
 
-Requirements: pip install py-algorand-sdk
+Requirements: none. Uses only the Python standard library (urllib.request).
+There is no Python SDK for Midnight; the indexer is queried over HTTPS GraphQL.
+
+READ path  (verify_device / get_all_devices / get_stats): fully implemented.
+           The public Midnight indexers accept unauthenticated GraphQL POSTs,
+           so no wallet, key, mnemonic or API token is stored on this host.
+
+WRITE path (register_device / revoke_device / log_access): NOT implemented.
+           Submitting a Midnight transaction requires a funded wallet plus a
+           local ZK proof server. Those raise NotImplementedError rather than
+           silently reporting success. See MIDNIGHT_WRITE_UNAVAILABLE below.
+
+Migrated from the previous Algorand implementation. The previous version is
+kept alongside this file as blockchain_algorand.py.<ts>.reference.
 """
 
-import base64
-import hashlib
 import json
 import logging
+import threading
 import time
-from typing import Optional, Dict, Any, List, Tuple
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('irongate.blockchain')
 
-# Check for Algorand SDK availability
-ALGORAND_AVAILABLE = False
-try:
-    from algosdk.v2client import algod
-    from algosdk import account, mnemonic, transaction
-    from algosdk.error import AlgodHTTPError
-    ALGORAND_AVAILABLE = True
-    logger.info("Algorand SDK loaded - Layer 8 blockchain features available")
-except ImportError:
-    logger.info("Algorand SDK not installed - Layer 8 disabled (install with: pip install py-algorand-sdk)")
+# The Midnight read path needs nothing beyond the standard library, so the
+# capability flag is unconditionally True. It is kept as a module export
+# because irongate.py and the irongate-blockchain CLI import it by name.
+MIDNIGHT_AVAILABLE = True
+
+MIDNIGHT_WRITE_UNAVAILABLE = (
+    "Midnight write operations are not available on this host. Submitting a "
+    "transaction requires (a) a funded Midnight wallet holding NIGHT/tDUST and "
+    "(b) a local ZK proof server. No Python SDK exists, and the published "
+    "proof-server container has no confirmed aarch64 image, so it cannot be "
+    "hosted on this Raspberry Pi 4. Register and revoke devices out-of-band, "
+    "then point blockchain.contract_address at the deployed registry contract."
+)
+
+# Bound the device cache so a hostile or noisy /20 cannot grow it without limit.
+MAX_CACHE_ENTRIES = 4096
+
+# After this many consecutive indexer failures, stop making network calls for
+# BREAKER_COOLDOWN seconds. verify_device runs inside the scapy ARP callback,
+# so an unreachable indexer must never add latency to every packet.
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN = 30.0
 
 
 class VerificationResult(Enum):
@@ -5339,193 +5453,346 @@ class DeviceRecord:
 
 class IrongateBlockchain:
     """
-    Algorand Mainnet integration for Irongate network security.
-    
+    Midnight integration for Irongate network security.
+
     Features:
-    - Device whitelist stored immutably on Algorand blockchain
+    - Device whitelist read from a Midnight registry contract's on-chain state
     - Real-time device verification with local caching
-    - Cryptographic proof of device identity
-    - Tamper-proof audit logging
-    - Post-quantum ready (Algorand supports FALCON signatures)
-    
+    - Graceful degradation: an unreachable chain never blocks the ARP loop
+    - No credentials on disk - the read path is unauthenticated
+
     Usage:
         bc = IrongateBlockchain(config)
         if bc.enabled:
             result = bc.verify_device(mac, ip)
-            if result['verified']:
+            if result['verified'] is True:
                 # Allow device
-            else:
+            elif result['verified'] is False:
                 # Block device
+            else:
+                # None -> chain undecided, fall through to Layers 1-7
     """
-    
-    # Algorand Mainnet endpoints (free, no API key required)
+
+    # Public Midnight endpoints. The indexers accept unauthenticated GraphQL
+    # POSTs - no project id, no API key.
     NETWORKS = {
-        'mainnet': {
-            'algod': 'https://mainnet-api.algonode.cloud',
-            'indexer': 'https://mainnet-idx.algonode.cloud'
+        'preprod': {
+            'indexer': 'https://indexer.preprod.midnight.network/api/v4/graphql',
+            'rpc': 'https://rpc.preprod.midnight.network',
         },
-        'testnet': {
-            'algod': 'https://testnet-api.algonode.cloud', 
-            'indexer': 'https://testnet-idx.algonode.cloud'
-        }
+        'preview': {
+            'indexer': 'https://indexer.preview.midnight.network/api/v4/graphql',
+            'rpc': 'https://rpc.preview.midnight.network',
+        },
+        'mainnet': {
+            'indexer': 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+            'rpc': 'https://rpc.mainnet.midnight.network',
+        },
+        'undeployed': {
+            'indexer': 'http://127.0.0.1:8088/api/v4/graphql',
+            'rpc': 'http://127.0.0.1:9944',
+        },
     }
-    
+
+    DEFAULT_NETWORK = 'preprod'
+    DEFAULT_TIMEOUT = 5.0
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize blockchain connection.
-        
+
         Args:
             config: Blockchain config section from config.yaml
         """
         self.enabled = False
         self.config = config or {}
-        
-        # Set defaults for attributes that might be accessed even when disabled
-        self.network = self.config.get('network', 'mainnet')
+
+        # Defaults for attributes read by callers even when disabled.
+        self.network = self.config.get('network', self.DEFAULT_NETWORK)
         self.cache_ttl = self.config.get('cache_ttl', 60)
         self.fallback_allow = self.config.get('fallback_allow', True)
         self.audit_logging = self.config.get('audit_logging', False)
         self.allow_rogue_devices = self.config.get('allow_rogue_devices', False)
+        self.timeout = float(self.config.get('timeout', self.DEFAULT_TIMEOUT))
+        self.contract_address = self.config.get('contract_address')
+
         self._cache = {}
         self._cache_time = {}
-        self._global_state_cache = None  # Cached global state list
-        self._global_state_cache_time = 0  # Timestamp of last global state fetch
-        self._global_state_cache_ttl = 15  # Seconds to cache global state
-        self._admin_key = None
-        self._admin_address = None
-        
-        # Check if explicitly enabled
+        self._lock = threading.RLock()
+        self._state_cache = None
+        self._state_cache_time = 0.0
+        self._state_cache_ttl = 15.0
+        self._fail_count = 0
+        self._breaker_until = 0.0
+        # Always assigned so it is safe to read on a disabled instance.
+        self._last_sync = 0.0
+
+        if self.network not in self.NETWORKS:
+            logger.warning(
+                "Blockchain Layer 8: unknown network '%s' - falling back to '%s'",
+                self.network, self.DEFAULT_NETWORK,
+            )
+            self.network = self.DEFAULT_NETWORK
+
+        # An explicit indexer_url overrides the network preset.
+        self.indexer_url = (
+            self.config.get('indexer_url')
+            or self.NETWORKS[self.network]['indexer']
+        )
+
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")
             return
-        
-        # Check SDK availability
-        if not ALGORAND_AVAILABLE:
-            logger.warning("Blockchain Layer 8: Cannot enable - SDK not installed")
-            logger.warning("  Install with: pip install py-algorand-sdk")
+
+        if not self.contract_address:
+            logger.warning("Blockchain Layer 8: No contract_address configured - disabled")
+            logger.warning("  Deploy the registry contract and set blockchain.contract_address")
             return
-        
-        # Get additional config values
-        self.app_id = self.config.get('app_id')
-        self.admin_mnemonic = self.config.get('admin_mnemonic')
-        
-        # Validate app_id
-        if not self.app_id:
-            logger.warning("Blockchain Layer 8: No app_id configured - disabled")
-            logger.warning("  Deploy smart contract and set app_id in config")
-            return
-        
-        # Initialize Algorand client
-        try:
-            network_config = self.NETWORKS.get(self.network, self.NETWORKS['mainnet'])
-            self.algod_client = algod.AlgodClient('', network_config['algod'])
-            
-            # Test connection
-            status = self.algod_client.status()
-            logger.info(f"Blockchain Layer 8: Connected to Algorand {self.network}")
-            logger.info(f"  Network round: {status.get('last-round', 'unknown')}")
-            
-        except Exception as e:
-            logger.error(f"Blockchain Layer 8: Connection failed - {e}")
-            return
-        
-        # Initialize admin credentials if provided
-        if self.admin_mnemonic:
-            try:
-                self._admin_key = mnemonic.to_private_key(self.admin_mnemonic)
-                self._admin_address = account.address_from_private_key(self._admin_key)
-                logger.info(f"  Admin address: {self._admin_address[:12]}...{self._admin_address[-6:]}")
-            except Exception as e:
-                logger.warning(f"  Invalid admin mnemonic: {e}")
-        
-        self._last_sync = 0
-        
-        # Mark as enabled
+
+        # Probe the indexer once. A failure here is not fatal: the layer stays
+        # enabled and degrades to 'undecided' until the indexer recovers.
+        head = self._query_block()
+        if head is not None:
+            logger.info("Blockchain Layer 8: Connected to Midnight %s", self.network)
+            logger.info("  Indexer: %s", self.indexer_url)
+            logger.info("  Chain height: %s", head.get('height', 'unknown'))
+        else:
+            logger.warning(
+                "Blockchain Layer 8: indexer %s unreachable at startup - "
+                "layer enabled but will report 'undecided' until it recovers",
+                self.indexer_url,
+            )
+
         self.enabled = True
-        logger.info(f"Blockchain Layer 8: ENABLED (App ID: {self.app_id})")
-    
+        logger.info("Blockchain Layer 8: ENABLED (contract: %s)", self.contract_address)
+
+    # ------------------------------------------------------------------
+    # GraphQL transport
+    # ------------------------------------------------------------------
+
+    def _graphql(self, query: str, variables: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        POST a GraphQL query to the Midnight indexer.
+
+        Returns the 'data' object, or None on any transport/protocol failure.
+        Never raises - callers treat None as 'chain undecided'.
+        """
+        now = time.time()
+        if now < self._breaker_until:
+            logger.debug("Midnight indexer circuit breaker open for %.0fs more",
+                         self._breaker_until - now)
+            return None
+
+        payload = json.dumps({'query': query, 'variables': variables or {}}).encode('utf-8')
+        req = urllib.request.Request(
+            self.indexer_url,
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'irongate-layer8/2.0 (+midnight)',
+            },
+            method='POST',
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read()
+            parsed = json.loads(body.decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            self._record_failure("indexer HTTP %s" % exc.code)
+            return None
+        except urllib.error.URLError as exc:
+            self._record_failure("indexer unreachable: %s" % exc.reason)
+            return None
+        except (TimeoutError, OSError) as exc:
+            self._record_failure("indexer socket error: %s" % exc)
+            return None
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._record_failure("indexer returned non-JSON: %s" % exc)
+            return None
+
+        if parsed.get('errors'):
+            self._record_failure("GraphQL errors: %s" % parsed['errors'])
+            return None
+
+        self._record_success()
+        return parsed.get('data')
+
+    def _record_failure(self, detail: str):
+        with self._lock:
+            self._fail_count += 1
+            if self._fail_count >= BREAKER_THRESHOLD:
+                self._breaker_until = time.time() + BREAKER_COOLDOWN
+                logger.warning(
+                    "Midnight indexer failed %d consecutive times - pausing queries for %.0fs (%s)",
+                    self._fail_count, BREAKER_COOLDOWN, detail,
+                )
+            else:
+                logger.debug("Midnight indexer failure %d: %s", self._fail_count, detail)
+
+    def _record_success(self):
+        with self._lock:
+            self._fail_count = 0
+            self._breaker_until = 0.0
+            self._last_sync = time.time()
+
+    def _query_block(self) -> Optional[Dict]:
+        """Fetch the chain head. Doubles as the liveness probe."""
+        data = self._graphql('query { block { hash height timestamp } }')
+        if not data:
+            return None
+        return data.get('block')
+
+    # ------------------------------------------------------------------
+    # Cache
+    # ------------------------------------------------------------------
+
     def _get_cached(self, mac: str) -> Optional[Dict]:
         """Get device from cache if still valid"""
         mac = mac.lower()
-        if mac in self._cache:
-            age = time.time() - self._cache_time.get(mac, 0)
-            if age < self.cache_ttl:
+        with self._lock:
+            if mac not in self._cache:
+                return None
+            if time.time() - self._cache_time.get(mac, 0) < self.cache_ttl:
                 return self._cache[mac]
-            # Cache expired
-            del self._cache[mac]
-            if mac in self._cache_time:
-                del self._cache_time[mac]
-        return None
-    
-    def _set_cached(self, mac: str, data: Dict):
-        """Store device in cache"""
-        mac = mac.lower()
-        self._cache[mac] = data
-        self._cache_time[mac] = time.time()
-    
-    def _get_global_state(self) -> List:
-        """Get application global state, with 15s TTL caching."""
-        now = time.time()
-        if self._global_state_cache is not None and (now - self._global_state_cache_time) < self._global_state_cache_ttl:
-            return self._global_state_cache
-        app_info = self.algod_client.application_info(self.app_id)
-        self._global_state_cache = app_info.get('params', {}).get('global-state', [])
-        self._global_state_cache_time = now
-        return self._global_state_cache
+            self._cache.pop(mac, None)
+            self._cache_time.pop(mac, None)
+            return None
 
-    def _parse_device_value(self, value_bytes: bytes) -> Optional[Dict]:
-        """Parse device data from blockchain storage format"""
+    def _set_cached(self, mac: str, data: Dict):
+        """Store device in cache, evicting the oldest entry when full"""
+        mac = mac.lower()
+        with self._lock:
+            if mac not in self._cache and len(self._cache) >= MAX_CACHE_ENTRIES:
+                oldest = min(self._cache_time, key=self._cache_time.get)
+                self._cache.pop(oldest, None)
+                self._cache_time.pop(oldest, None)
+            self._cache[mac] = data
+            self._cache_time[mac] = time.time()
+
+    def clear_cache(self):
+        """Clear the local device cache"""
+        with self._lock:
+            self._cache.clear()
+            self._cache_time.clear()
+        logger.info("Blockchain cache cleared")
+
+    # ------------------------------------------------------------------
+    # Registry state
+    # ------------------------------------------------------------------
+
+    def _get_contract_state(self) -> Optional[bytes]:
+        """
+        Fetch the registry contract's latest on-chain state, with a short TTL
+        cache. Returns raw decoded bytes, or None if unavailable.
+        """
+        now = time.time()
+        with self._lock:
+            if self._state_cache is not None and (now - self._state_cache_time) < self._state_cache_ttl:
+                return self._state_cache
+
+        data = self._graphql(
+            'query ($addr: HexEncoded!) { contractAction(address: $addr) '
+            '{ address state transaction { hash } } }',
+            {'addr': self.contract_address},
+        )
+        if not data:
+            return None
+
+        action = data.get('contractAction')
+        if not action:
+            logger.debug("No contract action found for %s", self.contract_address)
+            return None
+
+        state_hex = action.get('state') or ''
         try:
-            value = value_bytes.decode('utf-8')
-            # Format: ip|zone|hostname|timestamp
-            parts = value.split('|')
-            if len(parts) >= 3:
-                return {
-                    'ip': parts[0],
-                    'zone': parts[1],
-                    'hostname': parts[2] if len(parts) > 2 else 'unknown',
-                    'timestamp': int(parts[3]) if len(parts) > 3 else 0
-                }
-        except:
-            pass
-        return None
-    
+            raw = bytes.fromhex(state_hex[2:] if state_hex.startswith('0x') else state_hex)
+        except ValueError as exc:
+            logger.error("Contract state is not valid hex: %s", exc)
+            return None
+
+        with self._lock:
+            self._state_cache = raw
+            self._state_cache_time = now
+        return raw
+
+    def _parse_registry(self, raw: bytes) -> Dict[str, Dict]:
+        """
+        Decode the device registry out of the contract's serialized state.
+
+        Registry encoding (the format the Irongate registry contract must use):
+            one record per line, "<mac>=<ip>|<zone>|<hostname>|<unix_ts>"
+        Records are located by scanning the decoded state for that framing, so
+        surrounding contract-specific serialization is tolerated.
+        """
+        devices = {}
+        try:
+            text = raw.decode('utf-8', errors='ignore')
+        except (UnicodeDecodeError, AttributeError) as exc:
+            logger.error("Cannot decode contract state: %s", exc)
+            return devices
+
+        for line in text.splitlines():
+            line = line.strip()
+            if '=' not in line or '|' not in line:
+                continue
+            mac, _, value = line.partition('=')
+            mac = mac.strip().lower().replace('-', ':')
+            if mac.count(':') != 5:
+                continue
+            parsed = self._parse_device_value(value.strip())
+            if parsed:
+                devices[mac] = parsed
+        return devices
+
+    def _parse_device_value(self, value: str) -> Optional[Dict]:
+        """Parse 'ip|zone|hostname|timestamp' into a dict."""
+        parts = value.split('|')
+        if len(parts) < 3:
+            return None
+        try:
+            timestamp = int(parts[3]) if len(parts) > 3 and parts[3] else 0
+        except ValueError:
+            timestamp = 0
+        return {
+            'ip': parts[0],
+            'zone': parts[1],
+            'hostname': parts[2] or 'unknown',
+            'timestamp': timestamp,
+        }
+
+    # ------------------------------------------------------------------
+    # Verification (read path)
+    # ------------------------------------------------------------------
+
     def verify_device(self, mac: str, ip: str) -> Dict[str, Any]:
         """
-        Verify a device against the blockchain registry.
-        
-        This is the main verification function called by Irongate's
-        ARP defense loop for every network access attempt.
-        
-        Args:
-            mac: Device MAC address (any format)
-            ip: Device IP address
-            
-        Returns:
-            Dict with:
-                - verified: bool (True if device should be allowed)
-                - result: VerificationResult enum
-                - zone: str (device zone if verified)
-                - hostname: str (device hostname if verified)
-                - trust_score: int (0-100)
-                - cached: bool (whether from cache)
-                - details: str (human-readable explanation)
+        Verify a device against the on-chain registry.
+
+        Called by Irongate's ARP defense loop for every access attempt to a
+        protected IP, so it must be fast and must never raise.
+
+        Returns a dict whose 'verified' key is deliberately three-valued:
+            True  -> registered on-chain and the IP matches; allow
+            False -> a definite negative (not registered / IP mismatch); block
+            None  -> undecided (layer disabled, or the chain could not be
+                     consulted). The caller MUST fall through to Layers 1-7.
+                     An unreachable chain is NOT proof of a trustworthy device,
+                     so it never yields True.
         """
-        # Not enabled - return neutral result
         if not self.enabled:
             return {
                 'verified': None,
                 'result': VerificationResult.DISABLED,
                 'trust_score': 50,
-                'details': 'Blockchain verification disabled'
+                'details': 'Blockchain verification disabled',
             }
-        
+
         mac = mac.lower().replace('-', ':')
-        
-        # Check cache first (fast path)
+
         cached = self._get_cached(mac)
         if cached:
-            # Negative cache hit - device was previously not found
             if cached.get('_not_registered'):
                 return {
                     'verified': False,
@@ -5534,7 +5801,7 @@ class IrongateBlockchain:
                     'ip': ip,
                     'trust_score': 0,
                     'cached': True,
-                    'details': f"Device {mac} not registered on blockchain (cached)"
+                    'details': "Device %s not registered on Midnight (cached)" % mac,
                 }
             if cached.get('ip') == ip:
                 return {
@@ -5544,68 +5811,41 @@ class IrongateBlockchain:
                     'hostname': cached.get('hostname'),
                     'trust_score': 100,
                     'cached': True,
-                    'details': f"Verified from cache (zone: {cached.get('zone')})"
+                    'details': "Verified from cache (zone: %s)" % cached.get('zone'),
                 }
-            else:
-                # IP mismatch - possible spoofing!
-                return {
-                    'verified': False,
-                    'result': VerificationResult.IP_MISMATCH,
-                    'expected_ip': cached.get('ip'),
-                    'actual_ip': ip,
-                    'trust_score': 0,
-                    'cached': True,
-                    'details': f"ALERT: MAC {mac} registered with IP {cached.get('ip')}, seen at {ip}"
-                }
+            return {
+                'verified': False,
+                'result': VerificationResult.IP_MISMATCH,
+                'expected_ip': cached.get('ip'),
+                'actual_ip': ip,
+                'trust_score': 0,
+                'cached': True,
+                'details': "ALERT: MAC %s registered with IP %s, seen at %s"
+                           % (mac, cached.get('ip'), ip),
+            }
 
-        # Query blockchain (uses cached global state with 15s TTL)
-        try:
-            global_state = self._get_global_state()
-            
-            for item in global_state:
-                # Decode key (MAC address)
-                try:
-                    key_bytes = base64.b64decode(item['key'])
-                    key = key_bytes.decode('utf-8').lower()
-                except:
-                    continue
-                
-                # Check if this is our device
-                if key == mac or key.replace(':', '') == mac.replace(':', ''):
-                    # Found device - decode value
-                    value_data = item.get('value', {})
-                    if value_data.get('type') == 1:  # bytes
-                        value_bytes = base64.b64decode(value_data.get('bytes', ''))
-                        device = self._parse_device_value(value_bytes)
-                        
-                        if device:
-                            # Cache it
-                            self._set_cached(mac, device)
-                            
-                            if device['ip'] == ip:
-                                return {
-                                    'verified': True,
-                                    'result': VerificationResult.VERIFIED,
-                                    'zone': device['zone'],
-                                    'hostname': device['hostname'],
-                                    'registered_at': device['timestamp'],
-                                    'trust_score': 100,
-                                    'cached': False,
-                                    'details': f"Blockchain verified (zone: {device['zone']})"
-                                }
-                            else:
-                                return {
-                                    'verified': False,
-                                    'result': VerificationResult.IP_MISMATCH,
-                                    'expected_ip': device['ip'],
-                                    'actual_ip': ip,
-                                    'zone': device['zone'],
-                                    'trust_score': 0,
-                                    'cached': False,
-                                    'details': f"SPOOFING DETECTED: {mac} should be at {device['ip']}"
-                                }
-            
-            # Device not found in registry - cache the negative result
+        raw = self._get_contract_state()
+        if raw is None:
+            # Chain not consulted. Undecided - never a pass, never a hard block
+            # unless the operator explicitly asked for fail-closed.
+            if self.fallback_allow:
+                return {
+                    'verified': None,
+                    'result': VerificationResult.BLOCKCHAIN_ERROR,
+                    'trust_score': 50,
+                    'details': 'Midnight indexer unavailable - deferring to Layers 1-7',
+                }
+            return {
+                'verified': False,
+                'result': VerificationResult.BLOCKCHAIN_ERROR,
+                'trust_score': 0,
+                'details': 'Midnight indexer unavailable - fail-closed (fallback_allow: false)',
+            }
+
+        registry = self._parse_registry(raw)
+        device = registry.get(mac) or registry.get(mac.replace(':', ''))
+
+        if not device:
             self._set_cached(mac, {'_not_registered': True})
             return {
                 'verified': False,
@@ -5614,300 +5854,151 @@ class IrongateBlockchain:
                 'ip': ip,
                 'trust_score': 0,
                 'cached': False,
-                'details': f"Device {mac} not registered on blockchain"
+                'details': "Device %s not registered on Midnight" % mac,
             }
-            
-        except AlgodHTTPError as e:
-            logger.error(f"Blockchain API error: {e}")
+
+        self._set_cached(mac, device)
+
+        if device['ip'] == ip:
             return {
-                'verified': self.fallback_allow,
-                'result': VerificationResult.BLOCKCHAIN_ERROR,
-                'trust_score': 50 if self.fallback_allow else 0,
-                'details': f"Blockchain unavailable: {e}"
+                'verified': True,
+                'result': VerificationResult.VERIFIED,
+                'zone': device['zone'],
+                'hostname': device['hostname'],
+                'registered_at': device['timestamp'],
+                'trust_score': 100,
+                'cached': False,
+                'details': "Midnight verified (zone: %s)" % device['zone'],
             }
-        except Exception as e:
-            logger.error(f"Blockchain verification error: {e}")
-            return {
-                'verified': self.fallback_allow,
-                'result': VerificationResult.BLOCKCHAIN_ERROR,
-                'trust_score': 50 if self.fallback_allow else 0,
-                'details': f"Verification error: {e}"
-            }
-    
-    def register_device(self, mac: str, ip: str, zone: str, hostname: str) -> Dict[str, Any]:
-        """
-        Register a new device on the Algorand blockchain.
-        
-        Args:
-            mac: Device MAC address
-            ip: Device IP address  
-            zone: Security zone (isolated/servers/trusted)
-            hostname: Device hostname
-            
-        Returns:
-            Dict with success status and transaction ID
-        """
-        if not self.enabled:
-            return {'success': False, 'error': 'Blockchain not enabled'}
-        
-        if not self._admin_key:
-            return {'success': False, 'error': 'No admin credentials configured'}
-        
-        mac = mac.lower().replace('-', ':')
-        
-        try:
-            params = self.algod_client.suggested_params()
-            
-            # Encode device data: ip|zone|hostname|timestamp
-            device_value = f"{ip}|{zone}|{hostname}|{int(time.time())}"
-            
-            txn = transaction.ApplicationCallTxn(
-                sender=self._admin_address,
-                sp=params,
-                index=self.app_id,
-                on_complete=transaction.OnComplete.NoOpOC,
-                app_args=[
-                    b"register",
-                    mac.encode(),
-                    device_value.encode()
-                ]
-            )
-            
-            signed_txn = txn.sign(self._admin_key)
-            tx_id = self.algod_client.send_transaction(signed_txn)
-            
-            # Wait for confirmation
-            result = transaction.wait_for_confirmation(self.algod_client, tx_id, 4)
-            
-            # Update cache
-            self._set_cached(mac, {
-                'ip': ip,
-                'zone': zone,
-                'hostname': hostname,
-                'timestamp': int(time.time())
-            })
-            
-            logger.info(f"Device registered on blockchain: {mac} -> {ip} ({zone})")
-            
-            return {
-                'success': True,
-                'tx_id': tx_id,
-                'confirmed_round': result.get('confirmed-round'),
-                'explorer_url': f"https://allo.info/tx/{tx_id}"
-            }
-            
-        except AlgodHTTPError as e:
-            error_msg = str(e)
-            if 'already' in error_msg.lower():
-                return {'success': False, 'error': 'Device already registered'}
-            return {'success': False, 'error': error_msg}
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-    
-    def revoke_device(self, mac: str) -> Dict[str, Any]:
-        """
-        Remove a device from the blockchain registry.
-        
-        Args:
-            mac: Device MAC address to revoke
-            
-        Returns:
-            Dict with success status
-        """
-        if not self.enabled:
-            return {'success': False, 'error': 'Blockchain not enabled'}
-        
-        if not self._admin_key:
-            return {'success': False, 'error': 'No admin credentials configured'}
-        
-        mac = mac.lower().replace('-', ':')
-        
-        try:
-            params = self.algod_client.suggested_params()
-            
-            txn = transaction.ApplicationCallTxn(
-                sender=self._admin_address,
-                sp=params,
-                index=self.app_id,
-                on_complete=transaction.OnComplete.NoOpOC,
-                app_args=[
-                    b"revoke",
-                    mac.encode()
-                ]
-            )
-            
-            signed_txn = txn.sign(self._admin_key)
-            tx_id = self.algod_client.send_transaction(signed_txn)
-            
-            transaction.wait_for_confirmation(self.algod_client, tx_id, 4)
-            
-            # Remove from cache
-            mac_lower = mac.lower()
-            if mac_lower in self._cache:
-                del self._cache[mac_lower]
-            if mac_lower in self._cache_time:
-                del self._cache_time[mac_lower]
-            
-            logger.info(f"Device revoked from blockchain: {mac}")
-            
-            return {
-                'success': True,
-                'tx_id': tx_id,
-                'explorer_url': f"https://allo.info/tx/{tx_id}"
-            }
-            
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-    
-    def log_access(self, mac: str, ip: str, action: str, result: str) -> Optional[str]:
-        """
-        Log an access attempt to the blockchain for immutable audit trail.
-        
-        This creates a permanent, tamper-proof record of every network
-        access attempt - useful for compliance and forensics.
-        
-        Args:
-            mac: Device MAC address
-            ip: Device IP address
-            action: Action attempted (e.g., "arp_request", "connect")
-            result: Result ("allowed", "blocked", "spoofed")
-            
-        Returns:
-            Transaction ID if successful, None otherwise
-        """
-        if not self.enabled or not self.audit_logging:
-            return None
-        
-        if not self._admin_key:
-            return None
-        
-        try:
-            params = self.algod_client.suggested_params()
-            
-            # Create audit log entry
-            log_entry = json.dumps({
-                't': 'audit',
-                'm': mac.lower(),
-                'i': ip,
-                'a': action,
-                'r': result,
-                'ts': int(time.time())
-            })
-            
-            # 0-ALGO self-transfer with note (costs ~0.001 ALGO)
-            txn = transaction.PaymentTxn(
-                sender=self._admin_address,
-                sp=params,
-                receiver=self._admin_address,
-                amt=0,
-                note=log_entry.encode()
-            )
-            
-            signed_txn = txn.sign(self._admin_key)
-            tx_id = self.algod_client.send_transaction(signed_txn)
-            
-            return tx_id
-            
-        except Exception as e:
-            logger.debug(f"Audit log failed (non-critical): {e}")
-            return None
-    
+
+        return {
+            'verified': False,
+            'result': VerificationResult.IP_MISMATCH,
+            'expected_ip': device['ip'],
+            'actual_ip': ip,
+            'zone': device['zone'],
+            'trust_score': 0,
+            'cached': False,
+            'details': "SPOOFING DETECTED: %s should be at %s" % (mac, device['ip']),
+        }
+
     def get_all_devices(self) -> List[DeviceRecord]:
-        """Get all registered devices from blockchain"""
+        """Get all registered devices from the on-chain registry"""
         if not self.enabled:
             return []
+        raw = self._get_contract_state()
+        if raw is None:
+            return []
+        return [
+            DeviceRecord(
+                mac=mac,
+                ip=dev['ip'],
+                zone=dev['zone'],
+                hostname=dev['hostname'],
+                registered_at=dev['timestamp'],
+            )
+            for mac, dev in sorted(self._parse_registry(raw).items())
+        ]
 
-        devices = []
-        try:
-            global_state = self._get_global_state()
-            
-            for item in global_state:
-                try:
-                    key_bytes = base64.b64decode(item['key'])
-                    key = key_bytes.decode('utf-8')
-                    
-                    # Skip system keys
-                    if key in ('admin', 'device_count', 'version'):
-                        continue
-                    
-                    # Check if looks like MAC
-                    if ':' not in key and len(key) != 12:
-                        continue
-                    
-                    value_data = item.get('value', {})
-                    if value_data.get('type') == 1:
-                        value_bytes = base64.b64decode(value_data.get('bytes', ''))
-                        device = self._parse_device_value(value_bytes)
-                        if device:
-                            devices.append(DeviceRecord(
-                                mac=key,
-                                ip=device['ip'],
-                                zone=device['zone'],
-                                hostname=device['hostname'],
-                                registered_at=device['timestamp']
-                            ))
-                except:
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Failed to get blockchain devices: {e}")
-        
-        return devices
-    
     def get_stats(self) -> Dict[str, Any]:
         """Get blockchain status and statistics"""
+        with self._lock:
+            cache_size = len(self._cache)
+            last_sync = self._last_sync
+            breaker_open = time.time() < self._breaker_until
+
         stats = {
             'enabled': self.enabled,
-            'sdk_available': ALGORAND_AVAILABLE,
-            'network': self.config.get('network', 'mainnet'),
-            'app_id': self.config.get('app_id'),
-            'cache_size': len(self._cache),
+            'sdk_available': MIDNIGHT_AVAILABLE,
+            'chain': 'midnight',
+            'network': self.network,
+            'indexer_url': self.indexer_url,
+            'contract_address': self.contract_address,
+            'cache_size': cache_size,
             'cache_ttl': self.cache_ttl,
             'fallback_allow': self.fallback_allow,
             'audit_logging': self.audit_logging,
             'allow_rogue_devices': self.allow_rogue_devices,
-            'admin_configured': self._admin_address is not None
+            'write_supported': False,
+            'last_sync': last_sync,
+            'breaker_open': breaker_open,
         }
-        
-        if self.enabled:
-            try:
-                status = self.algod_client.status()
-                stats['network_round'] = status.get('last-round')
-                stats['connected'] = True
-            except:
-                stats['connected'] = False
-        
+
+        head = self._query_block()
+        if head:
+            stats['connected'] = True
+            stats['chain_height'] = head.get('height')
+            stats['chain_head'] = head.get('hash')
+        else:
+            stats['connected'] = False
+
         return stats
-    
-    def clear_cache(self):
-        """Clear the local device cache"""
-        self._cache.clear()
-        self._cache_time.clear()
-        logger.info("Blockchain cache cleared")
+
+    # ------------------------------------------------------------------
+    # Write path - not available on this host
+    # ------------------------------------------------------------------
+
+    def register_device(self, mac: str, ip: str, zone: str, hostname: str) -> Dict[str, Any]:
+        """
+        Register a device on the Midnight registry contract.
+
+        NOT IMPLEMENTED. Requires a funded wallet and a ZK proof server; see
+        MIDNIGHT_WRITE_UNAVAILABLE. Raises rather than returning a fake result
+        so a caller can never mistake a no-op for a successful registration.
+        """
+        raise NotImplementedError(
+            "register_device(%s -> %s, zone=%s): %s" % (mac, ip, zone, MIDNIGHT_WRITE_UNAVAILABLE)
+        )
+
+    def revoke_device(self, mac: str) -> Dict[str, Any]:
+        """
+        Revoke a device from the Midnight registry contract.
+
+        NOT IMPLEMENTED - see MIDNIGHT_WRITE_UNAVAILABLE.
+        """
+        raise NotImplementedError(
+            "revoke_device(%s): %s" % (mac, MIDNIGHT_WRITE_UNAVAILABLE)
+        )
+
+    def log_access(self, mac: str, ip: str, action: str, result: str) -> Optional[str]:
+        """
+        Write an access attempt to the chain as an immutable audit record.
+
+        The disabled / audit-logging-off guard is evaluated FIRST, so that with
+        the shipped defaults (audit_logging: false) this stays a silent no-op
+        exactly as before. It only raises if an operator explicitly turns
+        audit_logging on, at which point the missing capability must be loud.
+        """
+        if not self.enabled or not self.audit_logging:
+            return None
+        raise NotImplementedError(
+            "log_access(%s/%s %s=%s): %s" % (mac, ip, action, result, MIDNIGHT_WRITE_UNAVAILABLE)
+        )
 
 
 # Standalone test
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    
+
     print("=" * 60)
-    print("IRONGATE LAYER 8: ALGORAND BLOCKCHAIN MODULE")
+    print("IRONGATE LAYER 8: MIDNIGHT BLOCKCHAIN MODULE")
     print("=" * 60)
-    
-    test_config = {
-        'enabled': True,
-        'network': 'mainnet',
-        'app_id': None,  # Set your app ID
-        'cache_ttl': 60
-    }
-    
-    bc = IrongateBlockchain(test_config)
-    print(f"\nStatus: {bc.get_stats()}")
-    
-    if bc.enabled:
-        # Test verification
-        result = bc.verify_device("aa:bb:cc:dd:ee:ff", "192.168.1.100")
-        print(f"Test result: {result}")
+
+    probe = IrongateBlockchain({'enabled': False, 'network': 'preprod'})
+    print("\nDisabled-instance stats: enabled=%s connected=%s height=%s"
+          % (probe.enabled, probe.get_stats().get('connected'),
+             probe.get_stats().get('chain_height')))
+
+    neutral = probe.verify_device("aa:bb:cc:dd:ee:ff", "192.168.1.100")
+    print("Disabled verify_device -> verified=%r result=%s"
+          % (neutral['verified'], neutral['result']))
+
+    try:
+        probe.register_device("aa:bb:cc:dd:ee:ff", "192.168.1.100", "isolated", "test")
+        print("ERROR: register_device should have raised")
+    except NotImplementedError as exc:
+        print("register_device correctly raised NotImplementedError")
+        print("  %s" % str(exc)[:120])
 BLOCKCHAINPY
 
 chmod +x /opt/irongate/blockchain.py
@@ -6343,10 +6434,9 @@ def load_config():
 def get_blockchain():
     """Get blockchain instance"""
     try:
-        from blockchain import IrongateBlockchain, ALGORAND_AVAILABLE
-        if not ALGORAND_AVAILABLE:
-            print("Algorand SDK not installed!")
-            print("Install with: pip install py-algorand-sdk")
+        from blockchain import IrongateBlockchain, MIDNIGHT_AVAILABLE
+        if not MIDNIGHT_AVAILABLE:
+            print("Midnight blockchain support unavailable!")
             sys.exit(1)
         
         config = load_config()
@@ -6368,8 +6458,10 @@ def cmd_status(args):
     print(f"\nSDK Available: {'✓ Yes' if stats.get('sdk_available') else '✗ No'}")
     print(f"Enabled: {'✓ Yes' if stats.get('enabled') else '✗ No'}")
     print(f"Network: {stats.get('network', 'N/A')}")
-    print(f"App ID: {stats.get('app_id', 'Not configured')}")
-    print(f"Admin Configured: {'✓ Yes' if stats.get('admin_configured') else '✗ No'}")
+    print(f"Contract: {stats.get('contract_address', 'Not configured')}")
+    print(f"Indexer: {stats.get('indexer_url', 'N/A')}")
+    print(f"Chain Height: {stats.get('chain_height', 'N/A')}")
+    print(f"Write Support: {'✓ Yes' if stats.get('write_supported') else '✗ No'}")
     
     if stats.get('enabled'):
         print(f"Connected: {'✓ Yes' if stats.get('connected') else '✗ No'}")
@@ -6605,7 +6697,11 @@ Examples:
         'sync': cmd_sync,
     }
     
-    commands[args.command](args)
+    try:
+        commands[args.command](args)
+    except NotImplementedError as exc:
+        print("\nThis command is not available:\n  %s" % exc)
+        sys.exit(2)
 
 
 if __name__ == '__main__':
@@ -6671,20 +6767,22 @@ layers:
   bypass_detection: true
   firewall: true
 
-# Layer 8: Algorand Blockchain Verification (OPTIONAL)
-# Provides 100% VLAN-equivalent protection via cryptographic device authentication
-# Set enabled: true and configure app_id to activate
+# Layer 8: Midnight Blockchain Verification (OPTIONAL)
+# Cryptographic device authentication against an on-chain registry.
+# Set enabled: true and configure contract_address to activate.
+# The read path is unauthenticated, so no key material is stored on this host.
 blockchain:
   enabled: false
-  network: "mainnet"
-  # Your deployed smart contract App ID (required if enabled)
-  app_id: null
-  # Admin mnemonic for registering/revoking devices (25 words)
-  # Keep this secure! Only needed for admin operations
-  admin_mnemonic: null
+  # preprod | preview | mainnet | undeployed
+  network: "preprod"
+  # Address of the deployed Midnight device-registry contract (required if enabled)
+  contract_address: null
+  # Override the indexer endpoint; null uses the preset for the chosen network
+  indexer_url: null
   # Cache TTL in seconds (reduces blockchain queries)
   cache_ttl: 60
-  # Allow network access if blockchain unavailable
+  # When the chain cannot be consulted: true = undecided, defer to Layers 1-7;
+  # false = fail closed and block. It never means 'treat as verified'.
   fallback_allow: true
   # Log all access attempts to blockchain audit trail
   audit_logging: false
@@ -6922,6 +7020,15 @@ server {
     # Limit request size
     client_max_body_size 10M;
     
+    # irongate-audit: block source and database artifacts from being served.
+    # Backup files (api.php.bak.<ts>) do not end in .php, so the php location
+    # never claims them and \`location /\` returned them as plaintext source.
+    # The SQLite device database was likewise downloadable in full.
+    location ~* \.(bak|old|orig|swp|save|sql|sqlite|sqlite3|db)(\.[0-9]+)?\$ {
+        deny all;
+        return 403;
+    }
+
     location / { try_files \$uri \$uri/ =404; }
     
     location ~ \.php\$ {
