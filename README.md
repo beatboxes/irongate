@@ -13,8 +13,8 @@ Many organizations need to isolate critical devices (servers, medical equipment,
 - **8 Layers of Protection** - Defense-in-depth approach ensures isolation even if one layer is bypassed
 - **No Special Hardware Required** - Works on standard unmanaged network infrastructure
 - **Two Isolation Modes** - Single-NIC (software-based) or Dual-NIC (hardware-enforced) isolation
-- **Web-Based Management** - Modern HTTPS dashboard for real-time monitoring and device management
-- **Zone-Based Security** - Classify devices into quarantine, isolated, servers, or trusted zones
+- **Web-Based Management** - Web dashboard for real-time monitoring and device management
+- **Zone-Based Security** - Classify devices into isolated, servers, or trusted zones, plus custom device groups
 - **Active Threat Detection** - Real-time monitoring for bypass attempts with automatic response
 
 ## How It Works
@@ -102,14 +102,16 @@ sudo ./irongate_installer.sh
 ### Post-Installation
 
 After installation, Irongate creates:
-- Configuration: `/etc/irongate/irongate.yaml`
-- Logs: `/var/log/irongate/`
-- Device database: `/var/lib/irongate/zones/devices.yaml`
-- Web interface: `https://localhost:8443`
+- Configuration: `/etc/irongate/config.yaml` (generated from the device database)
+- Logs: the systemd journal (`journalctl -u irongate`)
+- Device database: `/var/www/irongate/dhcp.db` (SQLite)
+- Web interface: `http://localhost`
 
 ## Configuration
 
-The main configuration file is located at `/etc/irongate/irongate.yaml`:
+The engine reads `/etc/irongate/config.yaml`. It is generated from the device database by the web
+API, so edit devices through the dashboard rather than by hand — a manual edit is overwritten on the
+next apply.
 
 ```yaml
 network:
@@ -117,12 +119,10 @@ network:
   gateway_ip: 192.168.1.1      # Network gateway IP
   isolated_network: 10.55.0.0/16
 
-security:
-  zones:
-    - quarantine   # New/unknown devices
-    - isolated     # Devices requiring isolation
-    - servers      # Protected server zone
-    - trusted      # Trusted devices with full access
+devices:
+  - mac: "aa:bb:cc:dd:ee:ff"
+    ip: "10.0.0.50"
+    zone: "isolated"    # isolated | servers | trusted
 ```
 
 ### Isolation Modes
@@ -176,7 +176,7 @@ sudo systemctl status irongate-engine
 
 ### Web Interface
 
-Access the management dashboard at `https://localhost:8443`
+Access the management dashboard at `http://localhost`
 
 Features:
 - Real-time system status monitoring
@@ -280,3 +280,43 @@ Contributions are welcome! Please submit issues and pull requests to help improv
 ---
 
 **Disclaimer**: Irongate is a powerful network manipulation tool. Use responsibly and only on networks you own or have explicit permission to manage. Unauthorized use on networks you do not control may violate laws and regulations.
+
+## Layer 8: Midnight blockchain verification (optional)
+
+Irongate can verify device identity against a registry contract on the
+[Midnight](https://midnight.network) blockchain, a privacy-focused chain with zero-knowledge proofs
+and selective disclosure.
+
+The **read path is implemented and tested**. It queries Midnight's public indexer over HTTPS GraphQL
+using only the Python standard library — there is no SDK dependency, no wallet, and no key material
+of any kind stored on the host. Networks are config-driven across `preprod`, `preview`, `mainnet`
+and `undeployed` (a local node).
+
+The **write path is not implemented**. Submitting a Midnight transaction requires a funded wallet
+and a ZK proof server, and the published proof-server image has no confirmed `aarch64` build, so it
+cannot run on a Raspberry Pi. `register_device`, `revoke_device` and `log_access` raise
+`NotImplementedError` with an explanatory message rather than silently reporting success.
+
+Layer 8 is **disabled by default** and entirely optional — Irongate's network isolation works with
+no blockchain involvement at all. When enabled but the chain cannot be reached, verification returns
+"undecided" and enforcement falls through to the standard layers; an unreachable chain is never
+treated as proof that a device is trustworthy.
+
+```yaml
+blockchain:
+  enabled: false
+  network: "preprod"        # preprod | preview | mainnet | undeployed
+  contract_address: null    # required when enabled
+  indexer_url: null         # null uses the preset for the chosen network
+  fallback_allow: true      # true = undecided, defer to the other layers
+```
+
+## Testing
+
+```bash
+IRONGATE_DIR=/opt/irongate /opt/irongate/venv/bin/python tests/test_blockchain.py
+```
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
