@@ -509,14 +509,14 @@
             
             <!-- Layer 8 Blockchain Page -->
             <div class="page" id="page-blockchain">
-                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Algorand Blockchain</h2>
+                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Midnight Blockchain</h2>
                 
                 <div id="blockchain-alert" class="alert" style="display:none;"></div>
                 
                 <!-- Overview Card -->
                 <div class="card" style="background:linear-gradient(135deg,rgba(102,51,153,0.2),rgba(22,33,62,0.5));">
                     <div class="card-title" style="color:#9966cc;">What is Layer 8?</div>
-                    <p style="margin-bottom:10px;">Layer 8 adds <strong>cryptographic device verification</strong> via the Algorand blockchain. Each device must be registered on-chain to access protected resources.</p>
+                    <p style="margin-bottom:10px;">Layer 8 adds <strong>privacy-preserving device verification</strong> via the <a href="https://midnight.network" target="_blank" rel="noopener" style="color:var(--accent);">Midnight</a> blockchain. A device can be proven to be registered and correctly zoned without publishing what the device is, so the registry does not become a public map of your network.</p>
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-top:15px;">
                         <div style="background:var(--bg);padding:12px;border-radius:8px;">
                             <strong>🔐 Immutable Registry</strong>
@@ -548,36 +548,45 @@
                         <div id="blockchain-connection-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
                     </div>
                     <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
-                        When enabled, devices must be registered on the Algorand blockchain to access protected resources.
+                        When enabled, devices must be registered on the Midnight registry contract to access protected resources.
                         Requires a deployed smart contract (App ID).
                     </p>
                 </div>
                 
-                <!-- Smart Contract Config -->
+                <!-- Contract Configuration -->
                 <div class="card">
-                    <div class="card-title">Smart Contract Configuration</div>
+                    <div class="card-title">Midnight Configuration</div>
                     <div class="form-row">
                         <div class="form-group">
                             <label>Network</label>
-                            <select class="form-control" id="blockchain-network" style="max-width:200px;">
-                                <option value="mainnet">Mainnet (Production)</option>
-                                <option value="testnet">Testnet (Testing)</option>
+                            <select class="form-control" id="blockchain-network" style="max-width:220px;">
+                                <option value="preprod">Preprod (recommended)</option>
+                                <option value="preview">Preview</option>
+                                <option value="mainnet">Mainnet</option>
+                                <option value="undeployed">Undeployed (local node)</option>
                             </select>
                         </div>
                         <div class="form-group" style="flex:2;">
-                            <label>App ID (Smart Contract)</label>
-                            <input class="form-control" id="blockchain-app-id" type="number" placeholder="e.g., 1234567890">
+                            <label>Contract Address</label>
+                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x...">
                             <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
-                                Deploy with: <code>python3 /opt/irongate/smart_contract.py</code>
+                                Address of the deployed device-registry contract. Required to enable Layer 8.
                             </div>
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>Admin Mnemonic (25 words)</label>
-                        <input class="form-control" id="blockchain-mnemonic" type="password" placeholder="your 25 word recovery phrase...">
+                        <label>Indexer URL (optional)</label>
+                        <input class="form-control" id="blockchain-indexer-url" type="text" placeholder="leave blank to use the preset for the selected network">
                         <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
-                            ⚠️ Keep secure! Only needed for registering/revoking devices.
-                            <button class="btn btn-secondary" style="padding:2px 8px;font-size:0.8em;margin-left:10px;" onclick="document.getElementById('blockchain-mnemonic').type = document.getElementById('blockchain-mnemonic').type === 'password' ? 'text' : 'password'">👁️ Show/Hide</button>
+                            The public Midnight indexers accept unauthenticated queries, so no wallet or key
+                            material is stored on this device. Read operations only.
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <div style="padding:12px;background:var(--bg);border-radius:6px;font-size:0.85em;color:var(--text-secondary);">
+                            <strong>Write operations are not available.</strong> Registering or revoking a device
+                            on-chain requires a funded Midnight wallet and a ZK proof server, which does not run on
+                            this hardware. Verification is read-only, and no recovery phrase is ever needed or stored.
                         </div>
                     </div>
                 </div>
@@ -604,7 +613,7 @@
                             <input type="checkbox" id="blockchain-audit" style="margin-top:3px;">
                             <div>
                                 <strong>📝 Audit Logging</strong>
-                                <div style="font-size:0.8em;color:var(--text-secondary);">Log all access attempts to blockchain. Adds ~0.001 ALGO per entry.</div>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Log access attempts on-chain. Not currently available: writing to Midnight needs a wallet and a proof server.</div>
                             </div>
                         </label>
                     </div>
@@ -641,13 +650,11 @@
                 <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
                     <div class="card-title" style="color:#e94560;">Setup Guide</div>
                     <ol style="margin:10px 0 0 20px;color:var(--text-secondary);line-height:1.8;">
-                        <li>Install Algorand SDK: <code>pip install py-algorand-sdk --break-system-packages</code></li>
-                        <li>Compile smart contract: <code>python3 /opt/irongate/smart_contract.py</code></li>
-                        <li>Create Algorand wallet (Pera Wallet or MyAlgo) and fund with ~1 ALGO</li>
-                        <li>Deploy contract using AlgoKit or goal CLI</li>
-                        <li>Enter App ID and mnemonic above</li>
-                        <li>Enable blockchain and save</li>
-                        <li>Register devices: <code>irongate-blockchain sync</code></li>
+                        <li>Deploy a device-registry contract to Midnight and note its address</li>
+                        <li>Choose the network the contract is deployed on (preprod, preview or mainnet)</li>
+                        <li>Enter the contract address above</li>
+                        <li>Enable Layer 8 and save &mdash; the engine restarts automatically</li>
+                        <li>Check the connection status above to confirm the indexer is reachable</li>
                     </ol>
                 </div>
             </div>
@@ -1457,9 +1464,9 @@
                     }
                     
                     // Update form fields
-                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'mainnet';
-                    document.getElementById('blockchain-app-id').value = res.data.blockchain_app_id || '';
-                    document.getElementById('blockchain-mnemonic').value = res.data.blockchain_admin_mnemonic || '';
+                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'preprod';
+                    document.getElementById('blockchain-contract-address').value = res.data.blockchain_contract_address || '';
+                    document.getElementById('blockchain-indexer-url').value = res.data.blockchain_indexer_url || '';
                     document.getElementById('blockchain-cache-ttl').value = res.data.blockchain_cache_ttl || '60';
                     document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
                     document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
@@ -1475,10 +1482,12 @@
             const enabling = !toggle.classList.contains('active');
             
             // Quick validation
+            // Layer 8 cannot function without a contract address; enabling it without
+            // one silently leaves the layer off, so refuse here rather than mislead.
             if (enabling) {
-                const appId = document.getElementById('blockchain-app-id').value;
-                if (!appId) {
-                    toast('Please enter an App ID before enabling blockchain', 'error');
+                const addr = document.getElementById('blockchain-contract-address').value.trim();
+                if (!addr) {
+                    toast('Enter a contract address before enabling Layer 8', 'error');
                     return;
                 }
             }
@@ -1498,19 +1507,19 @@
         
         async function saveBlockchainSettings() {
             const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
-            const appId = document.getElementById('blockchain-app-id').value;
+            const contractAddr = document.getElementById('blockchain-contract-address').value.trim();
             
             // Validate if enabling
-            if (enabled && !appId) {
-                toast('App ID is required to enable blockchain', 'error');
+            if (enabled && !contractAddr) {
+                toast('Contract address is required to enable Layer 8', 'error');
                 return;
             }
             
             const settings = {
                 blockchain_enabled: enabled ? 'true' : 'false',
                 blockchain_network: document.getElementById('blockchain-network').value,
-                blockchain_app_id: appId || '',
-                blockchain_admin_mnemonic: document.getElementById('blockchain-mnemonic').value || '',
+                blockchain_contract_address: contractAddr,
+                blockchain_indexer_url: document.getElementById('blockchain-indexer-url').value.trim(),
                 blockchain_cache_ttl: document.getElementById('blockchain-cache-ttl').value || '60',
                 blockchain_fallback_allow: document.getElementById('blockchain-fallback').checked ? 'true' : 'false',
                 blockchain_audit_logging: document.getElementById('blockchain-audit').checked ? 'true' : 'false',
@@ -1535,25 +1544,23 @@
         }
         
         async function testBlockchainConnection() {
-            const appId = document.getElementById('blockchain-app-id').value;
             const network = document.getElementById('blockchain-network').value;
-            
-            if (!appId) {
-                toast('Enter an App ID first', 'error');
+            const addr = document.getElementById('blockchain-contract-address').value.trim();
+            const custom = document.getElementById('blockchain-indexer-url').value.trim();
+            const connStatus = document.getElementById('blockchain-connection-status');
+
+            if (!addr) {
+                toast('Enter a contract address first', 'error');
                 return;
             }
-            
-            toast('Testing connection...', 'info');
-            
-            // For now, just show a message - actual test would need a backend endpoint
-            const connStatus = document.getElementById('blockchain-connection-status');
-            connStatus.innerHTML = '<span style="color:var(--warning);">⏳ Testing...</span>';
-            
-            // Simulate connection test
-            setTimeout(() => {
-                connStatus.innerHTML = '<span style="color:var(--success);">✓ Algorand ' + network + ' reachable</span>';
-                toast('Connection test: Algorand ' + network + ' is reachable. Save settings and restart to fully activate.', 'success');
-            }, 1500);
+
+            // This deliberately does not claim a result. The browser cannot reach the
+            // indexer on the engine's behalf, and the previous version simply waited
+            // and then reported success without contacting anything. Reachability is
+            // established by the engine at startup and shown in its log.
+            const endpoint = custom || ('https://indexer.' + network + '.midnight.network/api/v4/graphql');
+            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Configured: ' + endpoint + '</span>';
+            toast('Save and apply, then check the engine log - it reports the chain height it read at startup.', 'info');
         }
         
         //======================================================================

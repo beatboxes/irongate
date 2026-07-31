@@ -1110,28 +1110,15 @@ switch ($action) {
             }
         }
         
-        // Download the latest install script
-        $ctx = stream_context_create(['http' => ['timeout' => 30, 'header' => 'User-Agent: Irongate-Updater']]);
-        $script = @file_get_contents("$repoRaw/irongate-install.sh", false, $ctx);
-        
-        if ($script === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to download update']);
-            break;
-        }
-        
-        // Save commit hash BEFORE running update (in case script fails to set it)
-        setSetting($db, 'installed_commit', $targetCommit);
-        
-        // Save and execute
-        file_put_contents($scriptPath, $script);
-        chmod($scriptPath, 0755);
-        
-        // Create log file with proper permissions first
+        // irongate-audit (D5/D6): this used to download the installer as www-data
+        // into a world-writable path and sudo-execute it. Any local user could
+        // replace that file first, so an unauthenticated request became root code
+        // execution. The web tier now only TRIGGERS the update; the root-owned
+        // updater fetches the installer, pins it to a commit, and verifies it
+        // before running. No attacker-supplied bytes are ever executed from here.
         exec("sudo touch /var/log/irongate-update.log");
         exec("sudo chown www-data /var/log/irongate-update.log");
-        
-        // Run update in background
-        exec("sudo bash $scriptPath > /var/log/irongate-update.log 2>&1 &");
+        exec("sudo /bin/bash /opt/irongate/irongate-updater.sh --force > /dev/null 2>&1 &");
         
         echo json_encode([
             'success' => true,

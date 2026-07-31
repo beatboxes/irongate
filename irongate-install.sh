@@ -1669,28 +1669,15 @@ switch ($action) {
             }
         }
         
-        // Download the latest install script
-        $ctx = stream_context_create(['http' => ['timeout' => 30, 'header' => 'User-Agent: Irongate-Updater']]);
-        $script = @file_get_contents("$repoRaw/irongate-install.sh", false, $ctx);
-        
-        if ($script === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to download update']);
-            break;
-        }
-        
-        // Save commit hash BEFORE running update (in case script fails to set it)
-        setSetting($db, 'installed_commit', $targetCommit);
-        
-        // Save and execute
-        file_put_contents($scriptPath, $script);
-        chmod($scriptPath, 0755);
-        
-        // Create log file with proper permissions first
+        // irongate-audit (D5/D6): this used to download the installer as www-data
+        // into a world-writable path and sudo-execute it. Any local user could
+        // replace that file first, so an unauthenticated request became root code
+        // execution. The web tier now only TRIGGERS the update; the root-owned
+        // updater fetches the installer, pins it to a commit, and verifies it
+        // before running. No attacker-supplied bytes are ever executed from here.
         exec("sudo touch /var/log/irongate-update.log");
         exec("sudo chown www-data /var/log/irongate-update.log");
-        
-        // Run update in background
-        exec("sudo bash $scriptPath > /var/log/irongate-update.log 2>&1 &");
+        exec("sudo /bin/bash /opt/irongate/irongate-updater.sh --force > /dev/null 2>&1 &");
         
         echo json_encode([
             'success' => true,
@@ -2393,14 +2380,14 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             
             <!-- Layer 8 Blockchain Page -->
             <div class="page" id="page-blockchain">
-                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Algorand Blockchain</h2>
+                <h2 style="margin-bottom:20px;">⛓️ Layer 8: Midnight Blockchain</h2>
                 
                 <div id="blockchain-alert" class="alert" style="display:none;"></div>
                 
                 <!-- Overview Card -->
                 <div class="card" style="background:linear-gradient(135deg,rgba(102,51,153,0.2),rgba(22,33,62,0.5));">
                     <div class="card-title" style="color:#9966cc;">What is Layer 8?</div>
-                    <p style="margin-bottom:10px;">Layer 8 adds <strong>cryptographic device verification</strong> via the Algorand blockchain. Each device must be registered on-chain to access protected resources.</p>
+                    <p style="margin-bottom:10px;">Layer 8 adds <strong>privacy-preserving device verification</strong> via the <a href="https://midnight.network" target="_blank" rel="noopener" style="color:var(--accent);">Midnight</a> blockchain. A device can be proven to be registered and correctly zoned without publishing what the device is, so the registry does not become a public map of your network.</p>
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-top:15px;">
                         <div style="background:var(--bg);padding:12px;border-radius:8px;">
                             <strong>🔐 Immutable Registry</strong>
@@ -2432,36 +2419,45 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                         <div id="blockchain-connection-status" style="font-size:0.9em;color:var(--text-secondary);"></div>
                     </div>
                     <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
-                        When enabled, devices must be registered on the Algorand blockchain to access protected resources.
+                        When enabled, devices must be registered on the Midnight registry contract to access protected resources.
                         Requires a deployed smart contract (App ID).
                     </p>
                 </div>
                 
-                <!-- Smart Contract Config -->
+                <!-- Contract Configuration -->
                 <div class="card">
-                    <div class="card-title">Smart Contract Configuration</div>
+                    <div class="card-title">Midnight Configuration</div>
                     <div class="form-row">
                         <div class="form-group">
                             <label>Network</label>
-                            <select class="form-control" id="blockchain-network" style="max-width:200px;">
-                                <option value="mainnet">Mainnet (Production)</option>
-                                <option value="testnet">Testnet (Testing)</option>
+                            <select class="form-control" id="blockchain-network" style="max-width:220px;">
+                                <option value="preprod">Preprod (recommended)</option>
+                                <option value="preview">Preview</option>
+                                <option value="mainnet">Mainnet</option>
+                                <option value="undeployed">Undeployed (local node)</option>
                             </select>
                         </div>
                         <div class="form-group" style="flex:2;">
-                            <label>App ID (Smart Contract)</label>
-                            <input class="form-control" id="blockchain-app-id" type="number" placeholder="e.g., 1234567890">
+                            <label>Contract Address</label>
+                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x...">
                             <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
-                                Deploy with: <code>python3 /opt/irongate/smart_contract.py</code>
+                                Address of the deployed device-registry contract. Required to enable Layer 8.
                             </div>
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>Admin Mnemonic (25 words)</label>
-                        <input class="form-control" id="blockchain-mnemonic" type="password" placeholder="your 25 word recovery phrase...">
+                        <label>Indexer URL (optional)</label>
+                        <input class="form-control" id="blockchain-indexer-url" type="text" placeholder="leave blank to use the preset for the selected network">
                         <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
-                            ⚠️ Keep secure! Only needed for registering/revoking devices.
-                            <button class="btn btn-secondary" style="padding:2px 8px;font-size:0.8em;margin-left:10px;" onclick="document.getElementById('blockchain-mnemonic').type = document.getElementById('blockchain-mnemonic').type === 'password' ? 'text' : 'password'">👁️ Show/Hide</button>
+                            The public Midnight indexers accept unauthenticated queries, so no wallet or key
+                            material is stored on this device. Read operations only.
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <div style="padding:12px;background:var(--bg);border-radius:6px;font-size:0.85em;color:var(--text-secondary);">
+                            <strong>Write operations are not available.</strong> Registering or revoking a device
+                            on-chain requires a funded Midnight wallet and a ZK proof server, which does not run on
+                            this hardware. Verification is read-only, and no recovery phrase is ever needed or stored.
                         </div>
                     </div>
                 </div>
@@ -2488,7 +2484,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                             <input type="checkbox" id="blockchain-audit" style="margin-top:3px;">
                             <div>
                                 <strong>📝 Audit Logging</strong>
-                                <div style="font-size:0.8em;color:var(--text-secondary);">Log all access attempts to blockchain. Adds ~0.001 ALGO per entry.</div>
+                                <div style="font-size:0.8em;color:var(--text-secondary);">Log access attempts on-chain. Not currently available: writing to Midnight needs a wallet and a proof server.</div>
                             </div>
                         </label>
                     </div>
@@ -2525,13 +2521,11 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                 <div class="card" style="background:linear-gradient(135deg,rgba(233,69,96,0.1),rgba(22,33,62,0.5));">
                     <div class="card-title" style="color:#e94560;">Setup Guide</div>
                     <ol style="margin:10px 0 0 20px;color:var(--text-secondary);line-height:1.8;">
-                        <li>Install Algorand SDK: <code>pip install py-algorand-sdk --break-system-packages</code></li>
-                        <li>Compile smart contract: <code>python3 /opt/irongate/smart_contract.py</code></li>
-                        <li>Create Algorand wallet (Pera Wallet or MyAlgo) and fund with ~1 ALGO</li>
-                        <li>Deploy contract using AlgoKit or goal CLI</li>
-                        <li>Enter App ID and mnemonic above</li>
-                        <li>Enable blockchain and save</li>
-                        <li>Register devices: <code>irongate-blockchain sync</code></li>
+                        <li>Deploy a device-registry contract to Midnight and note its address</li>
+                        <li>Choose the network the contract is deployed on (preprod, preview or mainnet)</li>
+                        <li>Enter the contract address above</li>
+                        <li>Enable Layer 8 and save &mdash; the engine restarts automatically</li>
+                        <li>Check the connection status above to confirm the indexer is reachable</li>
                     </ol>
                 </div>
             </div>
@@ -3341,9 +3335,9 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     }
                     
                     // Update form fields
-                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'mainnet';
-                    document.getElementById('blockchain-app-id').value = res.data.blockchain_app_id || '';
-                    document.getElementById('blockchain-mnemonic').value = res.data.blockchain_admin_mnemonic || '';
+                    document.getElementById('blockchain-network').value = res.data.blockchain_network || 'preprod';
+                    document.getElementById('blockchain-contract-address').value = res.data.blockchain_contract_address || '';
+                    document.getElementById('blockchain-indexer-url').value = res.data.blockchain_indexer_url || '';
                     document.getElementById('blockchain-cache-ttl').value = res.data.blockchain_cache_ttl || '60';
                     document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
                     document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
@@ -3359,10 +3353,12 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             const enabling = !toggle.classList.contains('active');
             
             // Quick validation
+            // Layer 8 cannot function without a contract address; enabling it without
+            // one silently leaves the layer off, so refuse here rather than mislead.
             if (enabling) {
-                const appId = document.getElementById('blockchain-app-id').value;
-                if (!appId) {
-                    toast('Please enter an App ID before enabling blockchain', 'error');
+                const addr = document.getElementById('blockchain-contract-address').value.trim();
+                if (!addr) {
+                    toast('Enter a contract address before enabling Layer 8', 'error');
                     return;
                 }
             }
@@ -3382,19 +3378,19 @@ cat > /var/www/irongate/index.html << 'EOHTML'
         
         async function saveBlockchainSettings() {
             const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
-            const appId = document.getElementById('blockchain-app-id').value;
+            const contractAddr = document.getElementById('blockchain-contract-address').value.trim();
             
             // Validate if enabling
-            if (enabled && !appId) {
-                toast('App ID is required to enable blockchain', 'error');
+            if (enabled && !contractAddr) {
+                toast('Contract address is required to enable Layer 8', 'error');
                 return;
             }
             
             const settings = {
                 blockchain_enabled: enabled ? 'true' : 'false',
                 blockchain_network: document.getElementById('blockchain-network').value,
-                blockchain_app_id: appId || '',
-                blockchain_admin_mnemonic: document.getElementById('blockchain-mnemonic').value || '',
+                blockchain_contract_address: contractAddr,
+                blockchain_indexer_url: document.getElementById('blockchain-indexer-url').value.trim(),
                 blockchain_cache_ttl: document.getElementById('blockchain-cache-ttl').value || '60',
                 blockchain_fallback_allow: document.getElementById('blockchain-fallback').checked ? 'true' : 'false',
                 blockchain_audit_logging: document.getElementById('blockchain-audit').checked ? 'true' : 'false',
@@ -3419,25 +3415,23 @@ cat > /var/www/irongate/index.html << 'EOHTML'
         }
         
         async function testBlockchainConnection() {
-            const appId = document.getElementById('blockchain-app-id').value;
             const network = document.getElementById('blockchain-network').value;
-            
-            if (!appId) {
-                toast('Enter an App ID first', 'error');
+            const addr = document.getElementById('blockchain-contract-address').value.trim();
+            const custom = document.getElementById('blockchain-indexer-url').value.trim();
+            const connStatus = document.getElementById('blockchain-connection-status');
+
+            if (!addr) {
+                toast('Enter a contract address first', 'error');
                 return;
             }
-            
-            toast('Testing connection...', 'info');
-            
-            // For now, just show a message - actual test would need a backend endpoint
-            const connStatus = document.getElementById('blockchain-connection-status');
-            connStatus.innerHTML = '<span style="color:var(--warning);">⏳ Testing...</span>';
-            
-            // Simulate connection test
-            setTimeout(() => {
-                connStatus.innerHTML = '<span style="color:var(--success);">✓ Algorand ' + network + ' reachable</span>';
-                toast('Connection test: Algorand ' + network + ' is reachable. Save settings and restart to fully activate.', 'success');
-            }, 1500);
+
+            // This deliberately does not claim a result. The browser cannot reach the
+            // indexer on the engine's behalf, and the previous version simply waited
+            // and then reported success without contacting anything. Reachability is
+            // established by the engine at startup and shown in its log.
+            const endpoint = custom || ('https://indexer.' + network + '.midnight.network/api/v4/graphql');
+            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Configured: ' + endpoint + '</span>';
+            toast('Save and apply, then check the engine log - it reports the chain height it read at startup.', 'info');
         }
         
         //======================================================================
@@ -4209,9 +4203,8 @@ www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 644 /var/lib/dnsmasq/dnsmasq.leases
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 664 /var/log/dnsmasq.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u dnsmasq *
 www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u irongate *
-www-data ALL=(ALL) NOPASSWD: /usr/bin/tail *
 www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
-www-data ALL=(ALL) NOPASSWD: /bin/bash /tmp/irongate-update.sh
+www-data ALL=(ALL) NOPASSWD: /bin/bash /opt/irongate/irongate-updater.sh --force
 www-data ALL=(ALL) NOPASSWD: /usr/bin/touch /var/log/irongate-update.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chown www-data /var/log/irongate-update.log
 EOF
@@ -4295,6 +4288,7 @@ import yaml
 import time
 import signal
 import logging
+import tempfile
 import subprocess
 import threading
 from pathlib import Path
@@ -5254,9 +5248,22 @@ table inet irongate {{{sets_section}{rules_section}}}
 """
         try:
             os.system('nft delete table inet irongate 2>/dev/null')
-            with open('/tmp/irongate.nft', 'w') as f:
-                f.write(rules)
-            result = os.system('nft -f /tmp/irongate.nft')
+            # irongate-audit (D11): stage through a unique file instead of a fixed
+            # path in a world-writable directory. The previous /tmp/irongate.nft
+            # could be replaced between the write and the load, injecting arbitrary
+            # firewall rules as root.
+            nft_fd, nft_path = tempfile.mkstemp(prefix='irongate-', suffix='.nft')
+            try:
+                with os.fdopen(nft_fd, 'w') as f:
+                    f.write(rules)
+                # os.system runs a shell, but nft_path is generated by mkstemp and
+                # is always [A-Za-z0-9_]+ - no metacharacters, not attacker-influenced.
+                result = os.system(f'nft -f {nft_path}')
+            finally:
+                try:
+                    os.unlink(nft_path)
+                except OSError:
+                    pass
             if result == 0:
                 # Log summary
                 custom_count = len([g for g in custom_groups if g.get('name') not in ['isolated', 'servers', 'trusted']])
@@ -6859,9 +6866,16 @@ echo -e "${YELLOW}Creating auto-updater service...${NC}"
 cat > /opt/irongate/irongate-updater.sh << 'UPDATER'
 #!/bin/bash
 # Irongate Auto-Updater (commit hash based)
+#
+# Runs as root. The web interface may TRIGGER an update (--force) but never
+# supplies the code: this script fetches and verifies the installer itself.
 
 GITHUB_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
-REPO_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
+REPO_RAW_BASE="https://raw.githubusercontent.com/beatboxes/irongate"
+STAGE_DIR="/opt/irongate/.update"
+MIN_INSTALLER_BYTES=100000
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
 DB_PATH="/var/www/irongate/dhcp.db"
 LOG_FILE="/var/log/irongate-update.log"
 
@@ -6871,7 +6885,7 @@ log() {
 
 # Check if auto-update is enabled
 AUTO_UPDATE=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='auto_update_enabled';" 2>/dev/null)
-if [ "$AUTO_UPDATE" != "true" ]; then
+if [ "$AUTO_UPDATE" != "true" ] && [ "$FORCE" -ne 1 ]; then
     log "Auto-update is disabled, skipping"
     exit 0
 fi
@@ -6882,7 +6896,8 @@ log "Starting update check..."
 CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null || echo "unknown")
 
 # Get latest commit from GitHub API
-REMOTE_COMMIT=$(curl -sf -H "User-Agent: Irongate-Updater" "$GITHUB_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
+REMOTE_SHA=$(curl -sf -H "User-Agent: Irongate-Updater" "$GITHUB_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4)
+REMOTE_COMMIT=$(printf '%s' "$REMOTE_SHA" | cut -c1-7)
 
 if [ -z "$REMOTE_COMMIT" ]; then
     log "ERROR: Could not fetch remote commit from GitHub API"
@@ -6895,26 +6910,55 @@ log "Current: $CURRENT_COMMIT, Remote: $REMOTE_COMMIT"
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
 # Compare commits
-if [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; then
+if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
     log "Update available! Downloading..."
     
     # Store the target commit BEFORE running update (in case script fails to set it)
     sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$REMOTE_COMMIT');" 2>/dev/null
     log "Set target commit to $REMOTE_COMMIT"
     
-    # Download and run installer
-    SCRIPT_PATH="/tmp/irongate-update.sh"
-    curl -sf -H "User-Agent: Irongate-Updater" "$REPO_RAW/irongate-install.sh" -o "$SCRIPT_PATH"
-    
-    if [ -f "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH"
-        log "Running installer..."
-        bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
-        log "Update complete!"
+    # Download the installer into a root-only directory. /tmp is world-writable,
+    # so staging there let any local user swap the file between download and
+    # execution - and the web user had a sudo grant to run exactly that path.
+    mkdir -p "$STAGE_DIR"
+    chmod 700 "$STAGE_DIR"
+    SCRIPT_PATH="$STAGE_DIR/irongate-install.sh"
+    rm -f "$SCRIPT_PATH"
+
+    # Pin to the resolved commit rather than the moving main ref, so the bytes
+    # executed are the bytes that were checked.
+    if [ -n "$REMOTE_SHA" ]; then
+        SRC_URL="$REPO_RAW_BASE/$REMOTE_SHA/irongate-install.sh"
     else
-        log "ERROR: Failed to download update script"
+        SRC_URL="$REPO_RAW_BASE/main/irongate-install.sh"
+    fi
+    log "Downloading $SRC_URL"
+    curl -sf -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
+
+    # Integrity gate. None of this is a substitute for a signature, but it does
+    # reject the realistic failures: a truncated download, an HTML error page
+    # served instead of the script, or a corrupted file.
+    if [ ! -s "$SCRIPT_PATH" ]; then
+        log "ERROR: downloaded installer is missing or empty - aborting"
         exit 1
     fi
+    SCRIPT_SIZE=$(stat -c%s "$SCRIPT_PATH" 2>/dev/null || echo 0)
+    if [ "$SCRIPT_SIZE" -lt "$MIN_INSTALLER_BYTES" ]; then
+        log "ERROR: installer is only ${SCRIPT_SIZE} bytes, expected >= ${MIN_INSTALLER_BYTES} - aborting"
+        rm -f "$SCRIPT_PATH"
+        exit 1
+    fi
+    if ! bash -n "$SCRIPT_PATH" 2>/dev/null; then
+        log "ERROR: installer failed syntax check - aborting"
+        rm -f "$SCRIPT_PATH"
+        exit 1
+    fi
+    log "Integrity checks passed (${SCRIPT_SIZE} bytes, syntax valid, commit ${REMOTE_COMMIT})"
+
+    chmod 700 "$SCRIPT_PATH"
+    log "Running installer..."
+    bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
+    log "Update complete!"
 else
     log "Already up to date"
 fi
