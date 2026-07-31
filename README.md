@@ -103,24 +103,117 @@ Layer 8 targeted Algorand until July 2026. The legacy Algorand contract is retai
 `src/smart_contract.py` for reference and is not used by the engine; its optional build
 dependencies live in `requirements-legacy.txt`.
 
-## Security
+## Security audit
 
-IronGate has been through a structured security audit. It produced 41 verified findings
-(13 critical, 15 high, 10 medium, 3 low), of which 15 were fixed and verified with none rolled
-back. Fixes included:
+IronGate went through a structured security audit in July 2026. 50 candidate findings were raised;
+each was then put through an adversarial verification pass that tried to refute it, which rejected 9
+as unreachable or duplicated. **41 findings survived verification** — 13 critical, 15 high,
+10 medium, 3 low.
 
-- unauthenticated command injection reaching root via the web API
-- PHP source and the SQLite device database being served over HTTP
-- a credential path that would have written a wallet mnemonic in plaintext to a world-readable
-  config file — removed entirely rather than guarded
-- a fail-open in the blockchain layer where an unreachable chain returned "verified" and silently
-  bypassed the other layers
-- YAML injection into the generated engine config
-- unlogged exceptions in the ARP callback that could break isolation silently
+Disposition of those 41:
 
-Known remaining gaps are tracked honestly: the web API has no authentication and is bound to
-localhost and a private interface rather than the LAN; the auto-updater has no signature
-verification. Both are documented rather than hidden.
+| | Count |
+|---|---|
+| Fixed and verified | **22** |
+| Partially fixed | **2** |
+| Deferred with a stated reason | **17** |
+
+15 code changes closed those 22 findings, because several changes each closed more than one: a
+single YAML-escaping helper closed 7 injection findings, and rewriting the blockchain module closed
+6 at once. Nothing was rolled back.
+
+One finding is worth calling out because it cuts against the process: the verification pass
+**rejected** the blockchain fail-open, judging it unreachable. It was fixed anyway, because a
+reproduction test demonstrated the failure on the pre-fix code — an unreachable chain really did
+return "verified" and skip every other layer. Evidence outranked the judgement call.
+
+### Fixed (22)
+
+- **Command injection** into shell commands from unauthenticated, user-settable values — the two
+  entry points are now argument-escaped.
+- **Source and database disclosure** — PHP source backups and the SQLite device database were
+  served in full over HTTP; now blocked at the web server.
+- **Credential storage path removed entirely** rather than guarded. A wallet recovery phrase could
+  previously be persisted and written in plaintext into a world-readable config file. The field is
+  gone, and secret-bearing keys are now refused on write.
+- **Blockchain fail-open** — an unreachable chain returned "verified", silently bypassing the other
+  layers. Verification is now three-valued, and an unreachable chain yields *undecided*.
+- **YAML injection** into the generated engine config from stored settings (7 findings) — all
+  interpolated values now go through an escaping emitter.
+- **Root code execution reachable by a plain GET** — the update action now requires POST.
+- **Blockchain module hardening** (6 findings) — request timeouts, a circuit breaker, a bounded and
+  lock-protected cache, and removal of exception-swallowing bare handlers. Relevant because
+  verification is called from inside a per-packet callback.
+- **Silent ARP callback failures** — a bare handler hid `sendp()` errors, so isolation could break
+  with nothing in the log.
+- **Shutdown ARP restoration** aborted entirely on the first failure, leaving later devices holding
+  a forged MAC after the daemon exited. Each device is now restored independently.
+- **Database lock handling** — no busy timeout, so concurrent writes silently lost settings.
+
+### Partially fixed (2)
+
+| Component | Finding | What was done, what remains |
+|---|---|---|
+| Updater / web API | Root code execution through the update path | The method restriction is in place, closing drive-by triggering. The downloaded installer is still executed **without signature verification** — see D6. |
+| Web API | Full configuration returned without authentication | The credential field was removed entirely, so it can no longer be disclosed. The remainder of the configuration is still returned unauthenticated — see D1. |
+
+### Deferred (17)
+
+These were identified and verified, then deliberately deferred — not missed. Each carries the
+specific reason. They are described by category and component; exact locations are omitted
+deliberately, since this repository is public and several remain live.
+
+**Critical**
+
+| # | Component | Finding | Why deferred |
+|---|---|---|---|
+| D1 | Web API | No authentication of any kind. Every action, including privileged ones, is accepted from any requester. | **Architectural** — needs a session/token system and a matching dashboard rework. Not patchable in isolation. Mitigated by binding the service to localhost and a private management interface rather than the LAN. |
+| D2 | Web API | State-changing operations are reachable by simple request with no CSRF protection. | **Architectural** — depends on D1; tokens are meaningless without an identity to bind them to. |
+| D3 | Web API | User-controlled settings are embedded into DHCP server configuration without escaping, allowing injected directives. | **DHCP risk** — the generator writes the config for the DHCP service the network depends on. A validation bug here takes DHCP down for every device. Requires a staged rollout with rollback. |
+| D4 | Web API | The generated DHCP configuration is written with no pre-write syntax check or rollback path. | **DHCP risk** — same blast radius as D3, and out of the audit's permitted change surface. |
+| D5 | Host configuration | The web user holds passwordless sudo for service control, so an unauthenticated request can restart services as root. | **Out of scope** — system-level privilege configuration was outside the audit's change surface, and the grant is load-bearing for normal operation. Meaningful only once D1 exists. |
+| D6 | Updater | The installer is downloaded and executed as root with no checksum or signature verification. A repository compromise is a root compromise on every deployment. | **Requires external dependency** — needs a signing key, a publishing process and verification logic. Cannot be fixed by a code change alone. |
+
+**High**
+
+| # | Component | Finding | Why deferred |
+|---|---|---|---|
+| D7 | Web API | The automatic repair routine can forcibly kill the DHCP service, with no rate limiting. | **DHCP risk** — already partially mitigated by a guard that only kills a service that is not running. Removing the kill path entirely needs testing against real failure modes. |
+| D8 | Web API | The service restart is backgrounded and success is reported before it has completed or been validated. | **Operator decision required** — changes the apply semantics the dashboard depends on; a synchronous restart alters timeout behaviour visible to users. |
+| D9 | Web API | Settings writes are not error-checked, so a failed write is silently ignored. | **Architectural** — a correct fix is a transactional settings layer with surfaced errors, not a return-value check bolted onto the loop. |
+| D10 | Engine | Shutdown ARP restoration is O(protected × LAN devices) and can exceed the service stop timeout on a large network. | **Operator decision required** — the fix is either a tuned stop timeout or a reduced restoration burst, and both are deployment-specific trade-offs against restoration completeness. |
+| D11 | Engine | Firewall rules are staged through a predictable path in a world-writable directory before being applied, giving a time-of-check/time-of-use window. | **Out of scope** — the firewall application path was frozen during the audit; changing where rules are staged risks the enforcement path itself. |
+| D12 | Engine | In dual-NIC mode the DHCP service is launched without any success check, so the mode can run believing DHCP is up when it is not. | **Not deployed** — dual-NIC mode is not in use; single-NIC is the deployed configuration. Fix alongside any dual-NIC work. |
+
+**Medium**
+
+| # | Component | Finding | Why deferred |
+|---|---|---|---|
+| D13 | Engine | Duplicate of D12 — the same unchecked DHCP launch, reported independently by a second reviewer. Listed rather than silently dropped, so the count reconciles. | **Duplicate** — resolved by D12. |
+| D14 | Engine | The DHCP grace-period file is parsed without validating MAC address format; malformed entries are accepted. | **Operator decision required** — rejecting malformed entries changes which devices receive grace-period treatment, and a too-strict rule could isolate legitimate devices mid-DHCP. |
+| D15 | Engine | Device MAC addresses from configuration are used without format validation. Command execution uses argument lists, so this is not injection, but invalid values propagate. | **Operator decision required** — same policy question as D14: validation strictness determines which real devices stop being protected. |
+
+**Low**
+
+| # | Component | Finding | Why deferred |
+|---|---|---|---|
+| D16 | Web API | The installed version identifier is returned without authentication, allowing deployed patch levels to be enumerated. | **Low risk — next cycle.** Depends on D1; the repository is public, so the value discloses little that is not already inferable. |
+| D17 | CLI | The registration command accepts unvalidated MAC and IP input. | **Now largely moot** — the on-chain write path raises `NotImplementedError`, so no invalid data can reach a chain. Worth fixing whenever writes are implemented. |
+
+### Additional findings since the audit (3)
+
+Found after the audit concluded, so outside the 41 above:
+
+| Severity | Component | Finding |
+|---|---|---|
+| High | Dashboard | The Layer 8 panel still presents a **wallet recovery-phrase field** and submits it over unauthenticated plain HTTP. The API now refuses to store it, so a real phrase entered here is silently discarded *after* already being transmitted. **Do not enter a real recovery phrase.** The field is stale UI from the pre-migration integration and should be removed. |
+| Medium | Dashboard | The Layer 8 panel still describes the previous Algorand integration — application ID, SDK installation, funding a wallet — none of which apply to the current Midnight integration. Misleading to anyone configuring it. |
+| Low | Installer | The Algorand SDK is still installed at setup. The Midnight layer needs no third-party package; only the retained legacy contract does. |
+
+### Reporting
+
+If you find something not listed here, please open an issue. Known gaps are documented rather than
+hidden — a security tool that misrepresents its own coverage is worse than one that does less.
 
 ## Quick start
 
