@@ -7069,13 +7069,29 @@ fi
 
 echo -e "PHP-FPM Socket: ${GREEN}$PHP_SOCK${NC}"
 
+# Optional admin workstation allow-listed for the web UI (kept out of the
+# public repo; pass ADMIN_LAN_IP=<ip> when running the installer)
+NGINX_ADMIN_ALLOW=""
+if [ -n "${ADMIN_LAN_IP:-}" ]; then
+    NGINX_ADMIN_ALLOW="    allow ${ADMIN_LAN_IP};"
+fi
+
 cat > /etc/nginx/sites-available/irongate << EOF
 server {
     listen $WEBUI_PORT;
     server_name _;
     root /var/www/irongate;
     index index.html;
-    
+
+    # Source-IP access control: localhost, Tailscale CGNAT range, plus an
+    # optional admin workstation (ADMIN_LAN_IP env at install time). The
+    # wildcard listen above avoids the bind(99) boot race that IP-pinned
+    # listens caused when nginx started before tailscale0 had its address.
+    allow 127.0.0.1;
+$NGINX_ADMIN_ALLOW
+    allow 100.64.0.0/10;
+    deny all;
+
     # Timeouts to prevent hung connections
     client_body_timeout 10s;
     client_header_timeout 10s;
