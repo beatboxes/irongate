@@ -598,6 +598,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
 
+// Session guard: all API actions require an authenticated WebUI session.
+// Localhost calls without a session cookie are exempted inside the guard.
+require_once __DIR__ . '/session_check.php';
+
 $db = new SQLite3('/var/www/irongate/dhcp.db');
 // irongate-audit: without a busy timeout, a concurrent php-fpm worker holding
 // the write lock made this connection fail immediately, silently dropping
@@ -654,6 +658,53 @@ function safeApplyConfig($db) {
 
 function cidrToHosts($cidr) {
     return pow(2, 32 - intval($cidr)) - 2;
+}
+
+// Validate an allow-list entry: single IP (v4/v6) or IPv4 CIDR. Returns the
+// trimmed entry on success, false otherwise. Used by the auth endpoints.
+function validAllowEntry($v) {
+    $v = trim((string)$v);
+    if (filter_var($v, FILTER_VALIDATE_IP)) return $v;
+    if (preg_match('#^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$#', $v, $m)) {
+        for ($i = 1; $i <= 4; $i++) { if (intval($m[$i]) > 255) return false; }
+        if (intval($m[5]) > 32) return false;
+        return $v;
+    }
+    return false;
+}
+
+// True when $ip is covered by one of the allow-list entries (exact or CIDR).
+function aclCovers($entries, $ip) {
+    foreach ($entries as $e) {
+        if ($e === $ip) return true;
+        if (strpos($e, '/') !== false) {
+            list($net, $bits) = explode('/', $e, 2);
+            $ipL = ip2long($ip);
+            $netL = ip2long($net);
+            $bits = intval($bits);
+            if ($ipL !== false && $netL !== false && $bits >= 0 && $bits <= 32) {
+                $mask = $bits === 0 ? 0 : (~0 << (32 - $bits)) & 0xFFFFFFFF;
+                if (($ipL & $mask) === ($netL & $mask)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Write the access-control JSON and regenerate the nginx snippet via sudo.
+// Returns ['success'=>bool, 'error'=>?, 'detail'=>?].
+function writeAclAndRegen($acl) {
+    $acl['updated_at'] = date('c');
+    if (@file_put_contents('/etc/irongate/access-control.json',
+            json_encode($acl, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+        return ['success' => false, 'error' => 'Failed to write access-control config'];
+    }
+    exec('sudo /opt/irongate/regen-access.sh 2>&1', $regenOut, $regenCode);
+    if ($regenCode !== 0) {
+        return ['success' => false, 'error' => 'nginx regeneration failed',
+                'detail' => implode("\n", array_slice($regenOut, -5))];
+    }
+    return ['success' => true, 'acl' => $acl];
 }
 
 function getLeases() {
@@ -1692,14 +1743,139 @@ switch ($action) {
         echo json_encode(['success' => true, 'data' => $log ?: 'No update log available']);
         break;
     
+    // --- Auth management endpoints (added by webauth feature; session-protected) ---
+    case 'change_password':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $cur = (string)($data['current_password'] ?? '');
+        $new = (string)($data['new_password'] ?? '');
+        $confirm = (string)($data['confirm_password'] ?? '');
+        $auth = json_decode(@file_get_contents('/etc/irongate/auth.json'), true);
+        if (!is_array($auth) || empty($auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Auth config unavailable']);
+            break;
+        }
+        if (!password_verify($cur, $auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Current password is incorrect']);
+            break;
+        }
+        if (strlen($new) < 8) {
+            echo json_encode(['success' => false, 'error' => 'New password must be at least 8 characters']);
+            break;
+        }
+        if ($new !== $confirm) {
+            echo json_encode(['success' => false, 'error' => 'New passwords do not match']);
+            break;
+        }
+        $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
+        $auth['updated_at'] = date('c');
+        if (@file_put_contents('/etc/irongate/auth.json',
+                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+            break;
+        }
+        echo json_encode(['success' => true, 'message' => 'Password changed']);
+        break;
+
+    case 'change_username':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $cur = (string)($data['current_password'] ?? '');
+        $newUser = trim((string)($data['new_username'] ?? ''));
+        $auth = json_decode(@file_get_contents('/etc/irongate/auth.json'), true);
+        if (!is_array($auth) || empty($auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Auth config unavailable']);
+            break;
+        }
+        if (!password_verify($cur, $auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Current password is incorrect']);
+            break;
+        }
+        if (!preg_match('/^[A-Za-z0-9_.-]{1,32}$/', $newUser)) {
+            echo json_encode(['success' => false, 'error' => 'Username must be 1-32 characters: letters, digits, dot, dash, underscore']);
+            break;
+        }
+        $auth['username'] = $newUser;
+        $auth['updated_at'] = date('c');
+        if (@file_put_contents('/etc/irongate/auth.json',
+                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+            break;
+        }
+        $_SESSION['username'] = $newUser;
+        echo json_encode(['success' => true, 'message' => 'Username changed']);
+        break;
+
+    case 'get_access_list':
+        $acl = json_decode(@file_get_contents('/etc/irongate/access-control.json'), true);
+        if (!is_array($acl)) {
+            $acl = ['enabled' => false, 'allowed_ips' => []];
+        }
+        echo json_encode(['success' => true, 'data' => $acl]);
+        break;
+
+    case 'update_access_list':
+        $data = json_decode(file_get_contents('php://input'), true);
+        if (!is_array($data) || !isset($data['allowed_ips']) || !is_array($data['allowed_ips'])) {
+            echo json_encode(['success' => false, 'error' => 'Invalid request body']);
+            break;
+        }
+        $ips = [];
+        $bad = null;
+        foreach ($data['allowed_ips'] as $entry) {
+            $valid = validAllowEntry($entry);
+            if ($valid === false) { $bad = (string)$entry; break; }
+            if (!in_array($valid, $ips, true)) $ips[] = $valid;
+        }
+        if ($bad !== null) {
+            echo json_encode(['success' => false, 'error' => 'Invalid IP or CIDR: ' . $bad]);
+            break;
+        }
+        if (!in_array('127.0.0.1', $ips, true)) {
+            array_unshift($ips, '127.0.0.1'); // never lock out localhost
+        }
+        $result = writeAclAndRegen([
+            'enabled' => (bool)($data['enabled'] ?? true),
+            'allowed_ips' => $ips
+        ]);
+        if (!$result['success']) {
+            echo json_encode($result);
+            break;
+        }
+        $warning = null;
+        $remote = $_SERVER['REMOTE_ADDR'] ?? '';
+        if ($result['acl']['enabled'] && $remote !== ''
+            && !in_array($remote, ['127.0.0.1', '::1'], true)
+            && !aclCovers($ips, $remote)) {
+            $warning = 'Your current IP (' . $remote . ') is not in the allow-list. You may lose access.';
+        }
+        echo json_encode(['success' => true, 'message' => 'Access list updated',
+                          'data' => $result['acl'], 'warning' => $warning]);
+        break;
+
+    case 'toggle_access_list':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $acl = json_decode(@file_get_contents('/etc/irongate/access-control.json'), true);
+        if (!is_array($acl) || !isset($acl['allowed_ips']) || !is_array($acl['allowed_ips'])) {
+            $acl = ['allowed_ips' => ['127.0.0.1']];
+        }
+        $acl['enabled'] = (bool)($data['enabled'] ?? false);
+        $result = writeAclAndRegen($acl);
+        if (!$result['success']) {
+            echo json_encode($result);
+            break;
+        }
+        echo json_encode(['success' => true, 'data' => $result['acl']]);
+        break;
+
     default:
         echo json_encode(['error' => 'Unknown action', 'available' => [
-            'system', 'status', 'settings', 'apply', 'leases', 
+            'system', 'status', 'settings', 'apply', 'leases',
             'reservations', 'logs', 'restart', 'stop', 'start',
             'diagnostics', 'repair', 'validate',
             'irongate_status', 'irongate_settings', 'irongate_interfaces',
             'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices', 'device_groups',
-            'update_check', 'update_settings', 'update_now', 'update_log'
+            'update_check', 'update_settings', 'update_now', 'update_log',
+            'change_password', 'change_username', 'get_access_list',
+            'update_access_list', 'toggle_access_list'
         ]]);
 }
 
@@ -1868,7 +2044,8 @@ EOPHP
 #######################################
 # Create Web UI with improved error display
 #######################################
-cat > /var/www/irongate/index.html << 'EOHTML'
+cat > /var/www/irongate/index.php << 'EOHTML'
+<?php require_once __DIR__ . '/session_check.php'; ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1957,6 +2134,8 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
             <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
             <div class="nav-item" onclick="showPage('updates')" style="border-top:1px solid var(--surface2);margin-top:10px;padding-top:15px;">⬆️ Updates</div>
+            <div class="nav-item" onclick="showPage('security')">🔐 Security</div>
+            <div class="nav-item" onclick="window.location.href='/logout.php'" style="color:var(--text-secondary);">🚪 Logout</div>
         </div>
         <div class="main">
             <!-- Dashboard -->
@@ -2603,9 +2782,61 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     </a>
                 </div>
             </div>
+
+            <!-- Security Settings -->
+            <div class="page" id="page-security">
+                <h2 style="margin-bottom:20px;">🔐 Security</h2>
+
+                <!-- IP Allow-List -->
+                <div class="card">
+                    <div class="card-title">🌐 IP Allow-List</div>
+                    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;">
+                        Only the IPs and CIDR ranges below can reach the WebUI (enforced by nginx before PHP runs).
+                        127.0.0.1 is always kept in the list so local access can never be locked out.
+                    </p>
+                    <div style="display:flex;align-items:center;gap:15px;margin-bottom:10px;">
+                        <div class="toggle" id="acl-toggle" onclick="toggleAccessList()"></div>
+                        <span id="acl-status-text">Loading…</span>
+                    </div>
+                    <p id="acl-disabled-warning" style="display:none;color:var(--warning);font-size:0.9em;margin-bottom:10px;">
+                        ⚠️ When disabled, any device on the network can reach the login page. Authentication is still required.
+                    </p>
+                    <div id="acl-ip-list" style="margin-bottom:15px;"></div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                        <input type="text" id="acl-new-ip" class="form-control" placeholder="e.g. 192.168.1.50 or 192.168.1.0/24" style="max-width:300px;">
+                        <button class="btn btn-primary" onclick="addAllowIp()">➕ Add IP</button>
+                    </div>
+                </div>
+
+                <!-- Change Password -->
+                <div class="card">
+                    <div class="card-title">🔑 Change Password</div>
+                    <div class="form-group"><label>Current Password</label><input type="password" id="pw-current" class="form-control" autocomplete="current-password"></div>
+                    <div class="form-group"><label>New Password (min 8 characters)</label><input type="password" id="pw-new" class="form-control" autocomplete="new-password"></div>
+                    <div class="form-group"><label>Confirm New Password</label><input type="password" id="pw-confirm" class="form-control" autocomplete="new-password"></div>
+                    <button class="btn btn-primary" onclick="changePassword()">💾 Change Password</button>
+                </div>
+
+                <!-- Change Username -->
+                <div class="card">
+                    <div class="card-title">👤 Change Username</div>
+                    <div class="form-group"><label>Current Password</label><input type="password" id="user-current-pw" class="form-control" autocomplete="current-password"></div>
+                    <div class="form-group"><label>New Username</label><input type="text" id="user-new" class="form-control" autocomplete="username"></div>
+                    <button class="btn btn-primary" onclick="changeUsername()">💾 Change Username</button>
+                </div>
+
+                <!-- Session -->
+                <div class="card">
+                    <div class="card-title">🚪 Session</div>
+                    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;">
+                        Sessions expire after 4 hours of inactivity.
+                    </p>
+                    <button class="btn btn-danger" onclick="window.location.href='/logout.php'">🚪 Logout</button>
+                </div>
+            </div>
         </div>
     </div>
-    
+
     <!-- Reservation Modal -->
     <div class="modal" id="reservation-modal">
         <div class="modal-content">
@@ -2749,7 +2980,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
             document.getElementById('page-'+page).classList.add('active');
-            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates'];
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates','security'];
             const idx = pages.indexOf(page);
             if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
             if(page==='dashboard')loadDashboard();
@@ -2762,6 +2993,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             if(page==='blockchain')loadBlockchainSettings();
             if(page==='dhcp')loadSettings();
             if(page==='updates')loadUpdateStatus();
+            if(page==='security')loadAccessList();
         }
         
         function toast(msg,type='success'){
@@ -2782,6 +3014,7 @@ cat > /var/www/irongate/index.html << 'EOHTML'
                     headers:opts.body?{'Content-Type':'application/json'}:{},
                     body:opts.body?JSON.stringify(opts.body):undefined
                 });
+                if(res.status===401){window.location.href='/login.php';return{success:false,error:'auth_required'};}
                 return await res.json();
             }catch(e){console.error(e);return{success:false,error:e.message};}
         }
@@ -4148,6 +4381,87 @@ cat > /var/www/irongate/index.html << 'EOHTML'
             }
         }
         
+        // --- Security page: auth + IP allow-list (webauth feature) ---
+        let aclState={enabled:false,allowed_ips:[]};
+
+        async function loadAccessList(){
+            const res=await api('get_access_list');
+            if(res.success){aclState=res.data;renderAccessList();}
+            else toast(res.error||'Failed to load access list','error');
+        }
+
+        function renderAccessList(){
+            const on=!!aclState.enabled;
+            document.getElementById('acl-toggle').classList.toggle('active',on);
+            document.getElementById('acl-status-text').textContent=on
+                ?`🟢 Active — ${aclState.allowed_ips.length} IP${aclState.allowed_ips.length===1?'':'s'} allowed`
+                :'⚪ Disabled — all IPs can connect (auth still required)';
+            document.getElementById('acl-disabled-warning').style.display=on?'none':'block';
+            document.getElementById('acl-ip-list').innerHTML=aclState.allowed_ips.map(ip=>
+                `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--surface2);">
+                    <code>${ip}</code>
+                    ${ip==='127.0.0.1'
+                        ?'<span style="color:var(--text-secondary);font-size:0.85em;">(always allowed)</span>'
+                        :`<button class="btn btn-danger" style="padding:2px 10px;font-size:0.85em;" onclick="removeAllowIp('${ip}')">×</button>`}
+                </div>`).join('')
+                ||'<span style="color:var(--text-secondary);">No IPs configured</span>';
+        }
+
+        function validIpClient(v){
+            const m=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(\/(\d{1,2}))?$/.exec(v.trim());
+            if(!m)return false;
+            for(let i=1;i<=4;i++){if(+m[i]>255)return false;}
+            if(m[6]!==undefined&&+m[6]>32)return false;
+            return true;
+        }
+
+        async function addAllowIp(){
+            const inp=document.getElementById('acl-new-ip');
+            const v=inp.value.trim();
+            if(!validIpClient(v)){toast('Invalid IP or CIDR format','error');return;}
+            if(aclState.allowed_ips.includes(v)){toast('Already in the list','error');return;}
+            await saveAccessList({enabled:aclState.enabled,allowed_ips:[...aclState.allowed_ips,v]});
+            inp.value='';
+        }
+
+        async function removeAllowIp(ip){
+            await saveAccessList({enabled:aclState.enabled,allowed_ips:aclState.allowed_ips.filter(x=>x!==ip)});
+        }
+
+        async function toggleAccessList(){
+            const res=await api('toggle_access_list',{method:'POST',body:{enabled:!aclState.enabled}});
+            if(res.success){aclState=res.data;renderAccessList();toast(aclState.enabled?'Allow-list enabled':'Allow-list disabled');}
+            else toast(res.error||'Toggle failed','error');
+        }
+
+        async function saveAccessList(next){
+            const res=await api('update_access_list',{method:'POST',body:next});
+            if(res.success){
+                aclState=res.data;renderAccessList();toast('Access list updated');
+                if(res.warning)toast(res.warning,'error');
+            }else toast(res.error||'Update failed','error');
+        }
+
+        async function changePassword(){
+            const cur=document.getElementById('pw-current').value;
+            const nw=document.getElementById('pw-new').value;
+            const cf=document.getElementById('pw-confirm').value;
+            if(nw.length<8){toast('New password must be at least 8 characters','error');return;}
+            if(nw!==cf){toast('New passwords do not match','error');return;}
+            const res=await api('change_password',{method:'POST',body:{current_password:cur,new_password:nw,confirm_password:cf}});
+            if(res.success){toast('Password changed');['pw-current','pw-new','pw-confirm'].forEach(id=>document.getElementById(id).value='');}
+            else toast(res.error||'Password change failed','error');
+        }
+
+        async function changeUsername(){
+            const cur=document.getElementById('user-current-pw').value;
+            const nu=document.getElementById('user-new').value.trim();
+            if(!/^[A-Za-z0-9_.-]{1,32}$/.test(nu)){toast('Username: 1-32 letters, digits, dot, dash, underscore','error');return;}
+            const res=await api('change_username',{method:'POST',body:{current_password:cur,new_username:nu}});
+            if(res.success){toast('Username changed');document.getElementById('user-current-pw').value='';document.getElementById('user-new').value='';}
+            else toast(res.error||'Username change failed','error');
+        }
+
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
             loadDashboard();
@@ -4156,6 +4470,237 @@ cat > /var/www/irongate/index.html << 'EOHTML'
 </body>
 </html>
 EOHTML
+
+# webauth: the SPA is now index.php (session-guarded); remove any stale copy
+rm -f /var/www/irongate/index.html
+
+cat > /var/www/irongate/session_check.php << 'WEBAUTH_SESSEOF'
+<?php
+/**
+ * Irongate WebUI Session Guard
+ * Include at the top of every protected page.
+ *
+ * - Browser pages: unauthenticated -> redirect to /login.php
+ * - api.php: unauthenticated -> 401 JSON (the SPA fetch() helper handles the
+ *   redirect; a 302-to-HTML would corrupt every frontend JSON error path)
+ * - Local service bypass: requests from 127.0.0.1/::1 to api.php that carry
+ *   no session cookie are exempted (defensive: no current local callers).
+ */
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+    session_start();
+}
+
+$IRONGATE_SESSION_TIMEOUT = 4 * 60 * 60; // 4 hours of inactivity
+
+$isApi = basename($_SERVER['SCRIPT_NAME'] ?? '') === 'api.php';
+
+// Local service-to-service API bypass (no session cookie presented)
+if ($isApi
+    && in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
+    && !isset($_COOKIE[session_name()])) {
+    return;
+}
+
+$authed = isset($_SESSION['authenticated']) && $_SESSION['authenticated'] === true;
+$expired = false;
+
+if ($authed && isset($_SESSION['last_activity'])
+    && (time() - $_SESSION['last_activity'] > $IRONGATE_SESSION_TIMEOUT)) {
+    session_unset();
+    session_destroy();
+    $authed = false;
+    $expired = true;
+}
+
+if (!$authed) {
+    if ($isApi) {
+        http_response_code(401);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'error' => 'auth_required']);
+        exit;
+    }
+    $current = $_SERVER['REQUEST_URI'] ?? '/';
+    header('Location: /login.php?' . ($expired ? 'expired=1&' : '') . 'redirect=' . urlencode($current));
+    exit;
+}
+
+$_SESSION['last_activity'] = time();
+WEBAUTH_SESSEOF
+
+cat > /var/www/irongate/login.php << 'WEBAUTH_LOGINEOF'
+<?php
+/**
+ * Irongate WebUI Login
+ * Validates credentials against /etc/irongate/auth.json (bcrypt).
+ * Rate limiting: 5 failed attempts within 15 minutes -> 15 minute lockout.
+ */
+session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+session_start();
+
+$AUTH_FILE = '/etc/irongate/auth.json';
+$MAX_ATTEMPTS = 5;
+$WINDOW_SECONDS = 15 * 60;
+$LOCKOUT_SECONDS = 15 * 60;
+
+if (isset($_SESSION['authenticated']) && $_SESSION['authenticated'] === true) {
+    header('Location: /');
+    exit;
+}
+
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+function loadAuth($file) {
+    $auth = json_decode(@file_get_contents($file), true);
+    return is_array($auth) ? $auth : null;
+}
+
+function saveAuth($file, $auth) {
+    return @file_put_contents($file, json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) !== false;
+}
+
+function safeRedirectTarget() {
+    $r = $_POST['redirect'] ?? $_GET['redirect'] ?? '/';
+    // Same-origin relative paths only: must start with a single '/'
+    if (!is_string($r) || $r === '' || $r[0] !== '/' || (isset($r[1]) && $r[1] === '/')) {
+        return '/';
+    }
+    return $r;
+}
+
+$error = '';
+$notice = '';
+if (isset($_GET['expired'])) {
+    $notice = 'Session expired — please sign in again.';
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $csrf = $_POST['csrf_token'] ?? '';
+    if (!hash_equals($_SESSION['csrf_token'], (string)$csrf)) {
+        $error = 'Invalid session token — please reload the page and try again.';
+    } else {
+        $auth = loadAuth($AUTH_FILE);
+        if (!$auth || empty($auth['password_hash']) || empty($auth['username'])) {
+            $error = 'Authentication is not configured correctly.';
+        } else {
+            $now = time();
+            $lockedUntil = intval($auth['locked_until'] ?? 0);
+            if ($lockedUntil > $now) {
+                $mins = (int)ceil(($lockedUntil - $now) / 60);
+                $error = 'Too many failed attempts. Try again in ' . $mins . ' minute' . ($mins === 1 ? '' : 's') . '.';
+            } else {
+                $user = (string)($_POST['username'] ?? '');
+                $pass = (string)($_POST['password'] ?? '');
+                if ($user === $auth['username'] && password_verify($pass, $auth['password_hash'])) {
+                    $auth['failed_attempts'] = 0;
+                    $auth['first_failed_at'] = 0;
+                    $auth['locked_until'] = 0;
+                    saveAuth($AUTH_FILE, $auth);
+                    session_regenerate_id(true);
+                    $_SESSION['authenticated'] = true;
+                    $_SESSION['username'] = $auth['username'];
+                    $_SESSION['last_activity'] = time();
+                    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                    header('Location: ' . safeRedirectTarget());
+                    exit;
+                }
+                // Failed attempt — rolling window
+                $first = intval($auth['first_failed_at'] ?? 0);
+                if ($first === 0 || ($now - $first) > $WINDOW_SECONDS) {
+                    $auth['failed_attempts'] = 1;
+                    $auth['first_failed_at'] = $now;
+                } else {
+                    $auth['failed_attempts'] = intval($auth['failed_attempts'] ?? 0) + 1;
+                }
+                if (intval($auth['failed_attempts']) >= $MAX_ATTEMPTS) {
+                    $auth['locked_until'] = $now + $LOCKOUT_SECONDS;
+                    $auth['failed_attempts'] = 0;
+                    $auth['first_failed_at'] = 0;
+                    $error = 'Too many failed attempts. Locked for 15 minutes.';
+                } else {
+                    $error = 'Invalid username or password.';
+                }
+                saveAuth($AUTH_FILE, $auth);
+            }
+        }
+    }
+}
+$redirectValue = safeRedirectTarget();
+?><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Irongate — Sign In</title>
+    <style>
+        :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--primary:#e94560;--success:#00bf63;--warning:#ffc107;--danger:#dc3545;--text:#eee;--text-secondary:#aaa;}
+        *{margin:0;padding:0;box-sizing:border-box;}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;}
+        .login-card{background:var(--surface);border-radius:12px;padding:35px;width:100%;max-width:380px;box-shadow:0 8px 24px rgba(0,0,0,0.4);}
+        .logo{display:flex;align-items:center;justify-content:center;gap:10px;font-size:1.4em;font-weight:bold;color:#e94560;margin-bottom:25px;letter-spacing:2px;}
+        .logo svg{width:32px;height:32px;}
+        .form-group{margin-bottom:15px;}
+        .form-group label{display:block;margin-bottom:5px;color:var(--text-secondary);}
+        .form-control{width:100%;padding:10px;border:1px solid var(--surface2);border-radius:6px;background:var(--bg);color:var(--text);font-size:1em;}
+        .form-control:focus{outline:none;border-color:var(--primary);}
+        .btn{display:block;width:100%;padding:12px;border:none;border-radius:6px;cursor:pointer;font-size:1em;background:var(--primary);color:white;margin-top:20px;}
+        .btn:hover{opacity:0.9;}
+        .alert{padding:12px;border-radius:8px;margin-bottom:15px;font-size:0.9em;}
+        .alert-danger{background:rgba(220,53,69,0.2);border:1px solid var(--danger);}
+        .alert-warning{background:rgba(255,193,7,0.2);border:1px solid var(--warning);}
+        .subtitle{text-align:center;color:var(--text-secondary);font-size:0.85em;margin-bottom:20px;}
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M12,5A3,3 0 0,1 15,8A3,3 0 0,1 12,11A3,3 0 0,1 9,8A3,3 0 0,1 12,5M17.13,17C15.92,18.85 14.11,20.24 12,20.92C9.89,20.24 8.08,18.85 6.87,17C6.53,16.5 6.24,16 6,15.47C6,13.82 8.71,12.47 12,12.47C15.29,12.47 18,13.79 18,15.47C17.76,16 17.47,16.5 17.13,17Z"/></svg>
+            IRONGATE
+        </div>
+        <div class="subtitle">Sign in to manage your network</div>
+        <?php if ($error !== ''): ?>
+        <div class="alert alert-danger"><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></div>
+        <?php elseif ($notice !== ''): ?>
+        <div class="alert alert-warning"><?php echo htmlspecialchars($notice, ENT_QUOTES, 'UTF-8'); ?></div>
+        <?php endif; ?>
+        <form method="POST" action="/login.php" autocomplete="on">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8'); ?>">
+            <input type="hidden" name="redirect" value="<?php echo htmlspecialchars($redirectValue, ENT_QUOTES, 'UTF-8'); ?>">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" class="form-control" autocomplete="username" autofocus required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" class="form-control" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn">🔐 Sign In</button>
+        </form>
+    </div>
+</body>
+</html>
+WEBAUTH_LOGINEOF
+
+cat > /var/www/irongate/logout.php << 'WEBAUTH_LOGOUTEOF'
+<?php
+// Irongate WebUI logout — destroys the session and returns to login
+session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+session_start();
+$_SESSION = [];
+if (ini_get('session.use_cookies')) {
+    $params = session_get_cookie_params();
+    setcookie(session_name(), '', time() - 42000,
+        $params['path'], $params['domain'],
+        $params['secure'], $params['httponly']
+    );
+}
+session_destroy();
+header('Location: /login.php');
+exit;
+WEBAUTH_LOGOUTEOF
 
 #######################################
 # Set permissions
@@ -7081,16 +7626,15 @@ server {
     listen $WEBUI_PORT;
     server_name _;
     root /var/www/irongate;
-    index index.html;
+    index index.php;
 
     # Source-IP access control: localhost, Tailscale CGNAT range, plus an
     # optional admin workstation (ADMIN_LAN_IP env at install time). The
     # wildcard listen above avoids the bind(99) boot race that IP-pinned
     # listens caused when nginx started before tailscale0 had its address.
-    allow 127.0.0.1;
-$NGINX_ADMIN_ALLOW
-    allow 100.64.0.0/10;
-    deny all;
+    # Allow-list is generated from /etc/irongate/access-control.json
+    # (WebUI Security page) by /opt/irongate/regen-access.sh
+    include /etc/nginx/snippets/irongate-access.conf;
 
     # Timeouts to prevent hung connections
     client_body_timeout 10s;
@@ -7144,6 +7688,137 @@ if [ ! -L /etc/nginx/sites-enabled/irongate ]; then
     echo -e "${RED}ERROR: Failed to create nginx symlink!${NC}"
     ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
 fi
+
+#######################################
+# WebUI authentication + IP allow-list (webauth feature)
+#######################################
+echo -e "${YELLOW}Configuring WebUI authentication + IP allow-list...${NC}"
+
+# Root helper: regenerate nginx allow-list snippet from access-control.json
+cat > /opt/irongate/regen-access.sh << 'WEBAUTH_REGENEOF'
+#!/bin/bash
+# Regenerates /etc/nginx/snippets/irongate-access.conf from
+# /etc/irongate/access-control.json, validates, and reloads nginx.
+# Called via sudo by the WebUI (www-data) after allow-list changes.
+# Every entry is re-validated here as root — the JSON is group-writable by
+# www-data and must never be able to inject arbitrary nginx directives.
+set -euo pipefail
+
+CONF="/etc/nginx/snippets/irongate-access.conf"
+JSON="/etc/irongate/access-control.json"
+TMP="${CONF}.tmp.$$"
+PREV="/run/irongate-access.prev.$$"
+
+{
+echo "# Auto-generated by irongate auth system - do not edit manually"
+echo "# Managed via WebUI Security > IP Allow-List"
+echo "# Regenerated by /opt/irongate/regen-access.sh"
+if [ -f "$JSON" ]; then
+php -r '
+$acl = json_decode(@file_get_contents($argv[1]), true);
+if ($acl && !empty($acl["enabled"]) && !empty($acl["allowed_ips"]) && is_array($acl["allowed_ips"])) {
+    foreach ($acl["allowed_ips"] as $ip) {
+        $ip = trim((string)$ip);
+        $ok = false;
+        if (filter_var($ip, FILTER_VALIDATE_IP)) {
+            $ok = true;
+        } elseif (preg_match("#^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$#", $ip, $m)) {
+            $ok = intval($m[5]) <= 32;
+            for ($i = 1; $i <= 4; $i++) { if (intval($m[$i]) > 255) { $ok = false; } }
+        }
+        if ($ok) { echo "allow " . $ip . ";\n"; }
+    }
+    echo "deny all;\n";
+} else {
+    echo "# IP allow-list disabled - all IPs permitted (auth still required)\n";
+}
+' "$JSON"
+else
+echo "# no access-control.json - all IPs permitted (auth still required)"
+fi
+} > "$TMP"
+
+cp -p "$CONF" "$PREV" 2>/dev/null || true
+mv "$TMP" "$CONF"
+chown root:root "$CONF"
+chmod 644 "$CONF"
+
+if ! nginx -t 2>&1; then
+    if [ -f "$PREV" ]; then mv "$PREV" "$CONF"; fi
+    echo "ERROR: nginx config test failed; previous access list restored" >&2
+    exit 1
+fi
+rm -f "$PREV"
+systemctl reload-or-restart nginx
+WEBAUTH_REGENEOF
+chown root:root /opt/irongate/regen-access.sh
+chmod 755 /opt/irongate/regen-access.sh
+
+# Sudoers drop-in: WebUI (www-data) may regenerate the allow-list
+cat > /etc/sudoers.d/irongate-webauth << 'WEBAUTH_SUDOEOF'
+# Allow the web server to regenerate the irongate nginx allow-list and reload nginx
+# Added by irongate webauth feature - remove this file to revoke
+www-data ALL=(root) NOPASSWD: /opt/irongate/regen-access.sh
+www-data ALL=(root) NOPASSWD: /usr/sbin/nginx -t
+WEBAUTH_SUDOEOF
+chmod 440 /etc/sudoers.d/irongate-webauth
+if ! visudo -cf /etc/sudoers.d/irongate-webauth; then
+    echo -e "${RED}ERROR: irongate-webauth sudoers failed validation - removing${NC}"
+    rm -f /etc/sudoers.d/irongate-webauth
+fi
+
+# access-control.json — preserved across re-runs
+mkdir -p /etc/irongate
+if [ ! -f /etc/irongate/access-control.json ]; then
+    WEBAUTH_ADMIN_ALLOW=""
+    if [ -n "${ADMIN_LAN_IP:-}" ]; then
+        WEBAUTH_ADMIN_ALLOW=",
+        \"${ADMIN_LAN_IP}\""
+    fi
+    cat > /etc/irongate/access-control.json << WEBAUTH_ACLEOF
+{
+    "enabled": true,
+    "allowed_ips": [
+        "127.0.0.1",
+        "100.64.0.0/10"${WEBAUTH_ADMIN_ALLOW}
+    ],
+    "updated_at": "$(date -Iseconds)"
+}
+WEBAUTH_ACLEOF
+    echo -e "${GREEN}  ✓ Created access-control.json${NC}"
+else
+    echo -e "${GREEN}  ✓ Existing access-control.json preserved${NC}"
+fi
+chown root:www-data /etc/irongate/access-control.json
+chmod 660 /etc/irongate/access-control.json
+
+# auth.json — preserved across re-runs; random initial password printed at end
+WEBAUTH_INIT_PASSWORD=""
+if [ ! -f /etc/irongate/auth.json ]; then
+    WEBAUTH_INIT_PASSWORD=$(php -r "echo bin2hex(random_bytes(10));")
+    WEBAUTH_HASH=$(WEBAUTH_PW="$WEBAUTH_INIT_PASSWORD" php -r 'echo password_hash(getenv("WEBAUTH_PW"), PASSWORD_BCRYPT);')
+    cat > /etc/irongate/auth.json << WEBAUTH_AUTHEOF
+{
+    "username": "admin",
+    "password_hash": "${WEBAUTH_HASH}",
+    "created_at": "$(date -Iseconds)",
+    "updated_at": "$(date -Iseconds)",
+    "failed_attempts": 0,
+    "first_failed_at": 0,
+    "locked_until": 0
+}
+WEBAUTH_AUTHEOF
+    echo -e "${GREEN}  ✓ Created auth.json (credentials printed at end)${NC}"
+else
+    echo -e "${GREEN}  ✓ Existing auth.json preserved (credentials unchanged)${NC}"
+fi
+chown root:www-data /etc/irongate/auth.json
+chmod 660 /etc/irongate/auth.json
+
+# Generate the nginx allow-list snippet now; reload failure is tolerated here
+# because the final bulletproof restart below brings nginx up regardless
+mkdir -p /etc/nginx/snippets
+/opt/irongate/regen-access.sh || true
 
 #######################################
 # Configure log rotation
@@ -7327,3 +8002,13 @@ fi
 # Restart nginx
 systemctl restart nginx
 echo -e "${GREEN}Done.${NC}"
+
+if [ -n "$WEBAUTH_INIT_PASSWORD" ]; then
+    echo ""
+    echo -e "${CYAN}=============================================${NC}"
+    echo -e "${CYAN}WEBUI INITIAL CREDENTIALS (change after first login):${NC}"
+    echo -e "  Username: ${BOLD}admin${NC}"
+    echo -e "  Password: ${BOLD}${WEBAUTH_INIT_PASSWORD}${NC}"
+    echo -e "${CYAN}=============================================${NC}"
+fi
+

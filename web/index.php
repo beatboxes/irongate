@@ -1,3 +1,4 @@
+<?php require_once __DIR__ . '/session_check.php'; ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -86,6 +87,8 @@
             <div class="nav-item" onclick="showPage('logs')">📜 Logs</div>
             <div class="nav-item" onclick="showPage('diagnostics')">🔧 Diagnostics</div>
             <div class="nav-item" onclick="showPage('updates')" style="border-top:1px solid var(--surface2);margin-top:10px;padding-top:15px;">⬆️ Updates</div>
+            <div class="nav-item" onclick="showPage('security')">🔐 Security</div>
+            <div class="nav-item" onclick="window.location.href='/logout.php'" style="color:var(--text-secondary);">🚪 Logout</div>
         </div>
         <div class="main">
             <!-- Dashboard -->
@@ -732,9 +735,61 @@
                     </a>
                 </div>
             </div>
+
+            <!-- Security Settings -->
+            <div class="page" id="page-security">
+                <h2 style="margin-bottom:20px;">🔐 Security</h2>
+
+                <!-- IP Allow-List -->
+                <div class="card">
+                    <div class="card-title">🌐 IP Allow-List</div>
+                    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;">
+                        Only the IPs and CIDR ranges below can reach the WebUI (enforced by nginx before PHP runs).
+                        127.0.0.1 is always kept in the list so local access can never be locked out.
+                    </p>
+                    <div style="display:flex;align-items:center;gap:15px;margin-bottom:10px;">
+                        <div class="toggle" id="acl-toggle" onclick="toggleAccessList()"></div>
+                        <span id="acl-status-text">Loading…</span>
+                    </div>
+                    <p id="acl-disabled-warning" style="display:none;color:var(--warning);font-size:0.9em;margin-bottom:10px;">
+                        ⚠️ When disabled, any device on the network can reach the login page. Authentication is still required.
+                    </p>
+                    <div id="acl-ip-list" style="margin-bottom:15px;"></div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                        <input type="text" id="acl-new-ip" class="form-control" placeholder="e.g. 192.168.1.50 or 192.168.1.0/24" style="max-width:300px;">
+                        <button class="btn btn-primary" onclick="addAllowIp()">➕ Add IP</button>
+                    </div>
+                </div>
+
+                <!-- Change Password -->
+                <div class="card">
+                    <div class="card-title">🔑 Change Password</div>
+                    <div class="form-group"><label>Current Password</label><input type="password" id="pw-current" class="form-control" autocomplete="current-password"></div>
+                    <div class="form-group"><label>New Password (min 8 characters)</label><input type="password" id="pw-new" class="form-control" autocomplete="new-password"></div>
+                    <div class="form-group"><label>Confirm New Password</label><input type="password" id="pw-confirm" class="form-control" autocomplete="new-password"></div>
+                    <button class="btn btn-primary" onclick="changePassword()">💾 Change Password</button>
+                </div>
+
+                <!-- Change Username -->
+                <div class="card">
+                    <div class="card-title">👤 Change Username</div>
+                    <div class="form-group"><label>Current Password</label><input type="password" id="user-current-pw" class="form-control" autocomplete="current-password"></div>
+                    <div class="form-group"><label>New Username</label><input type="text" id="user-new" class="form-control" autocomplete="username"></div>
+                    <button class="btn btn-primary" onclick="changeUsername()">💾 Change Username</button>
+                </div>
+
+                <!-- Session -->
+                <div class="card">
+                    <div class="card-title">🚪 Session</div>
+                    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:15px;">
+                        Sessions expire after 4 hours of inactivity.
+                    </p>
+                    <button class="btn btn-danger" onclick="window.location.href='/logout.php'">🚪 Logout</button>
+                </div>
+            </div>
         </div>
     </div>
-    
+
     <!-- Reservation Modal -->
     <div class="modal" id="reservation-modal">
         <div class="modal-content">
@@ -878,7 +933,7 @@
             document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
             document.getElementById('page-'+page).classList.add('active');
-            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates'];
+            const pages = ['dashboard','devices','dhcp','leases','reservations','protection','blockchain','logs','diagnostics','updates','security'];
             const idx = pages.indexOf(page);
             if (idx >= 0) document.querySelectorAll('.nav-item')[idx].classList.add('active');
             if(page==='dashboard')loadDashboard();
@@ -891,6 +946,7 @@
             if(page==='blockchain')loadBlockchainSettings();
             if(page==='dhcp')loadSettings();
             if(page==='updates')loadUpdateStatus();
+            if(page==='security')loadAccessList();
         }
         
         function toast(msg,type='success'){
@@ -911,6 +967,7 @@
                     headers:opts.body?{'Content-Type':'application/json'}:{},
                     body:opts.body?JSON.stringify(opts.body):undefined
                 });
+                if(res.status===401){window.location.href='/login.php';return{success:false,error:'auth_required'};}
                 return await res.json();
             }catch(e){console.error(e);return{success:false,error:e.message};}
         }
@@ -2277,6 +2334,87 @@
             }
         }
         
+        // --- Security page: auth + IP allow-list (webauth feature) ---
+        let aclState={enabled:false,allowed_ips:[]};
+
+        async function loadAccessList(){
+            const res=await api('get_access_list');
+            if(res.success){aclState=res.data;renderAccessList();}
+            else toast(res.error||'Failed to load access list','error');
+        }
+
+        function renderAccessList(){
+            const on=!!aclState.enabled;
+            document.getElementById('acl-toggle').classList.toggle('active',on);
+            document.getElementById('acl-status-text').textContent=on
+                ?`🟢 Active — ${aclState.allowed_ips.length} IP${aclState.allowed_ips.length===1?'':'s'} allowed`
+                :'⚪ Disabled — all IPs can connect (auth still required)';
+            document.getElementById('acl-disabled-warning').style.display=on?'none':'block';
+            document.getElementById('acl-ip-list').innerHTML=aclState.allowed_ips.map(ip=>
+                `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--surface2);">
+                    <code>${ip}</code>
+                    ${ip==='127.0.0.1'
+                        ?'<span style="color:var(--text-secondary);font-size:0.85em;">(always allowed)</span>'
+                        :`<button class="btn btn-danger" style="padding:2px 10px;font-size:0.85em;" onclick="removeAllowIp('${ip}')">×</button>`}
+                </div>`).join('')
+                ||'<span style="color:var(--text-secondary);">No IPs configured</span>';
+        }
+
+        function validIpClient(v){
+            const m=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(\/(\d{1,2}))?$/.exec(v.trim());
+            if(!m)return false;
+            for(let i=1;i<=4;i++){if(+m[i]>255)return false;}
+            if(m[6]!==undefined&&+m[6]>32)return false;
+            return true;
+        }
+
+        async function addAllowIp(){
+            const inp=document.getElementById('acl-new-ip');
+            const v=inp.value.trim();
+            if(!validIpClient(v)){toast('Invalid IP or CIDR format','error');return;}
+            if(aclState.allowed_ips.includes(v)){toast('Already in the list','error');return;}
+            await saveAccessList({enabled:aclState.enabled,allowed_ips:[...aclState.allowed_ips,v]});
+            inp.value='';
+        }
+
+        async function removeAllowIp(ip){
+            await saveAccessList({enabled:aclState.enabled,allowed_ips:aclState.allowed_ips.filter(x=>x!==ip)});
+        }
+
+        async function toggleAccessList(){
+            const res=await api('toggle_access_list',{method:'POST',body:{enabled:!aclState.enabled}});
+            if(res.success){aclState=res.data;renderAccessList();toast(aclState.enabled?'Allow-list enabled':'Allow-list disabled');}
+            else toast(res.error||'Toggle failed','error');
+        }
+
+        async function saveAccessList(next){
+            const res=await api('update_access_list',{method:'POST',body:next});
+            if(res.success){
+                aclState=res.data;renderAccessList();toast('Access list updated');
+                if(res.warning)toast(res.warning,'error');
+            }else toast(res.error||'Update failed','error');
+        }
+
+        async function changePassword(){
+            const cur=document.getElementById('pw-current').value;
+            const nw=document.getElementById('pw-new').value;
+            const cf=document.getElementById('pw-confirm').value;
+            if(nw.length<8){toast('New password must be at least 8 characters','error');return;}
+            if(nw!==cf){toast('New passwords do not match','error');return;}
+            const res=await api('change_password',{method:'POST',body:{current_password:cur,new_password:nw,confirm_password:cf}});
+            if(res.success){toast('Password changed');['pw-current','pw-new','pw-confirm'].forEach(id=>document.getElementById(id).value='');}
+            else toast(res.error||'Password change failed','error');
+        }
+
+        async function changeUsername(){
+            const cur=document.getElementById('user-current-pw').value;
+            const nu=document.getElementById('user-new').value.trim();
+            if(!/^[A-Za-z0-9_.-]{1,32}$/.test(nu)){toast('Username: 1-32 letters, digits, dot, dash, underscore','error');return;}
+            const res=await api('change_username',{method:'POST',body:{current_password:cur,new_username:nu}});
+            if(res.success){toast('Username changed');document.getElementById('user-current-pw').value='';document.getElementById('user-new').value='';}
+            else toast(res.error||'Username change failed','error');
+        }
+
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
             loadDashboard();

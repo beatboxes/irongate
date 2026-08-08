@@ -1,0 +1,8 @@
+{
+    "enabled": true,
+    "allowed_ips": [
+        "127.0.0.1",
+        "100.64.0.0/10"${WEBAUTH_ADMIN_ALLOW}
+    ],
+    "updated_at": "$(date -Iseconds)"
+}

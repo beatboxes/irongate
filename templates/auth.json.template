@@ -1,0 +1,9 @@
+{
+    "username": "admin",
+    "password_hash": "${WEBAUTH_HASH}",
+    "created_at": "$(date -Iseconds)",
+    "updated_at": "$(date -Iseconds)",
+    "failed_attempts": 0,
+    "first_failed_at": 0,
+    "locked_until": 0
+}

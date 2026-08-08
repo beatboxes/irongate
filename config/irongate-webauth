@@ -1,0 +1,4 @@
+# Allow the web server to regenerate the irongate nginx allow-list and reload nginx
+# Added by irongate webauth feature - remove this file to revoke
+www-data ALL=(root) NOPASSWD: /opt/irongate/regen-access.sh
+www-data ALL=(root) NOPASSWD: /usr/sbin/nginx -t

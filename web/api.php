@@ -39,6 +39,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
 
+// Session guard: all API actions require an authenticated WebUI session.
+// Localhost calls without a session cookie are exempted inside the guard.
+require_once __DIR__ . '/session_check.php';
+
 $db = new SQLite3('/var/www/irongate/dhcp.db');
 // irongate-audit: without a busy timeout, a concurrent php-fpm worker holding
 // the write lock made this connection fail immediately, silently dropping
@@ -95,6 +99,53 @@ function safeApplyConfig($db) {
 
 function cidrToHosts($cidr) {
     return pow(2, 32 - intval($cidr)) - 2;
+}
+
+// Validate an allow-list entry: single IP (v4/v6) or IPv4 CIDR. Returns the
+// trimmed entry on success, false otherwise. Used by the auth endpoints.
+function validAllowEntry($v) {
+    $v = trim((string)$v);
+    if (filter_var($v, FILTER_VALIDATE_IP)) return $v;
+    if (preg_match('#^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$#', $v, $m)) {
+        for ($i = 1; $i <= 4; $i++) { if (intval($m[$i]) > 255) return false; }
+        if (intval($m[5]) > 32) return false;
+        return $v;
+    }
+    return false;
+}
+
+// True when $ip is covered by one of the allow-list entries (exact or CIDR).
+function aclCovers($entries, $ip) {
+    foreach ($entries as $e) {
+        if ($e === $ip) return true;
+        if (strpos($e, '/') !== false) {
+            list($net, $bits) = explode('/', $e, 2);
+            $ipL = ip2long($ip);
+            $netL = ip2long($net);
+            $bits = intval($bits);
+            if ($ipL !== false && $netL !== false && $bits >= 0 && $bits <= 32) {
+                $mask = $bits === 0 ? 0 : (~0 << (32 - $bits)) & 0xFFFFFFFF;
+                if (($ipL & $mask) === ($netL & $mask)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Write the access-control JSON and regenerate the nginx snippet via sudo.
+// Returns ['success'=>bool, 'error'=>?, 'detail'=>?].
+function writeAclAndRegen($acl) {
+    $acl['updated_at'] = date('c');
+    if (@file_put_contents('/etc/irongate/access-control.json',
+            json_encode($acl, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+        return ['success' => false, 'error' => 'Failed to write access-control config'];
+    }
+    exec('sudo /opt/irongate/regen-access.sh 2>&1', $regenOut, $regenCode);
+    if ($regenCode !== 0) {
+        return ['success' => false, 'error' => 'nginx regeneration failed',
+                'detail' => implode("\n", array_slice($regenOut, -5))];
+    }
+    return ['success' => true, 'acl' => $acl];
 }
 
 function getLeases() {
@@ -1133,14 +1184,139 @@ switch ($action) {
         echo json_encode(['success' => true, 'data' => $log ?: 'No update log available']);
         break;
     
+    // --- Auth management endpoints (added by webauth feature; session-protected) ---
+    case 'change_password':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $cur = (string)($data['current_password'] ?? '');
+        $new = (string)($data['new_password'] ?? '');
+        $confirm = (string)($data['confirm_password'] ?? '');
+        $auth = json_decode(@file_get_contents('/etc/irongate/auth.json'), true);
+        if (!is_array($auth) || empty($auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Auth config unavailable']);
+            break;
+        }
+        if (!password_verify($cur, $auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Current password is incorrect']);
+            break;
+        }
+        if (strlen($new) < 8) {
+            echo json_encode(['success' => false, 'error' => 'New password must be at least 8 characters']);
+            break;
+        }
+        if ($new !== $confirm) {
+            echo json_encode(['success' => false, 'error' => 'New passwords do not match']);
+            break;
+        }
+        $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
+        $auth['updated_at'] = date('c');
+        if (@file_put_contents('/etc/irongate/auth.json',
+                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+            break;
+        }
+        echo json_encode(['success' => true, 'message' => 'Password changed']);
+        break;
+
+    case 'change_username':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $cur = (string)($data['current_password'] ?? '');
+        $newUser = trim((string)($data['new_username'] ?? ''));
+        $auth = json_decode(@file_get_contents('/etc/irongate/auth.json'), true);
+        if (!is_array($auth) || empty($auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Auth config unavailable']);
+            break;
+        }
+        if (!password_verify($cur, $auth['password_hash'])) {
+            echo json_encode(['success' => false, 'error' => 'Current password is incorrect']);
+            break;
+        }
+        if (!preg_match('/^[A-Za-z0-9_.-]{1,32}$/', $newUser)) {
+            echo json_encode(['success' => false, 'error' => 'Username must be 1-32 characters: letters, digits, dot, dash, underscore']);
+            break;
+        }
+        $auth['username'] = $newUser;
+        $auth['updated_at'] = date('c');
+        if (@file_put_contents('/etc/irongate/auth.json',
+                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+            break;
+        }
+        $_SESSION['username'] = $newUser;
+        echo json_encode(['success' => true, 'message' => 'Username changed']);
+        break;
+
+    case 'get_access_list':
+        $acl = json_decode(@file_get_contents('/etc/irongate/access-control.json'), true);
+        if (!is_array($acl)) {
+            $acl = ['enabled' => false, 'allowed_ips' => []];
+        }
+        echo json_encode(['success' => true, 'data' => $acl]);
+        break;
+
+    case 'update_access_list':
+        $data = json_decode(file_get_contents('php://input'), true);
+        if (!is_array($data) || !isset($data['allowed_ips']) || !is_array($data['allowed_ips'])) {
+            echo json_encode(['success' => false, 'error' => 'Invalid request body']);
+            break;
+        }
+        $ips = [];
+        $bad = null;
+        foreach ($data['allowed_ips'] as $entry) {
+            $valid = validAllowEntry($entry);
+            if ($valid === false) { $bad = (string)$entry; break; }
+            if (!in_array($valid, $ips, true)) $ips[] = $valid;
+        }
+        if ($bad !== null) {
+            echo json_encode(['success' => false, 'error' => 'Invalid IP or CIDR: ' . $bad]);
+            break;
+        }
+        if (!in_array('127.0.0.1', $ips, true)) {
+            array_unshift($ips, '127.0.0.1'); // never lock out localhost
+        }
+        $result = writeAclAndRegen([
+            'enabled' => (bool)($data['enabled'] ?? true),
+            'allowed_ips' => $ips
+        ]);
+        if (!$result['success']) {
+            echo json_encode($result);
+            break;
+        }
+        $warning = null;
+        $remote = $_SERVER['REMOTE_ADDR'] ?? '';
+        if ($result['acl']['enabled'] && $remote !== ''
+            && !in_array($remote, ['127.0.0.1', '::1'], true)
+            && !aclCovers($ips, $remote)) {
+            $warning = 'Your current IP (' . $remote . ') is not in the allow-list. You may lose access.';
+        }
+        echo json_encode(['success' => true, 'message' => 'Access list updated',
+                          'data' => $result['acl'], 'warning' => $warning]);
+        break;
+
+    case 'toggle_access_list':
+        $data = json_decode(file_get_contents('php://input'), true);
+        $acl = json_decode(@file_get_contents('/etc/irongate/access-control.json'), true);
+        if (!is_array($acl) || !isset($acl['allowed_ips']) || !is_array($acl['allowed_ips'])) {
+            $acl = ['allowed_ips' => ['127.0.0.1']];
+        }
+        $acl['enabled'] = (bool)($data['enabled'] ?? false);
+        $result = writeAclAndRegen($acl);
+        if (!$result['success']) {
+            echo json_encode($result);
+            break;
+        }
+        echo json_encode(['success' => true, 'data' => $result['acl']]);
+        break;
+
     default:
         echo json_encode(['error' => 'Unknown action', 'available' => [
-            'system', 'status', 'settings', 'apply', 'leases', 
+            'system', 'status', 'settings', 'apply', 'leases',
             'reservations', 'logs', 'restart', 'stop', 'start',
             'diagnostics', 'repair', 'validate',
             'irongate_status', 'irongate_settings', 'irongate_interfaces',
             'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices', 'device_groups',
-            'update_check', 'update_settings', 'update_now', 'update_log'
+            'update_check', 'update_settings', 'update_now', 'update_log',
+            'change_password', 'change_username', 'get_access_list',
+            'update_access_list', 'toggle_access_list'
         ]]);
 }
 

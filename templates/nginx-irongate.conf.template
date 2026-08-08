@@ -2,8 +2,16 @@ server {
     listen $WEBUI_PORT;
     server_name _;
     root /var/www/irongate;
-    index index.html;
-    
+    index index.php;
+
+    # Source-IP access control: localhost, Tailscale CGNAT range, plus an
+    # optional admin workstation (ADMIN_LAN_IP env at install time). The
+    # wildcard listen above avoids the bind(99) boot race that IP-pinned
+    # listens caused when nginx started before tailscale0 had its address.
+    # Allow-list is generated from /etc/irongate/access-control.json
+    # (WebUI Security page) by /opt/irongate/regen-access.sh
+    include /etc/nginx/snippets/irongate-access.conf;
+
     # Timeouts to prevent hung connections
     client_body_timeout 10s;
     client_header_timeout 10s;
