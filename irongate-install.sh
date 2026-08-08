@@ -691,6 +691,58 @@ function aclCovers($entries, $ip) {
     return false;
 }
 
+// Midnight indexer presets — mirror of blockchain.py NETWORKS (Layer 8).
+function midnightNetworks() {
+    return [
+        'preprod'    => 'https://indexer.preprod.midnight.network/api/v4/graphql',
+        'preview'    => 'https://indexer.preview.midnight.network/api/v4/graphql',
+        'mainnet'    => 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+        'undeployed' => 'http://127.0.0.1:8088/api/v4/graphql',
+    ];
+}
+
+// Resolve the effective indexer endpoint: custom URL (validated http/https)
+// overrides the network preset, matching blockchain.py behaviour.
+function midnightEndpoint($network, $custom) {
+    $custom = trim((string)$custom);
+    if ($custom !== '') {
+        if (!filter_var($custom, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $custom)) {
+            return null;
+        }
+        return $custom;
+    }
+    $nets = midnightNetworks();
+    return $nets[$network] ?? null;
+}
+
+// Probe a Midnight indexer with a minimal GraphQL query. Pure PHP streams —
+// no shell involved. Returns reachable/response_time_ms/http_code/error.
+function midnightProbe($endpoint, $timeout) {
+    $ctx = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'header' => "Content-Type: application/json\r\nUser-Agent: Irongate-WebUI\r\n",
+            'content' => '{"query":"{__typename}"}',
+            'timeout' => $timeout,
+            'ignore_errors' => true,
+        ],
+    ]);
+    $t0 = microtime(true);
+    $body = @file_get_contents($endpoint, false, $ctx);
+    $ms = (int)round((microtime(true) - $t0) * 1000);
+    $code = 0;
+    if (isset($http_response_header[0]) && preg_match('#HTTP/\S+\s+(\d{3})#', $http_response_header[0], $m)) {
+        $code = intval($m[1]);
+    }
+    if ($body === false && $code === 0) {
+        return ['reachable' => false, 'response_time_ms' => $ms, 'http_code' => 0,
+                'error' => $ms >= ($timeout * 1000 - 100) ? 'connection timeout' : 'connection failed'];
+    }
+    $ok = $code >= 200 && $code < 400;
+    return ['reachable' => $ok, 'response_time_ms' => $ms, 'http_code' => $code,
+            'error' => $ok ? null : 'indexer returned HTTP ' . $code];
+}
+
 // Write the access-control JSON and regenerate the nginx snippet via sudo.
 // Returns ['success'=>bool, 'error'=>?, 'detail'=>?].
 function writeAclAndRegen($acl) {
@@ -1348,6 +1400,30 @@ switch ($action) {
     case 'irongate_settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            // Layer 8 validation: never persist an enable without a contract
+            // address, an unknown network, or a malformed indexer URL.
+            if (is_array($data) && (array_key_exists('blockchain_enabled', $data)
+                || array_key_exists('blockchain_network', $data)
+                || array_key_exists('blockchain_indexer_url', $data))) {
+                $reqEnabled = ($data['blockchain_enabled'] ?? (getSetting($db, 'blockchain_enabled') ?? 'false')) === 'true';
+                $reqContract = trim((string)($data['blockchain_contract_address']
+                    ?? (getSetting($db, 'blockchain_contract_address') ?? '')));
+                if ($reqEnabled && $reqContract === '') {
+                    echo json_encode(['success' => false, 'error' => 'Layer 8 cannot be enabled without a contract address']);
+                    break;
+                }
+                if (array_key_exists('blockchain_network', $data)
+                    && !array_key_exists((string)$data['blockchain_network'], midnightNetworks())) {
+                    echo json_encode(['success' => false, 'error' => 'Unknown blockchain network']);
+                    break;
+                }
+                $reqIndexer = trim((string)($data['blockchain_indexer_url'] ?? ''));
+                if ($reqIndexer !== '' && (!filter_var($reqIndexer, FILTER_VALIDATE_URL)
+                    || !preg_match('#^https?://#i', $reqIndexer))) {
+                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+                    break;
+                }
+            }
             foreach ($data as $key => $value) {
                 // irongate-audit: the Midnight read path needs no key material.
                 // Refuse to persist secret-bearing keys so a mnemonic can never
@@ -1743,6 +1819,73 @@ switch ($action) {
         echo json_encode(['success' => true, 'data' => $log ?: 'No update log available']);
         break;
     
+    // --- Layer 8 Midnight endpoints (session-protected) ---
+    case 'test_blockchain_connection':
+        $data = json_decode(file_get_contents('php://input'), true) ?: [];
+        $settings = getAllSettings($db);
+        $network = (string)($data['network'] ?? ($settings['blockchain_network'] ?? 'preprod'));
+        $custom = (string)($data['indexer_url'] ?? ($settings['blockchain_indexer_url'] ?? ''));
+        if (!array_key_exists($network, midnightNetworks())) {
+            echo json_encode(['success' => false, 'error' => 'Unknown network; expected one of: '
+                . implode(', ', array_keys(midnightNetworks()))]);
+            break;
+        }
+        $endpoint = midnightEndpoint($network, $custom);
+        if ($endpoint === null) {
+            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+            break;
+        }
+        $probe = midnightProbe($endpoint, 5);
+        echo json_encode([
+            'success' => true,
+            'endpoint' => $endpoint,
+            'reachable' => $probe['reachable'],
+            'response_time_ms' => $probe['response_time_ms'],
+            'http_code' => $probe['http_code'],
+            'error' => $probe['error'],
+        ]);
+        break;
+
+    case 'get_blockchain_status':
+        $settings = getAllSettings($db);
+        $enabled = ($settings['blockchain_enabled'] ?? 'false') === 'true';
+        $contract = trim((string)($settings['blockchain_contract_address'] ?? ''));
+        $network = $settings['blockchain_network'] ?? 'preprod';
+        $endpoint = midnightEndpoint($network, $settings['blockchain_indexer_url'] ?? '');
+        $engineActive = trim((string)shell_exec('systemctl is-active irongate 2>/dev/null')) === 'active';
+        $probe = null;
+        if ($contract !== '' && $endpoint !== null) {
+            $probe = midnightProbe($endpoint, 3);
+        }
+        if ($contract === '') {
+            $state = 'not_configured';
+        } elseif (!$enabled) {
+            $state = 'disabled';
+        } elseif ($probe !== null && $probe['reachable']) {
+            $state = 'active';
+        } else {
+            $state = 'degraded';
+        }
+        $journal = [];
+        exec('sudo /usr/bin/journalctl -u irongate -n 80 --no-pager 2>/dev/null', $jout);
+        foreach ($jout as $line) {
+            if (stripos($line, 'blockchain') !== false || stripos($line, 'Layer 8') !== false) {
+                $journal[] = $line;
+            }
+        }
+        echo json_encode(['success' => true, 'data' => [
+            'state' => $state,
+            'enabled' => $enabled,
+            'network' => $network,
+            'contract_address' => $contract,
+            'endpoint' => $endpoint,
+            'engine_active' => $engineActive,
+            'indexer_reachable' => $probe !== null ? $probe['reachable'] : null,
+            'response_time_ms' => $probe !== null ? $probe['response_time_ms'] : null,
+            'recent_log' => array_slice($journal, -5),
+        ]]);
+        break;
+
     // --- Auth management endpoints (added by webauth feature; session-protected) ---
     case 'change_password':
         $data = json_decode(file_get_contents('php://input'), true);
@@ -1875,7 +2018,8 @@ switch ($action) {
             'irongate_toggle', 'irongate_apply', 'irongate_logs', 'irongate_devices', 'device_groups',
             'update_check', 'update_settings', 'update_now', 'update_log',
             'change_password', 'change_username', 'get_access_list',
-            'update_access_list', 'toggle_access_list'
+            'update_access_list', 'toggle_access_list',
+            'test_blockchain_connection', 'get_blockchain_status'
         ]]);
 }
 
@@ -2599,7 +2743,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                     </div>
                     <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
                         When enabled, devices must be registered on the Midnight registry contract to access protected resources.
-                        Requires a deployed smart contract (App ID).
+                        Requires a deployed registry contract.
                     </p>
                 </div>
                 
@@ -2609,7 +2753,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                     <div class="form-row">
                         <div class="form-group">
                             <label>Network</label>
-                            <select class="form-control" id="blockchain-network" style="max-width:220px;">
+                            <select class="form-control" id="blockchain-network" style="max-width:220px;" onchange="blockchainNetworkChanged()">
                                 <option value="preprod">Preprod (recommended)</option>
                                 <option value="preview">Preview</option>
                                 <option value="mainnet">Mainnet</option>
@@ -2618,7 +2762,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                         </div>
                         <div class="form-group" style="flex:2;">
                             <label>Contract Address</label>
-                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x...">
+                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x..." oninput="updateBlockchainToggleState()">
                             <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
                                 Address of the deployed device-registry contract. Required to enable Layer 8.
                             </div>
@@ -2990,7 +3134,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
             if(page==='diagnostics')runDiagnostics();
             if(page==='devices')loadIrongateDevices();
             if(page==='protection')loadIrongateStatus();
-            if(page==='blockchain')loadBlockchainSettings();
+            if(page==='blockchain'){loadBlockchainSettings();loadBlockchainStatus();}
             if(page==='dhcp')loadSettings();
             if(page==='updates')loadUpdateStatus();
             if(page==='security')loadAccessList();
@@ -3575,6 +3719,9 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                     document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
                     document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
                     document.getElementById('blockchain-allow-rogue').checked = res.data.blockchain_allow_rogue_devices === 'true';
+
+                    updateBlockchainToggleState();
+                    blockchainNetworkChanged();
                 }
             } catch (e) {
                 console.error('Blockchain settings error:', e);
@@ -3607,8 +3754,73 @@ cat > /var/www/irongate/index.php << 'EOHTML'
             }
             
             toast('Click "Save & Apply" to apply changes', 'info');
+            updateBlockchainToggleState();
         }
-        
+
+        // Indexer presets — mirror of blockchain.py NETWORKS
+        const MIDNIGHT_INDEXER_PRESETS = {
+            preprod: 'https://indexer.preprod.midnight.network/api/v4/graphql',
+            preview: 'https://indexer.preview.midnight.network/api/v4/graphql',
+            mainnet: 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+            undeployed: 'http://127.0.0.1:8088/api/v4/graphql'
+        };
+
+        function blockchainNetworkChanged() {
+            const network = document.getElementById('blockchain-network').value;
+            const field = document.getElementById('blockchain-indexer-url');
+            const preset = MIDNIGHT_INDEXER_PRESETS[network] || '';
+            // Blank means "use the preset" — surface which endpoint that is.
+            field.placeholder = preset ? ('leave blank to use ' + preset) : 'leave blank to use the preset for the selected network';
+            // If the field holds another network's preset (not a custom URL), clear it
+            // so the new network's preset applies; never stomp a custom URL.
+            const v = field.value.trim();
+            if (v && v !== preset && Object.values(MIDNIGHT_INDEXER_PRESETS).includes(v)) {
+                field.value = '';
+            }
+        }
+
+        function updateBlockchainToggleState() {
+            const toggle = document.getElementById('blockchain-toggle');
+            const hasContract = document.getElementById('blockchain-contract-address').value.trim() !== '';
+            const enabled = toggle.classList.contains('active');
+            // Grey the toggle until a contract address exists (unless already enabled,
+            // so Layer 8 can always be turned off).
+            if (!hasContract && !enabled) {
+                toggle.style.opacity = '0.4';
+                toggle.style.cursor = 'not-allowed';
+                toggle.title = 'Set a contract address to enable Layer 8';
+            } else {
+                toggle.style.opacity = '';
+                toggle.style.cursor = 'pointer';
+                toggle.title = '';
+            }
+        }
+
+        async function loadBlockchainStatus() {
+            const res = await api('get_blockchain_status');
+            if (!res.success) return;
+            const d = res.data;
+            const statusText = document.getElementById('blockchain-status-text');
+            const connStatus = document.getElementById('blockchain-connection-status');
+            if (d.state === 'active') {
+                statusText.textContent = 'Enabled';
+                statusText.style.color = 'var(--success)';
+                connStatus.innerHTML = '<span class="status-dot running"></span>🟢 Active — connected to ' + d.network + ' indexer (' + d.response_time_ms + 'ms)';
+            } else if (d.state === 'degraded') {
+                statusText.textContent = 'Enabled';
+                statusText.style.color = 'var(--warning)';
+                connStatus.innerHTML = '<span class="status-dot stopped"></span>🟡 Enabled — indexer unreachable';
+            } else if (d.state === 'disabled') {
+                statusText.textContent = 'Disabled';
+                statusText.style.color = 'var(--text-secondary)';
+                connStatus.innerHTML = '<span class="status-dot stopped"></span>⚪ Disabled';
+            } else {
+                statusText.textContent = 'Not configured';
+                statusText.style.color = 'var(--text-secondary)';
+                connStatus.innerHTML = '⚙️ Not configured — set a contract address to enable';
+            }
+        }
+
         async function saveBlockchainSettings() {
             const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
             const contractAddr = document.getElementById('blockchain-contract-address').value.trim();
@@ -3639,6 +3851,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                 if (res.success) {
                     toast('Blockchain settings saved! Irongate restarting...', 'success');
                     await loadBlockchainSettings();
+                    loadBlockchainStatus();
                 } else {
                     toast('Failed: ' + (res.error || 'Unknown error'), 'error');
                 }
@@ -3648,23 +3861,21 @@ cat > /var/www/irongate/index.php << 'EOHTML'
         }
         
         async function testBlockchainConnection() {
+            // Server-side probe: the Pi (not the browser) contacts the indexer, so
+            // the result is a real reachability measurement from the engine's host.
             const network = document.getElementById('blockchain-network').value;
-            const addr = document.getElementById('blockchain-contract-address').value.trim();
             const custom = document.getElementById('blockchain-indexer-url').value.trim();
             const connStatus = document.getElementById('blockchain-connection-status');
-
-            if (!addr) {
-                toast('Enter a contract address first', 'error');
-                return;
+            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Testing…</span>';
+            const res = await api('test_blockchain_connection', {method:'POST', body:{network: network, indexer_url: custom}});
+            if (res.success && res.reachable) {
+                connStatus.innerHTML = '<span style="color:var(--success);">✓ Reachable (' + res.response_time_ms + 'ms)</span> <span style="color:var(--text-secondary);font-size:0.85em;">' + res.endpoint + '</span>';
+                toast('Indexer reachable in ' + res.response_time_ms + 'ms');
+            } else {
+                const why = res.error || 'unknown error';
+                connStatus.innerHTML = '<span style="color:var(--danger);">✗ Unreachable: ' + why + '</span>';
+                toast('Indexer unreachable: ' + why, 'error');
             }
-
-            // This deliberately does not claim a result. The browser cannot reach the
-            // indexer on the engine's behalf, and the previous version simply waited
-            // and then reported success without contacting anything. Reachability is
-            // established by the engine at startup and shown in its log.
-            const endpoint = custom || ('https://indexer.' + network + '.midnight.network/api/v4/graphql');
-            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Configured: ' + endpoint + '</span>';
-            toast('Save and apply, then check the engine log - it reports the chain height it read at startup.', 'info');
         }
         
         //======================================================================
@@ -4802,14 +5013,8 @@ python3 -m venv /opt/irongate/venv 2>/dev/null || true
 /opt/irongate/venv/bin/pip install --quiet pyyaml scapy netifaces 2>/dev/null || \
     pip3 install --quiet --break-system-packages pyyaml scapy netifaces 2>/dev/null || true
 
-# Algorand SDK and PyTeal for Layer 8 blockchain verification
-echo "Installing Algorand SDK and PyTeal for Layer 8 blockchain..."
-/opt/irongate/venv/bin/pip install --quiet py-algorand-sdk pyteal 2>/dev/null || \
-    pip3 install --quiet --break-system-packages py-algorand-sdk pyteal 2>/dev/null || \
-    echo "Note: Algorand SDK not installed - blockchain features will be disabled"
-
 # Fallback install with break-system-packages
-pip3 install --quiet --break-system-packages pyyaml scapy netifaces py-algorand-sdk pyteal 2>/dev/null || true
+pip3 install --quiet --break-system-packages pyyaml scapy netifaces 2>/dev/null || true
 
 # Create Irongate main script
 cat > /opt/irongate/irongate.py << 'IRONGATEPY'

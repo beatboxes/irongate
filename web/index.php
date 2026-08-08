@@ -552,7 +552,7 @@
                     </div>
                     <p style="margin-top:15px;font-size:0.9em;color:var(--text-secondary);">
                         When enabled, devices must be registered on the Midnight registry contract to access protected resources.
-                        Requires a deployed smart contract (App ID).
+                        Requires a deployed registry contract.
                     </p>
                 </div>
                 
@@ -562,7 +562,7 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label>Network</label>
-                            <select class="form-control" id="blockchain-network" style="max-width:220px;">
+                            <select class="form-control" id="blockchain-network" style="max-width:220px;" onchange="blockchainNetworkChanged()">
                                 <option value="preprod">Preprod (recommended)</option>
                                 <option value="preview">Preview</option>
                                 <option value="mainnet">Mainnet</option>
@@ -571,7 +571,7 @@
                         </div>
                         <div class="form-group" style="flex:2;">
                             <label>Contract Address</label>
-                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x...">
+                            <input class="form-control" id="blockchain-contract-address" type="text" placeholder="0x..." oninput="updateBlockchainToggleState()">
                             <div style="font-size:0.8em;color:var(--text-secondary);margin-top:5px;">
                                 Address of the deployed device-registry contract. Required to enable Layer 8.
                             </div>
@@ -943,7 +943,7 @@
             if(page==='diagnostics')runDiagnostics();
             if(page==='devices')loadIrongateDevices();
             if(page==='protection')loadIrongateStatus();
-            if(page==='blockchain')loadBlockchainSettings();
+            if(page==='blockchain'){loadBlockchainSettings();loadBlockchainStatus();}
             if(page==='dhcp')loadSettings();
             if(page==='updates')loadUpdateStatus();
             if(page==='security')loadAccessList();
@@ -1528,6 +1528,9 @@
                     document.getElementById('blockchain-fallback').checked = res.data.blockchain_fallback_allow !== 'false';
                     document.getElementById('blockchain-audit').checked = res.data.blockchain_audit_logging === 'true';
                     document.getElementById('blockchain-allow-rogue').checked = res.data.blockchain_allow_rogue_devices === 'true';
+
+                    updateBlockchainToggleState();
+                    blockchainNetworkChanged();
                 }
             } catch (e) {
                 console.error('Blockchain settings error:', e);
@@ -1560,8 +1563,73 @@
             }
             
             toast('Click "Save & Apply" to apply changes', 'info');
+            updateBlockchainToggleState();
         }
-        
+
+        // Indexer presets — mirror of blockchain.py NETWORKS
+        const MIDNIGHT_INDEXER_PRESETS = {
+            preprod: 'https://indexer.preprod.midnight.network/api/v4/graphql',
+            preview: 'https://indexer.preview.midnight.network/api/v4/graphql',
+            mainnet: 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+            undeployed: 'http://127.0.0.1:8088/api/v4/graphql'
+        };
+
+        function blockchainNetworkChanged() {
+            const network = document.getElementById('blockchain-network').value;
+            const field = document.getElementById('blockchain-indexer-url');
+            const preset = MIDNIGHT_INDEXER_PRESETS[network] || '';
+            // Blank means "use the preset" — surface which endpoint that is.
+            field.placeholder = preset ? ('leave blank to use ' + preset) : 'leave blank to use the preset for the selected network';
+            // If the field holds another network's preset (not a custom URL), clear it
+            // so the new network's preset applies; never stomp a custom URL.
+            const v = field.value.trim();
+            if (v && v !== preset && Object.values(MIDNIGHT_INDEXER_PRESETS).includes(v)) {
+                field.value = '';
+            }
+        }
+
+        function updateBlockchainToggleState() {
+            const toggle = document.getElementById('blockchain-toggle');
+            const hasContract = document.getElementById('blockchain-contract-address').value.trim() !== '';
+            const enabled = toggle.classList.contains('active');
+            // Grey the toggle until a contract address exists (unless already enabled,
+            // so Layer 8 can always be turned off).
+            if (!hasContract && !enabled) {
+                toggle.style.opacity = '0.4';
+                toggle.style.cursor = 'not-allowed';
+                toggle.title = 'Set a contract address to enable Layer 8';
+            } else {
+                toggle.style.opacity = '';
+                toggle.style.cursor = 'pointer';
+                toggle.title = '';
+            }
+        }
+
+        async function loadBlockchainStatus() {
+            const res = await api('get_blockchain_status');
+            if (!res.success) return;
+            const d = res.data;
+            const statusText = document.getElementById('blockchain-status-text');
+            const connStatus = document.getElementById('blockchain-connection-status');
+            if (d.state === 'active') {
+                statusText.textContent = 'Enabled';
+                statusText.style.color = 'var(--success)';
+                connStatus.innerHTML = '<span class="status-dot running"></span>🟢 Active — connected to ' + d.network + ' indexer (' + d.response_time_ms + 'ms)';
+            } else if (d.state === 'degraded') {
+                statusText.textContent = 'Enabled';
+                statusText.style.color = 'var(--warning)';
+                connStatus.innerHTML = '<span class="status-dot stopped"></span>🟡 Enabled — indexer unreachable';
+            } else if (d.state === 'disabled') {
+                statusText.textContent = 'Disabled';
+                statusText.style.color = 'var(--text-secondary)';
+                connStatus.innerHTML = '<span class="status-dot stopped"></span>⚪ Disabled';
+            } else {
+                statusText.textContent = 'Not configured';
+                statusText.style.color = 'var(--text-secondary)';
+                connStatus.innerHTML = '⚙️ Not configured — set a contract address to enable';
+            }
+        }
+
         async function saveBlockchainSettings() {
             const enabled = document.getElementById('blockchain-toggle').classList.contains('active');
             const contractAddr = document.getElementById('blockchain-contract-address').value.trim();
@@ -1592,6 +1660,7 @@
                 if (res.success) {
                     toast('Blockchain settings saved! Irongate restarting...', 'success');
                     await loadBlockchainSettings();
+                    loadBlockchainStatus();
                 } else {
                     toast('Failed: ' + (res.error || 'Unknown error'), 'error');
                 }
@@ -1601,23 +1670,21 @@
         }
         
         async function testBlockchainConnection() {
+            // Server-side probe: the Pi (not the browser) contacts the indexer, so
+            // the result is a real reachability measurement from the engine's host.
             const network = document.getElementById('blockchain-network').value;
-            const addr = document.getElementById('blockchain-contract-address').value.trim();
             const custom = document.getElementById('blockchain-indexer-url').value.trim();
             const connStatus = document.getElementById('blockchain-connection-status');
-
-            if (!addr) {
-                toast('Enter a contract address first', 'error');
-                return;
+            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Testing…</span>';
+            const res = await api('test_blockchain_connection', {method:'POST', body:{network: network, indexer_url: custom}});
+            if (res.success && res.reachable) {
+                connStatus.innerHTML = '<span style="color:var(--success);">✓ Reachable (' + res.response_time_ms + 'ms)</span> <span style="color:var(--text-secondary);font-size:0.85em;">' + res.endpoint + '</span>';
+                toast('Indexer reachable in ' + res.response_time_ms + 'ms');
+            } else {
+                const why = res.error || 'unknown error';
+                connStatus.innerHTML = '<span style="color:var(--danger);">✗ Unreachable: ' + why + '</span>';
+                toast('Indexer unreachable: ' + why, 'error');
             }
-
-            // This deliberately does not claim a result. The browser cannot reach the
-            // indexer on the engine's behalf, and the previous version simply waited
-            // and then reported success without contacting anything. Reachability is
-            // established by the engine at startup and shown in its log.
-            const endpoint = custom || ('https://indexer.' + network + '.midnight.network/api/v4/graphql');
-            connStatus.innerHTML = '<span style="color:var(--text-secondary);">Configured: ' + endpoint + '</span>';
-            toast('Save and apply, then check the engine log - it reports the chain height it read at startup.', 'info');
         }
         
         //======================================================================
