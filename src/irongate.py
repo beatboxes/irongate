@@ -13,12 +13,14 @@ Layer 8 Blockchain (Optional):
 """
 
 import os
+import re
 import sys
 import yaml
 import time
 import signal
 import logging
 import tempfile
+import ipaddress
 import subprocess
 import threading
 from pathlib import Path
@@ -46,6 +48,29 @@ except ImportError:
     BLOCKCHAIN_MODULE_AVAILABLE = False
     MIDNIGHT_AVAILABLE = False
     logger.info("Blockchain module not available - Layer 8 disabled")
+
+# irongate-audit (V1): zone/group names and device IPs are interpolated into the
+# nftables ruleset text that is loaded as root. The config is writable by the
+# web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
+# otherwise become nft syntax. Only strict identifiers/addresses may reach it.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+
+
+def _valid_zone_name(name):
+    """True only for a str matching [A-Za-z0-9_-]{1,32} (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
+
+
+def _valid_ipv4(value):
+    """Return the canonical IPv4 string for value, or None if it is not an IPv4 address."""
+    if not isinstance(value, str):
+        return None
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return str(addr) if addr.version == 4 else None
+
 
 def _audit_log(blockchain, mac, ip, action, result):
     """Best-effort Layer 8 audit write.
@@ -838,6 +863,17 @@ class Irongate:
         devices = self.config.get('devices') or []
         custom_groups = self.config.get('custom_groups') or []
 
+        # irongate-audit (V1): drop groups whose name is not a safe identifier
+        # before anything is interpolated into the ruleset.
+        safe_groups = []
+        for g in custom_groups:
+            if isinstance(g, dict) and _valid_zone_name(g.get('name', '')):
+                safe_groups.append(g)
+            else:
+                logger.warning("Firewall: skipping custom group with invalid name %r",
+                               g.get('name') if isinstance(g, dict) else g)
+        custom_groups = safe_groups
+
         # Build a dictionary of group name -> group config
         group_configs = {}
         for g in custom_groups:
@@ -852,9 +888,15 @@ class Irongate:
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
+                # irongate-audit (V1): validate before interpolating into nft text.
+                safe_ip = _valid_ipv4(ip)
+                if safe_ip is None or not _valid_zone_name(zone):
+                    logger.warning("Firewall: skipping device with invalid ip/zone (ip=%r zone=%r)",
+                                   ip, zone)
+                    continue
                 if zone not in zone_ips:
                     zone_ips[zone] = []
-                zone_ips[zone].append(ip)
+                zone_ips[zone].append(safe_ip)
 
         # Ensure built-in zones exist even if empty
         for builtin in ['isolated', 'servers', 'trusted']:
@@ -947,7 +989,7 @@ class Irongate:
 """
                 for target_group in can_access:
                     target_set = f"{target_group}_devices"
-                    if target_group in zone_ips:
+                    if _valid_zone_name(target_group) and target_group in zone_ips:
                         rules_section += f"        ip saddr @{set_name} ip daddr @{target_set} accept\n"
                         rules_section += f"        ip daddr @{set_name} ip saddr @{target_set} accept\n"
 

@@ -59,6 +59,18 @@ runs everything.
 Network-dependent tests skip rather than fail when there is no route to the Midnight indexer, so the
 deterministic suite stays meaningful offline.
 
+The input-validation suite (`tests/test_validation.py`, `tests/test_validation.php`,
+`tests/test_updater.sh`) needs no network and no root on the device. Run it in disposable containers:
+
+```bash
+python3 -m pytest tests/test_validation.py            # or: python3 -m unittest tests/test_validation.py
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w php:8.3-cli php tests/test_validation.php web
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_updater.sh src/irongate-updater.sh
+```
+
+The PHP and shell tests overwrite `/var/www/irongate` or create root-owned files, so they refuse to
+run unless `IRONGATE_TEST_SANDBOX=1` is set; never run them on a real device.
+
 If you fix a bug, add a test that fails before your fix and passes after it. Please say so in the PR
 so a reviewer can verify the same way.
 

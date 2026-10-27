@@ -31,9 +31,9 @@ set_exception_handler(function($e) {
 });
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
-header('Access-Control-Allow-Headers: Content-Type');
+// irongate-audit (V3): no CORS headers. The dashboard (index.php) calls this API
+// with a relative URL, so it is same-origin; a wildcard Access-Control-Allow-Origin
+// only let any web page a LAN browser visited drive this API cross-origin.
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
@@ -97,6 +97,17 @@ function safeApplyConfig($db) {
     return $result;
 }
 
+// irongate-audit (V1): zone/group names and device IPs are interpolated into an
+// nftables ruleset by the root engine, so only strict values may be stored.
+// \z (not $) so a trailing newline cannot slip through.
+function validZoneName($name) {
+    return is_string($name) && preg_match('/^[A-Za-z0-9_-]{1,32}\z/', $name) === 1;
+}
+
+function validDeviceIp($ip) {
+    return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
 function cidrToHosts($cidr) {
     return pow(2, 32 - intval($cidr)) - 2;
 }
@@ -142,12 +153,36 @@ function midnightNetworks() {
     ];
 }
 
-// Resolve the effective indexer endpoint: custom URL (validated http/https)
-// overrides the network preset, matching blockchain.py behaviour.
+// irongate-audit (V2, SSRF): a custom indexer URL must be https and its host
+// must be the host of one of the https presets above (same rule as
+// blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
+// cloud-metadata addresses from the web tier.
+function validIndexerUrl($url) {
+    if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
+        return false;
+    }
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
+    $p = parse_url($url);
+    if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
+    if (isset($p['user']) || isset($p['pass'])) return false;
+    if (isset($p['port']) && $p['port'] !== 443) return false;
+    $hosts = [];
+    foreach (midnightNetworks() as $preset) {
+        $pp = parse_url($preset);
+        if (strtolower($pp['scheme'] ?? '') === 'https' && !empty($pp['host'])) {
+            $hosts[] = strtolower($pp['host']);
+        }
+    }
+    return in_array(strtolower($p['host'] ?? ''), $hosts, true);
+}
+
+// Resolve the effective indexer endpoint: custom URL (https, known Midnight
+// indexer host only) overrides the network preset, matching blockchain.py.
 function midnightEndpoint($network, $custom) {
     $custom = trim((string)$custom);
     if ($custom !== '') {
-        if (!filter_var($custom, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $custom)) {
+        // The selected network's own preset (e.g. the local 'undeployed' node) is always fine.
+        if ($custom !== (midnightNetworks()[$network] ?? null) && !validIndexerUrl($custom)) {
             return null;
         }
         return $custom;
@@ -859,9 +894,11 @@ switch ($action) {
                     break;
                 }
                 $reqIndexer = trim((string)($data['blockchain_indexer_url'] ?? ''));
-                if ($reqIndexer !== '' && (!filter_var($reqIndexer, FILTER_VALIDATE_URL)
-                    || !preg_match('#^https?://#i', $reqIndexer))) {
-                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+                $reqNetwork = (string)($data['blockchain_network'] ?? (getSetting($db, 'blockchain_network') ?? 'preprod'));
+                if ($reqIndexer !== '' && $reqIndexer !== (midnightNetworks()[$reqNetwork] ?? null)
+                    && !validIndexerUrl($reqIndexer)) {
+                    http_response_code(400);
+                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
                 }
             }
@@ -969,6 +1006,19 @@ switch ($action) {
                 break;
             }
 
+            // irongate-audit (V1): group names (and the names a group may reach)
+            // become nft set identifiers in the root engine.
+            $accessList = $data['can_access_groups'] ?? [];
+            $accessOk = is_array($accessList);
+            foreach (($accessOk ? $accessList : []) as $g) {
+                if (!validZoneName($g)) { $accessOk = false; }
+            }
+            if (!validZoneName($name) || !$accessOk) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (A-Z a-z 0-9 _ - , max 32 characters)']);
+                break;
+            }
+
             $stmt = $db->prepare('INSERT OR REPLACE INTO device_groups (name, color, icon, description, lan_access, can_access_groups) VALUES (?, ?, ?, ?, ?, ?)');
             $stmt->bindValue(1, $name, SQLITE3_TEXT);
             $stmt->bindValue(2, $data['color'] ?? '#6c757d', SQLITE3_TEXT);
@@ -1070,11 +1120,20 @@ switch ($action) {
     case 'irongate_devices':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            // irongate-audit (V1): ip and zone end up inside the root engine's nft
+            // ruleset. An empty ip is still allowed (the engine skips such devices).
+            $devIp = $data['ip'] ?? '';
+            $devZone = $data['zone'] ?? 'isolated';
+            if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (A-Z a-z 0-9 _ - , max 32 characters)']);
+                break;
+            }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
             $stmt->bindValue(1, strtolower($data['mac']), SQLITE3_TEXT);
-            $stmt->bindValue(2, $data['ip'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(2, $devIp, SQLITE3_TEXT);
             $stmt->bindValue(3, $data['hostname'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(4, $data['zone'] ?? 'isolated', SQLITE3_TEXT);
+            $stmt->bindValue(4, $devZone, SQLITE3_TEXT);
             $result = $stmt->execute();
             if ($result) {
                 safeApplyConfig($db);
@@ -1273,7 +1332,8 @@ switch ($action) {
         }
         $endpoint = midnightEndpoint($network, $custom);
         if ($endpoint === null) {
-            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+            http_response_code(400);
+            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
             break;
         }
         $probe = midnightProbe($endpoint, 5);

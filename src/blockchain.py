@@ -26,9 +26,11 @@ kept alongside this file as blockchain_algorand.py.<ts>.reference.
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -129,6 +131,38 @@ class IrongateBlockchain:
     DEFAULT_NETWORK = 'preprod'
     DEFAULT_TIMEOUT = 5.0
 
+    @classmethod
+    def allowed_indexer_hosts(cls):
+        """Hosts of the https indexer presets in NETWORKS (derived, not hard-coded)."""
+        hosts = set()
+        for preset in cls.NETWORKS.values():
+            parts = urllib.parse.urlsplit(preset['indexer'])
+            if parts.scheme == 'https' and parts.hostname:
+                hosts.add(parts.hostname.lower())
+        return frozenset(hosts)
+
+    @classmethod
+    def validate_indexer_url(cls, url):
+        """Return url if it is an https URL on a known Midnight indexer host, else None.
+
+        irongate-audit (V2, SSRF): indexer_url comes from a config file the web
+        tier can write, and this process runs as root. Without this check a
+        crafted value points the engine at cloud metadata (http://169.254.169.254/),
+        loopback services or file:// URLs.
+        """
+        if not isinstance(url, str) or not re.fullmatch(r'[\x21-\x7e]+', url) or '\\' in url:
+            return None
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+            return None
+        if (parts.hostname or '').lower() not in cls.allowed_indexer_hosts():
+            return None
+        return url
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize blockchain connection.
@@ -166,11 +200,19 @@ class IrongateBlockchain:
             )
             self.network = self.DEFAULT_NETWORK
 
-        # An explicit indexer_url overrides the network preset.
-        self.indexer_url = (
-            self.config.get('indexer_url')
-            or self.NETWORKS[self.network]['indexer']
-        )
+        # An explicit indexer_url overrides the network preset, but only if it
+        # is an https URL on a known Midnight indexer host (SSRF guard, V2).
+        self.indexer_url = self.NETWORKS[self.network]['indexer']
+        custom_indexer = self.config.get('indexer_url')
+        if custom_indexer and custom_indexer != self.indexer_url:
+            if self.validate_indexer_url(custom_indexer):
+                self.indexer_url = custom_indexer
+            else:
+                logger.warning(
+                    "Blockchain Layer 8: indexer_url %r rejected (must be https on a "
+                    "known Midnight indexer host) - using the '%s' preset",
+                    custom_indexer, self.network,
+                )
 
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")

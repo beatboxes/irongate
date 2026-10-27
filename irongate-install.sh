@@ -590,9 +590,9 @@ set_exception_handler(function($e) {
 });
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
-header('Access-Control-Allow-Headers: Content-Type');
+// irongate-audit (V3): no CORS headers. The dashboard (index.php) calls this API
+// with a relative URL, so it is same-origin; a wildcard Access-Control-Allow-Origin
+// only let any web page a LAN browser visited drive this API cross-origin.
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
@@ -656,6 +656,17 @@ function safeApplyConfig($db) {
     return $result;
 }
 
+// irongate-audit (V1): zone/group names and device IPs are interpolated into an
+// nftables ruleset by the root engine, so only strict values may be stored.
+// \z (not $) so a trailing newline cannot slip through.
+function validZoneName($name) {
+    return is_string($name) && preg_match('/^[A-Za-z0-9_-]{1,32}\z/', $name) === 1;
+}
+
+function validDeviceIp($ip) {
+    return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
 function cidrToHosts($cidr) {
     return pow(2, 32 - intval($cidr)) - 2;
 }
@@ -701,12 +712,36 @@ function midnightNetworks() {
     ];
 }
 
-// Resolve the effective indexer endpoint: custom URL (validated http/https)
-// overrides the network preset, matching blockchain.py behaviour.
+// irongate-audit (V2, SSRF): a custom indexer URL must be https and its host
+// must be the host of one of the https presets above (same rule as
+// blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
+// cloud-metadata addresses from the web tier.
+function validIndexerUrl($url) {
+    if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
+        return false;
+    }
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
+    $p = parse_url($url);
+    if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
+    if (isset($p['user']) || isset($p['pass'])) return false;
+    if (isset($p['port']) && $p['port'] !== 443) return false;
+    $hosts = [];
+    foreach (midnightNetworks() as $preset) {
+        $pp = parse_url($preset);
+        if (strtolower($pp['scheme'] ?? '') === 'https' && !empty($pp['host'])) {
+            $hosts[] = strtolower($pp['host']);
+        }
+    }
+    return in_array(strtolower($p['host'] ?? ''), $hosts, true);
+}
+
+// Resolve the effective indexer endpoint: custom URL (https, known Midnight
+// indexer host only) overrides the network preset, matching blockchain.py.
 function midnightEndpoint($network, $custom) {
     $custom = trim((string)$custom);
     if ($custom !== '') {
-        if (!filter_var($custom, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $custom)) {
+        // The selected network's own preset (e.g. the local 'undeployed' node) is always fine.
+        if ($custom !== (midnightNetworks()[$network] ?? null) && !validIndexerUrl($custom)) {
             return null;
         }
         return $custom;
@@ -1418,9 +1453,11 @@ switch ($action) {
                     break;
                 }
                 $reqIndexer = trim((string)($data['blockchain_indexer_url'] ?? ''));
-                if ($reqIndexer !== '' && (!filter_var($reqIndexer, FILTER_VALIDATE_URL)
-                    || !preg_match('#^https?://#i', $reqIndexer))) {
-                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+                $reqNetwork = (string)($data['blockchain_network'] ?? (getSetting($db, 'blockchain_network') ?? 'preprod'));
+                if ($reqIndexer !== '' && $reqIndexer !== (midnightNetworks()[$reqNetwork] ?? null)
+                    && !validIndexerUrl($reqIndexer)) {
+                    http_response_code(400);
+                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
                 }
             }
@@ -1528,6 +1565,19 @@ switch ($action) {
                 break;
             }
 
+            // irongate-audit (V1): group names (and the names a group may reach)
+            // become nft set identifiers in the root engine.
+            $accessList = $data['can_access_groups'] ?? [];
+            $accessOk = is_array($accessList);
+            foreach (($accessOk ? $accessList : []) as $g) {
+                if (!validZoneName($g)) { $accessOk = false; }
+            }
+            if (!validZoneName($name) || !$accessOk) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (A-Z a-z 0-9 _ - , max 32 characters)']);
+                break;
+            }
+
             $stmt = $db->prepare('INSERT OR REPLACE INTO device_groups (name, color, icon, description, lan_access, can_access_groups) VALUES (?, ?, ?, ?, ?, ?)');
             $stmt->bindValue(1, $name, SQLITE3_TEXT);
             $stmt->bindValue(2, $data['color'] ?? '#6c757d', SQLITE3_TEXT);
@@ -1629,11 +1679,20 @@ switch ($action) {
     case 'irongate_devices':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            // irongate-audit (V1): ip and zone end up inside the root engine's nft
+            // ruleset. An empty ip is still allowed (the engine skips such devices).
+            $devIp = $data['ip'] ?? '';
+            $devZone = $data['zone'] ?? 'isolated';
+            if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (A-Z a-z 0-9 _ - , max 32 characters)']);
+                break;
+            }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
             $stmt->bindValue(1, strtolower($data['mac']), SQLITE3_TEXT);
-            $stmt->bindValue(2, $data['ip'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(2, $devIp, SQLITE3_TEXT);
             $stmt->bindValue(3, $data['hostname'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(4, $data['zone'] ?? 'isolated', SQLITE3_TEXT);
+            $stmt->bindValue(4, $devZone, SQLITE3_TEXT);
             $result = $stmt->execute();
             if ($result) {
                 safeApplyConfig($db);
@@ -1832,7 +1891,8 @@ switch ($action) {
         }
         $endpoint = midnightEndpoint($network, $custom);
         if ($endpoint === null) {
-            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+            http_response_code(400);
+            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
             break;
         }
         $probe = midnightProbe($endpoint, 5);
@@ -5006,6 +5066,12 @@ chmod 775 /etc/irongate
 touch /etc/irongate/config.yaml 2>/dev/null || true
 chown root:www-data /etc/irongate/config.yaml 2>/dev/null || true
 chmod 664 /etc/irongate/config.yaml 2>/dev/null || true
+# The updater's pin file is its trust root: keep it root:root even though the
+# recursive chown above would hand it to www-data (the updater refuses such a file).
+if [ -f /etc/irongate/updater-pin.conf ]; then
+    chown root:root /etc/irongate/updater-pin.conf
+    chmod 644 /etc/irongate/updater-pin.conf
+fi
 
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
@@ -5033,12 +5099,14 @@ Layer 8 Blockchain (Optional):
 """
 
 import os
+import re
 import sys
 import yaml
 import time
 import signal
 import logging
 import tempfile
+import ipaddress
 import subprocess
 import threading
 from pathlib import Path
@@ -5066,6 +5134,29 @@ except ImportError:
     BLOCKCHAIN_MODULE_AVAILABLE = False
     MIDNIGHT_AVAILABLE = False
     logger.info("Blockchain module not available - Layer 8 disabled")
+
+# irongate-audit (V1): zone/group names and device IPs are interpolated into the
+# nftables ruleset text that is loaded as root. The config is writable by the
+# web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
+# otherwise become nft syntax. Only strict identifiers/addresses may reach it.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+
+
+def _valid_zone_name(name):
+    """True only for a str matching [A-Za-z0-9_-]{1,32} (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
+
+
+def _valid_ipv4(value):
+    """Return the canonical IPv4 string for value, or None if it is not an IPv4 address."""
+    if not isinstance(value, str):
+        return None
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return str(addr) if addr.version == 4 else None
+
 
 def _audit_log(blockchain, mac, ip, action, result):
     """Best-effort Layer 8 audit write.
@@ -5858,6 +5949,17 @@ class Irongate:
         devices = self.config.get('devices') or []
         custom_groups = self.config.get('custom_groups') or []
 
+        # irongate-audit (V1): drop groups whose name is not a safe identifier
+        # before anything is interpolated into the ruleset.
+        safe_groups = []
+        for g in custom_groups:
+            if isinstance(g, dict) and _valid_zone_name(g.get('name', '')):
+                safe_groups.append(g)
+            else:
+                logger.warning("Firewall: skipping custom group with invalid name %r",
+                               g.get('name') if isinstance(g, dict) else g)
+        custom_groups = safe_groups
+
         # Build a dictionary of group name -> group config
         group_configs = {}
         for g in custom_groups:
@@ -5872,9 +5974,15 @@ class Irongate:
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
+                # irongate-audit (V1): validate before interpolating into nft text.
+                safe_ip = _valid_ipv4(ip)
+                if safe_ip is None or not _valid_zone_name(zone):
+                    logger.warning("Firewall: skipping device with invalid ip/zone (ip=%r zone=%r)",
+                                   ip, zone)
+                    continue
                 if zone not in zone_ips:
                     zone_ips[zone] = []
-                zone_ips[zone].append(ip)
+                zone_ips[zone].append(safe_ip)
 
         # Ensure built-in zones exist even if empty
         for builtin in ['isolated', 'servers', 'trusted']:
@@ -5967,7 +6075,7 @@ class Irongate:
 """
                 for target_group in can_access:
                     target_set = f"{target_group}_devices"
-                    if target_group in zone_ips:
+                    if _valid_zone_name(target_group) and target_group in zone_ips:
                         rules_section += f"        ip saddr @{set_name} ip daddr @{target_set} accept\n"
                         rules_section += f"        ip daddr @{set_name} ip saddr @{target_set} accept\n"
 
@@ -6171,9 +6279,11 @@ kept alongside this file as blockchain_algorand.py.<ts>.reference.
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -6274,6 +6384,38 @@ class IrongateBlockchain:
     DEFAULT_NETWORK = 'preprod'
     DEFAULT_TIMEOUT = 5.0
 
+    @classmethod
+    def allowed_indexer_hosts(cls):
+        """Hosts of the https indexer presets in NETWORKS (derived, not hard-coded)."""
+        hosts = set()
+        for preset in cls.NETWORKS.values():
+            parts = urllib.parse.urlsplit(preset['indexer'])
+            if parts.scheme == 'https' and parts.hostname:
+                hosts.add(parts.hostname.lower())
+        return frozenset(hosts)
+
+    @classmethod
+    def validate_indexer_url(cls, url):
+        """Return url if it is an https URL on a known Midnight indexer host, else None.
+
+        irongate-audit (V2, SSRF): indexer_url comes from a config file the web
+        tier can write, and this process runs as root. Without this check a
+        crafted value points the engine at cloud metadata (http://169.254.169.254/),
+        loopback services or file:// URLs.
+        """
+        if not isinstance(url, str) or not re.fullmatch(r'[\x21-\x7e]+', url) or '\\' in url:
+            return None
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+            return None
+        if (parts.hostname or '').lower() not in cls.allowed_indexer_hosts():
+            return None
+        return url
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize blockchain connection.
@@ -6311,11 +6453,19 @@ class IrongateBlockchain:
             )
             self.network = self.DEFAULT_NETWORK
 
-        # An explicit indexer_url overrides the network preset.
-        self.indexer_url = (
-            self.config.get('indexer_url')
-            or self.NETWORKS[self.network]['indexer']
-        )
+        # An explicit indexer_url overrides the network preset, but only if it
+        # is an https URL on a known Midnight indexer host (SSRF guard, V2).
+        self.indexer_url = self.NETWORKS[self.network]['indexer']
+        custom_indexer = self.config.get('indexer_url')
+        if custom_indexer and custom_indexer != self.indexer_url:
+            if self.validate_indexer_url(custom_indexer):
+                self.indexer_url = custom_indexer
+            else:
+                logger.warning(
+                    "Blockchain Layer 8: indexer_url %r rejected (must be https on a "
+                    "known Midnight indexer host) - using the '%s' preset",
+                    custom_indexer, self.network,
+                )
 
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")
@@ -7615,13 +7765,21 @@ echo -e "${YELLOW}Creating auto-updater service...${NC}"
 # Create updater script
 cat > /opt/irongate/irongate-updater.sh << 'UPDATER'
 #!/bin/bash
-# Irongate Auto-Updater (commit hash based)
+# Irongate Auto-Updater (pinned commit)
 #
 # Runs as root. The web interface may TRIGGER an update (--force) but never
-# supplies the code: this script fetches and verifies the installer itself.
+# supplies the code: this script installs ONLY the commit named in the
+# root-owned pin file, and only if the downloaded installer's sha256 equals the
+# pin. It never follows the moving main branch.
+#
+# Pin file (operator-maintained, root:root, mode 0644 or 0600):
+#   /etc/irongate/updater-pin.conf
+#     PINNED_COMMIT=<40 hex chars>
+#     PINNED_INSTALLER_SHA256=<64 hex chars>   # sha256 of irongate-install.sh at that commit
+# Update the pin (after reviewing the new commit) to roll out a new version.
 
-GITHUB_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
 REPO_RAW_BASE="https://raw.githubusercontent.com/beatboxes/irongate"
+PIN_FILE="/etc/irongate/updater-pin.conf"
 STAGE_DIR="/opt/irongate/.update"
 MIN_INSTALLER_BYTES=100000
 FORCE=0
@@ -7633,6 +7791,50 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# Load and validate the pin file. Sets PINNED_COMMIT and PINNED_INSTALLER_SHA256,
+# or returns 1 after logging why. The file is opened once and that open file is
+# inspected and read, so a swap between the check and the read cannot matter.
+load_pin() {
+    local LC_ALL=C line pin_stat pin_uid pin_gid pin_mode n=0
+    PINNED_COMMIT=""
+    PINNED_INSTALLER_SHA256=""
+    if [ -L "$PIN_FILE" ] || [ ! -f "$PIN_FILE" ]; then
+        log "ERROR: pin file $PIN_FILE is missing or not a regular file - refusing to update"
+        return 1
+    fi
+    if ! exec 3< "$PIN_FILE"; then
+        log "ERROR: cannot open pin file $PIN_FILE - refusing to update"
+        return 1
+    fi
+    pin_stat=$(stat -L -c '%u:%g:%a' /dev/fd/3 2>/dev/null)
+    IFS=: read -r pin_uid pin_gid pin_mode <<< "$pin_stat"
+    if [ "$pin_uid" != "0" ] || [ "$pin_gid" != "0" ] \
+        || { [ "$pin_mode" != "644" ] && [ "$pin_mode" != "600" ]; }; then
+        log "ERROR: pin file $PIN_FILE must be root:root with mode 0644 or 0600 (found uid:gid:mode ${pin_stat:-unknown}) - refusing to update"
+        exec 3<&-
+        return 1
+    fi
+    while IFS= read -r line <&3 || [ -n "$line" ]; do
+        n=$((n + 1))
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ "$line" =~ ^PINNED_COMMIT=([0-9a-f]{40})$ ]] && [ -z "$PINNED_COMMIT" ]; then
+            PINNED_COMMIT="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^PINNED_INSTALLER_SHA256=([0-9a-f]{64})$ ]] && [ -z "$PINNED_INSTALLER_SHA256" ]; then
+            PINNED_INSTALLER_SHA256="${BASH_REMATCH[1]}"
+        else
+            log "ERROR: pin file $PIN_FILE line $n is not valid - refusing to update"
+            exec 3<&-
+            return 1
+        fi
+    done
+    exec 3<&-
+    if [ -z "$PINNED_COMMIT" ] || [ -z "$PINNED_INSTALLER_SHA256" ]; then
+        log "ERROR: pin file $PIN_FILE must define PINNED_COMMIT (40 hex) and PINNED_INSTALLER_SHA256 (64 hex) - refusing to update"
+        return 1
+    fi
+    return 0
+}
+
 # Check if auto-update is enabled
 AUTO_UPDATE=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='auto_update_enabled';" 2>/dev/null)
 if [ "$AUTO_UPDATE" != "true" ] && [ "$FORCE" -ne 1 ]; then
@@ -7642,31 +7844,25 @@ fi
 
 log "Starting update check..."
 
+# The pin is the only source of truth for what may be installed.
+if ! load_pin; then
+    exit 1
+fi
+TARGET_SHA="$PINNED_COMMIT"
+TARGET_COMMIT=$(printf '%s' "$TARGET_SHA" | cut -c1-7)
+
 # Get current commit from database
 CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null || echo "unknown")
 
-# Get latest commit from GitHub API
-REMOTE_SHA=$(curl -sf -H "User-Agent: Irongate-Updater" "$GITHUB_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4)
-REMOTE_COMMIT=$(printf '%s' "$REMOTE_SHA" | cut -c1-7)
-
-if [ -z "$REMOTE_COMMIT" ]; then
-    log "ERROR: Could not fetch remote commit from GitHub API"
-    exit 1
-fi
-
-log "Current: $CURRENT_COMMIT, Remote: $REMOTE_COMMIT"
+log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 
 # Update last check time
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
 # Compare commits
-if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
+if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
     log "Update available! Downloading..."
-    
-    # Store the target commit BEFORE running update (in case script fails to set it)
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$REMOTE_COMMIT');" 2>/dev/null
-    log "Set target commit to $REMOTE_COMMIT"
-    
+
     # Download the installer into a root-only directory. /tmp is world-writable,
     # so staging there let any local user swap the file between download and
     # execution - and the web user had a sudo grant to run exactly that path.
@@ -7675,23 +7871,26 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURR
     SCRIPT_PATH="$STAGE_DIR/irongate-install.sh"
     rm -f "$SCRIPT_PATH"
 
-    # Pin to the resolved commit rather than the moving main ref, so the bytes
-    # executed are the bytes that were checked.
-    if [ -n "$REMOTE_SHA" ]; then
-        SRC_URL="$REPO_RAW_BASE/$REMOTE_SHA/irongate-install.sh"
-    else
-        SRC_URL="$REPO_RAW_BASE/main/irongate-install.sh"
-    fi
+    # Fetch the pinned commit, never the moving main ref.
+    SRC_URL="$REPO_RAW_BASE/$TARGET_SHA/irongate-install.sh"
     log "Downloading $SRC_URL"
     curl -sf -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
 
-    # Integrity gate. None of this is a substitute for a signature, but it does
-    # reject the realistic failures: a truncated download, an HTML error page
-    # served instead of the script, or a corrupted file.
     if [ ! -s "$SCRIPT_PATH" ]; then
         log "ERROR: downloaded installer is missing or empty - aborting"
         exit 1
     fi
+
+    # Authenticity gate: the bytes must be exactly the bytes that were reviewed
+    # and pinned. Checked before the file is made executable or run.
+    ACTUAL_SHA256=$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)
+    if [ "$ACTUAL_SHA256" != "$PINNED_INSTALLER_SHA256" ]; then
+        log "ERROR: installer sha256 ${ACTUAL_SHA256:-unavailable} does not match pin $PINNED_INSTALLER_SHA256 - aborting"
+        rm -f "$SCRIPT_PATH"
+        exit 1
+    fi
+
+    # Sanity gate: reject a truncated download or an unparseable script.
     SCRIPT_SIZE=$(stat -c%s "$SCRIPT_PATH" 2>/dev/null || echo 0)
     if [ "$SCRIPT_SIZE" -lt "$MIN_INSTALLER_BYTES" ]; then
         log "ERROR: installer is only ${SCRIPT_SIZE} bytes, expected >= ${MIN_INSTALLER_BYTES} - aborting"
@@ -7703,12 +7902,28 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURR
         rm -f "$SCRIPT_PATH"
         exit 1
     fi
-    log "Integrity checks passed (${SCRIPT_SIZE} bytes, syntax valid, commit ${REMOTE_COMMIT})"
+    log "Integrity checks passed (${SCRIPT_SIZE} bytes, sha256 matches pin, syntax valid, commit ${TARGET_COMMIT})"
+
+    # Store the target commit BEFORE running update (in case script fails to set it)
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
+    log "Set target commit to $TARGET_COMMIT"
 
     chmod 700 "$SCRIPT_PATH"
     log "Running installer..."
     bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
+    INSTALL_RC=$?
+    if [ "$INSTALL_RC" -ne 0 ]; then
+        log "ERROR: installer exited with status $INSTALL_RC"
+        exit 1
+    fi
+    # The installer stamps installed_commit with the moving main HEAD; restore
+    # the pinned commit so the next scheduled run does not reinstall.
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
     log "Update complete!"
+    log "Update check finished"
+    # The installer rewrites this very file; bash reads scripts incrementally, so
+    # stop here instead of reading whatever now sits at the old offset.
+    exit 0
 else
     log "Already up to date"
 fi

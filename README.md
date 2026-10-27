@@ -229,6 +229,24 @@ and the web dashboard.
 **Do not rename `irongate-install.sh`.** The updater and the web UI's update action both fetch it
 from this repository by that exact name.
 
+### Updater pin (required for updates)
+
+The updater (`irongate-updater.sh`, run by the daily timer and by the dashboard's *Update now*)
+installs **only the commit named in a root-owned pin file** and refuses to run if the downloaded
+`irongate-install.sh` does not hash to the pinned value. It never follows `main`. Create
+`/etc/irongate/updater-pin.conf` (owner `root:root`, mode `0644` or `0600`):
+
+```
+PINNED_COMMIT=<40-hex commit sha you reviewed>
+PINNED_INSTALLER_SHA256=<sha256 of irongate-install.sh at that commit>
+```
+
+Compute the hash from the reviewed commit, e.g.
+`git show <commit>:irongate-install.sh | sha256sum`. With no pin file (or a wrong owner, mode or
+hash) the updater logs the reason to `/var/log/irongate-update.log` and exits 1 without installing.
+After merging a new release, review it and update the pin; until then the host stays on the
+previously pinned commit. `auto_update_enabled=false` still disables scheduled runs entirely.
+
 ## Requirements
 
 - Debian-based Linux, root access
