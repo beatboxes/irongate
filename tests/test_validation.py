@@ -541,5 +541,217 @@ class OpenerScopeTests(unittest.TestCase):
         self.assertEqual(users, [], 'urllib is used outside blockchain.py: %s' % users)
 
 
+import shutil  # noqa: E402  (only the O3 tests below use it)
+
+FAKE_TOOLS = ('ip', 'brctl', 'bridge', 'ebtables', 'nft', 'pkill', 'dnsmasq')
+
+# What run_dual_nic() has always run for the default settings (eth1 isolated behind br-irongate, eth0 uplink).
+EXPECTED_DUAL_COMMANDS = [
+    ['ip', 'link', 'set', 'br-irongate', 'down'],
+    ['brctl', 'delbr', 'br-irongate'],
+    ['brctl', 'addbr', 'br-irongate'],
+    ['brctl', 'stp', 'br-irongate', 'off'],
+    ['ip', 'link', 'set', 'eth1', 'down'],
+    ['ip', 'addr', 'flush', 'dev', 'eth1'],
+    ['brctl', 'addif', 'br-irongate', 'eth1'],
+    ['ip', 'link', 'set', 'eth1', 'up'],
+    ['ip', 'addr', 'add', '10.99.0.1/16', 'dev', 'br-irongate'],
+    ['ip', 'link', 'set', 'br-irongate', 'up'],
+    ['bridge', 'link', 'set', 'dev', 'eth1', 'isolated', 'on'],
+    ['nft', 'add', 'table', 'nat'],
+    ['nft', 'add', 'chain', 'nat', 'postrouting', '{', 'type', 'nat', 'hook', 'postrouting', 'priority', '100', ';', '}'],
+    ['nft', 'add', 'rule', 'nat', 'postrouting', 'oifname', 'eth0', 'masquerade'],
+    ['pkill', '-f', 'dnsmasq.*bridge-dnsmasq'],
+    ['dnsmasq', '--conf-file=/etc/irongate/bridge-dnsmasq.conf'],
+]
+EXPECTED_DUAL_CONF = ('\ninterface=br-irongate\nbind-interfaces\ndhcp-range=10.99.1.1,10.99.255.254,24h\n'
+                      'dhcp-option=option:router,10.99.0.1\ndhcp-option=option:dns-server,10.99.0.1,8.8.8.8\n')
+
+
+class DualNicInjectionTests(unittest.TestCase):
+    """O3: the dual-NIC settings (config.yaml, which the web tier can write) never reach a shell, a command
+    argument or the dnsmasq file unchecked.
+
+    run_dual_nic() really runs here, against recording stand-ins for ip, brctl, bridge, ebtables, nft, pkill and
+    dnsmasq that sit first on PATH (nothing needs root, nothing touches the network or the real /etc), and the
+    dnsmasq file is redirected into a scratch directory. The payloads try to run `touch <scratch>/PWNED`: with a
+    shell in the way (os.system with the value pasted into the command) that file appears.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='ig-dual-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.mkdir(self.bin)
+        self.log = os.path.join(self.tmp, 'calls.log')
+        self.conf = os.path.join(self.tmp, 'bridge-dnsmasq.conf')
+        self.pwned = os.path.join(self.tmp, 'PWNED')
+        for tool in FAKE_TOOLS:
+            path = os.path.join(self.bin, tool)
+            with open(path, 'w') as fh:
+                fh.write('#!/bin/sh\n'
+                         'printf "%s" "${0##*/}" >> "$IG_FAKE_LOG"\n'
+                         'for a in "$@"; do printf "\\037%s" "$a" >> "$IG_FAKE_LOG"; done\n'
+                         'printf "\\n" >> "$IG_FAKE_LOG"\n'
+                         '[ "${IG_FAKE_FAIL:-}" = "${0##*/}" ] && exit 1\n'
+                         'exit 0\n')
+            os.chmod(path, 0o755)
+
+    def run_dual(self, bridge=None, network='eth0', fail=''):
+        net = {} if network is None else {'interface': network}
+        cfg = {'mode': 'dual', 'network': net,
+               'bridge': dict({'isolated_interface': 'eth1', 'bridge_name': 'br-irongate', 'bridge_ip': '10.99.0.1',
+                               'dhcp_start': '10.99.1.1', 'dhcp_end': '10.99.255.254'}, **(bridge or {}))}
+        engine = irongate.Irongate.__new__(irongate.Irongate)
+        engine.config = cfg
+        real_open, real_exists, conf = open, os.path.exists, self.conf
+
+        def fake_open(path, *a, **k):
+            return real_open(conf if path == '/etc/irongate/bridge-dnsmasq.conf' else path, *a, **k)
+
+        def fake_exists(path):
+            return True if str(path).startswith('/sys/class/net/') else real_exists(path)
+
+        env = {'PATH': self.bin + os.pathsep + os.environ.get('PATH', ''), 'IG_FAKE_LOG': self.log, 'IG_FAKE_FAIL': fail}
+        with mock.patch.dict(os.environ, env), mock.patch.object(irongate, 'open', fake_open, create=True), \
+                mock.patch.object(irongate.os.path, 'exists', fake_exists):
+            return engine.run_dual_nic()
+
+    def calls(self, wait_for=None):
+        """The recorded commands; wait_for names a tool that is started in the background (dnsmasq)."""
+        import time
+        end = time.time() + 5
+        while True:
+            rows = []
+            if os.path.exists(self.log):
+                with open(self.log) as fh:
+                    rows = [line.rstrip('\n').split('\x1f') for line in fh]
+            if wait_for is None or any(r[0] == wait_for for r in rows) or time.time() > end:
+                return rows
+            time.sleep(0.05)
+
+    def test_valid_settings_run_the_same_commands_as_before(self):
+        self.assertTrue(self.run_dual())
+        self.assertEqual(self.calls(wait_for='dnsmasq'), EXPECTED_DUAL_COMMANDS)
+        with open(self.conf) as fh:
+            self.assertEqual(fh.read(), EXPECTED_DUAL_CONF)
+
+    def test_failed_port_isolation_falls_back_to_ebtables(self):
+        self.assertTrue(self.run_dual(fail='bridge'))
+        rows = self.calls(wait_for='dnsmasq')
+        self.assertIn(['ebtables', '-A', 'FORWARD', '-i', 'eth1', '-o', 'eth1', '-j', 'DROP'], rows)
+
+    def test_a_missing_tool_does_not_stop_the_bridge_setup(self):
+        for tool in ('ebtables', 'brctl', 'pkill', 'dnsmasq'):
+            os.unlink(os.path.join(self.bin, tool))
+        with mock.patch.dict(os.environ, {'PATH': self.bin}):          # no brctl anywhere on PATH
+            self.assertTrue(self.run_dual(fail='bridge'))
+
+    def test_an_empty_uplink_only_skips_the_nat_rule(self):
+        self.assertTrue(self.run_dual(network=''))
+        rows = self.calls(wait_for='dnsmasq')
+        self.assertIn(['nft', 'add', 'table', 'nat'], rows)
+        self.assertFalse([r for r in rows if r[:4] == ['nft', 'add', 'rule', 'nat']], rows)
+
+    def payloads(self):
+        p = self.pwned
+        return [
+            # the reviewer's payload, and its cousins
+            ('bridge_ip', '10.99.0.1/32 dev lo; touch %s #' % p),
+            ('bridge_ip', '10.99.0.1; touch %s' % p),
+            ('bridge_ip', '10.99.0.1 && touch %s' % p),
+            ('bridge_ip', '$(touch %s)' % p),
+            ('bridge_ip', '`touch %s`' % p),
+            ('bridge_ip', '10.99.0.1\ntouch %s' % p),
+            ('bridge_ip', '10.99.0.1/16'),
+            ('bridge_ip', '10.99.0.1 '),
+            ('bridge_ip', '10.99.0.1\n'),
+            ('bridge_ip', 'fe80::1'),
+            ('bridge_ip', ''),
+            ('bridge_ip', None),
+            ('bridge_ip', ['10.99.0.1']),
+            ('bridge_ip', 167837697),
+            # dnsmasq file: a newline would add a directive of its own (dhcp-script= runs a program as root)
+            ('dhcp_start', '10.99.1.1,10.99.255.254,24h\ndhcp-script=%s\n#' % p),
+            ('dhcp_start', '10.99.1.1; touch %s' % p),
+            ('dhcp_start', '10.99.1.1\n'),
+            ('dhcp_end', '10.99.255.254,24h\nconf-file=/etc/shadow\n#'),
+            ('dhcp_end', '10.99.255.254 ; touch %s' % p),
+            ('dhcp_end', 'dhcp'),
+            # interface names
+            ('isolated_interface', 'eth1; touch %s' % p),
+            ('isolated_interface', 'eth1 && touch %s' % p),
+            ('isolated_interface', '$(touch %s)' % p),
+            ('isolated_interface', 'eth1\n'),
+            ('isolated_interface', '-x'),
+            ('isolated_interface', '..'),
+            ('isolated_interface', 'a' * 16),
+            ('isolated_interface', ['eth1']),
+            ('bridge_name', 'br0; touch %s' % p),
+            ('bridge_name', 'br-irongate\ninterface=eth0'),
+            ('bridge_name', '-batch'),
+            ('network.interface', 'eth0 masquerade ; flush ruleset ; #'),
+            ('network.interface', 'eth0; touch %s' % p),
+            ('network.interface', 'eth0\n'),
+            ('network.interface', ['eth0']),
+        ]
+
+    def test_injected_values_are_rejected_before_anything_runs(self):
+        for field, value in self.payloads():
+            with self.subTest(field=field, value=value):
+                self.setUp()                                  # fresh scratch directory for every payload
+                if field == 'network.interface':
+                    ok = self.run_dual(network=value)
+                else:
+                    ok = self.run_dual(bridge={field: value})
+                self.assertFalse(ok, 'a hostile %s was accepted' % field)
+                self.assertFalse(os.path.exists(self.pwned), 'the payload ran a command: %s was created' % self.pwned)
+                self.assertEqual(self.calls(), [], 'commands ran although %s is invalid' % field)
+                self.assertFalse(os.path.exists(self.conf), 'the dnsmasq file was written although %s is invalid' % field)
+
+    def test_no_shell_is_used_and_every_command_is_an_argument_list(self):
+        started = []
+
+        def no_system(cmd):
+            raise AssertionError('os.system() called with %r' % (cmd,))
+
+        def fake_run(argv, **kw):
+            started.append((argv, kw))
+            return mock.Mock(returncode=0)
+
+        def fake_popen(argv, **kw):
+            started.append((argv, kw))
+            return mock.Mock()
+
+        real_open = open
+        conf = self.conf
+        engine = irongate.Irongate.__new__(irongate.Irongate)
+        engine.config = {'mode': 'dual', 'network': {'interface': 'eth0'},
+                         'bridge': {'isolated_interface': 'eth1', 'bridge_name': 'br-irongate', 'bridge_ip': '10.99.0.1',
+                                    'dhcp_start': '10.99.1.1', 'dhcp_end': '10.99.255.254'}}
+        real_exists = os.path.exists
+        with mock.patch.object(irongate.os, 'system', no_system), mock.patch.object(irongate.subprocess, 'run', fake_run), \
+                mock.patch.object(irongate.subprocess, 'Popen', fake_popen), \
+                mock.patch.object(irongate, 'open', lambda p, *a, **k: real_open(conf if p == '/etc/irongate/bridge-dnsmasq.conf' else p, *a, **k), create=True), \
+                mock.patch.object(irongate.os.path, 'exists', lambda p: True if str(p).startswith('/sys/class/net/') else real_exists(p)):
+            self.assertTrue(engine.run_dual_nic())
+        self.assertEqual([a for a, _ in started], EXPECTED_DUAL_COMMANDS)
+        for argv, kw in started:
+            self.assertIsInstance(argv, list)
+            self.assertTrue(all(isinstance(a, str) for a in argv), argv)
+            self.assertFalse(kw.get('shell'), 'shell=True for %r' % (argv,))
+
+
+class IfaceNameTests(unittest.TestCase):
+    def test_valid_interface_names(self):
+        for name in ('eth0', 'br-irongate', 'eth0.100', 'enx001122334455', '_x', 'a', 'a' * 15, 'wlan0', 'end0'):
+            self.assertTrue(irongate._valid_iface(name), name)
+
+    def test_invalid_interface_names(self):
+        for name in ('', 'a' * 16, '-x', '.x', '..', '.', 'a b', 'a;b', 'a\n', 'eth0\n', 'a/b', 'a:1', 'a$b', 'a`b', 'é',
+                     None, 5, ['eth0'], b'eth0'):
+            self.assertFalse(irongate._valid_iface(name), repr(name))
+
+
 if __name__ == '__main__':
     unittest.main()

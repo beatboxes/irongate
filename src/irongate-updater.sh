@@ -138,10 +138,8 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     fi
     log "Integrity checks passed (${SCRIPT_SIZE} bytes, sha256 matches pin, syntax valid, commit ${TARGET_COMMIT})"
 
-    # Store the target commit BEFORE running update (in case script fails to set it)
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
-    log "Set target commit to $TARGET_COMMIT"
-
+    # installed_commit is stamped only AFTER the installer has exited 0 (below). Stamping it first made a
+    # failed installer look installed: the next scheduled run said "Already up to date" and never retried.
     chmod 700 "$SCRIPT_PATH"
     log "Running installer..."
     bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1

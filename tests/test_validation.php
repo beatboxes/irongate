@@ -302,5 +302,115 @@ foreach ([['GET', 'irongate_devices'], ['POST', 'irongate_devices'], ['OPTIONS',
     check("V3 CORS: no Access-Control-* header on $m (headers were captured)", count($ct) === 1 && count($cors) === 0, json_encode($r['headers']));
 }
 
+// ---- O3: irongate_* settings are validated before they are stored ---------------------------------------------------
+// They are copied into /etc/irongate/config.yaml and, in dual-NIC mode, the root engine turns them into bridge, nft
+// and dnsmasq commands. yamlScalar() keeps a value from breaking the YAML but not from being a hostile string.
+// Both endpoints that store settings are checked: irongate_settings and the generic settings endpoint, which stores
+// any key (so validating only the first would be bypassed through the second).
+$inj = '10.99.0.1/32 dev lo; touch /tmp/PWNED #';
+$badSettings = [
+    "bridge_ip: the reviewer's command injection" => ['irongate_bridge_ip', $inj],
+    'bridge_ip: ;-chained command'      => ['irongate_bridge_ip', '10.99.0.1; touch /tmp/PWNED'],
+    'bridge_ip: $() substitution'       => ['irongate_bridge_ip', '$(touch /tmp/PWNED)'],
+    'bridge_ip: with a prefix length'   => ['irongate_bridge_ip', '10.99.0.1/16'],
+    'bridge_ip: trailing newline'       => ['irongate_bridge_ip', "10.99.0.1\n"],
+    'bridge_ip: leading space'          => ['irongate_bridge_ip', ' 10.99.0.1'],
+    'bridge_ip: IPv6'                   => ['irongate_bridge_ip', 'fe80::1'],
+    'bridge_ip: integer'                => ['irongate_bridge_ip', 167837697],
+    'bridge_ip: array'                  => ['irongate_bridge_ip', ['10.99.0.1']],
+    'bridge_ip: null'                   => ['irongate_bridge_ip', null],
+    'dhcp_start: dnsmasq directive after a newline' => ['irongate_bridge_dhcp_start', "10.99.1.1,10.99.255.254,24h\ndhcp-script=/tmp/x\n#"],
+    'dhcp_end: chained command'         => ['irongate_bridge_dhcp_end', '10.99.255.254; touch /tmp/PWNED'],
+    'dhcp_end: host name'               => ['irongate_bridge_dhcp_end', 'example.com'],
+    'isolated_interface: command'       => ['irongate_isolated_interface', 'eth1; touch /tmp/PWNED'],
+    'isolated_interface: &&'            => ['irongate_isolated_interface', 'eth1 && touch /tmp/PWNED'],
+    'isolated_interface: leading hyphen (option injection)' => ['irongate_isolated_interface', '-batch'],
+    'isolated_interface: ..'            => ['irongate_isolated_interface', '..'],
+    'isolated_interface: 16 characters' => ['irongate_isolated_interface', str_repeat('a', 16)],
+    'isolated_interface: slash'         => ['irongate_isolated_interface', 'a/b'],
+    'isolated_interface: trailing newline' => ['irongate_isolated_interface', "eth1\n"],
+    'isolated_interface: integer (would pass a regex through string coercion)' => ['irongate_isolated_interface', 123],
+    'isolated_interface: array' => ['irongate_isolated_interface', ['eth1']],
+    'mode: unknown value'               => ['irongate_mode', 'bridge'],
+    'mode: wrong case'                  => ['irongate_mode', 'Dual'],
+    'flag: yes'                         => ['irongate_firewall', 'yes'],
+    'flag: JSON true'                   => ['irongate_arp_defense', true],
+    'flag: 1'                           => ['irongate_ipv6_ra', '1'],
+    'flag: TRUE'                        => ['irongate_gateway_takeover', 'TRUE'],
+    'flag: array'                       => ['irongate_bypass_detection', ['true']],
+    'enabled: trailing space'           => ['irongate_enabled', 'true '],
+    'unknown key'                       => ['irongate_evil', 'x'],
+    'unknown key: the bare prefix'      => ['irongate_', 'x'],
+    'unknown key: near miss'            => ['irongate_bridge_ip6', '::1'],
+];
+foreach (['irongate_settings', 'settings'] as $endpoint) {
+    foreach ($badSettings as $label => [$key, $val]) {
+        $before = dbq("SELECT value FROM settings WHERE key='$key'");
+        $r = call('POST', $endpoint, [$key => $val]);
+        $after = dbq("SELECT value FROM settings WHERE key='$key'");
+        check("O3 $endpoint: reject $label", $r['status'] === 400 && ($r['json']['success'] ?? null) === false && $after === $before
+            && strpos((string)($r['json']['error'] ?? ''), $key) !== false, brief($r) . ' stored=' . var_export($after, true));
+    }
+    // all or nothing: one bad entry keeps the good ones in the same request from being stored
+    $r = call('POST', $endpoint, ['irongate_arp_defense' => 'false', 'irongate_bridge_ip' => $inj]);
+    check("O3 $endpoint: a request with one hostile value stores nothing at all", $r['status'] === 400
+        && dbq("SELECT COUNT(*) FROM settings WHERE key IN ('irongate_arp_defense','irongate_bridge_ip')") == 0, brief($r));
+}
+$ui = ['irongate_enabled' => 'false', 'irongate_mode' => 'dual', 'irongate_isolated_interface' => 'eth1',
+       'irongate_bridge_ip' => '10.99.0.1', 'irongate_bridge_dhcp_start' => '10.99.1.1', 'irongate_bridge_dhcp_end' => '10.99.255.254',
+       'irongate_arp_defense' => 'true', 'irongate_ipv6_ra' => 'true', 'irongate_gateway_takeover' => 'false',
+       'irongate_bypass_detection' => 'true', 'irongate_firewall' => 'true'];
+$r = call('POST', 'irongate_settings', $ui);
+$allStored = true;
+foreach ($ui as $k => $v) { if (dbq("SELECT value FROM settings WHERE key='$k'") !== $v) { $allStored = false; } }
+check('O3 save: the dashboard\'s full settings payload is accepted and stored (control)', ($r['json']['success'] ?? null) === true && $allStored, brief($r));
+$r = call('POST', 'irongate_settings', ['irongate_isolated_interface' => '', 'irongate_bridge_ip' => '', 'irongate_bridge_dhcp_start' => '', 'irongate_bridge_dhcp_end' => '', 'irongate_mode' => 'single']);
+check('O3 save: empty strings ("not set") are accepted for the interface and the addresses (control)', ($r['json']['success'] ?? null) === true
+    && dbq("SELECT value FROM settings WHERE key='irongate_bridge_ip'") === '', brief($r));
+foreach (['eth0', 'br-irongate', 'eth0.100', 'enx001122334455', '_x', str_repeat('a', 15)] as $ifn) {
+    $r = call('POST', 'irongate_settings', ['irongate_isolated_interface' => $ifn]);
+    check("O3 save: interface name $ifn is accepted (control)", ($r['json']['success'] ?? null) === true
+        && dbq("SELECT value FROM settings WHERE key='irongate_isolated_interface'") === $ifn, brief($r));
+}
+$r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_enabled' => 'false']);
+check('O3 save: settings without any irongate_* key are unaffected (control)', ($r['json']['success'] ?? null) === true, brief($r));
+$r = call('POST', 'irongate_toggle', ['enabled' => false]);
+check('O3 toggle: irongate_toggle still stores irongate_enabled (control)', ($r['json']['success'] ?? null) === true
+    && dbq("SELECT value FROM settings WHERE key='irongate_enabled'") === 'false', brief($r));
+// the engine reads these values from the generated config: dual mode writes the validated addresses
+dbx("INSERT OR REPLACE INTO settings VALUES ('irongate_enabled','true'), ('interface','eth0'), ('gateway','192.168.1.1')");
+$r = call('POST', 'irongate_settings', ['irongate_mode' => 'dual', 'irongate_isolated_interface' => 'eth1', 'irongate_bridge_ip' => '10.99.0.1',
+    'irongate_bridge_dhcp_start' => '10.99.1.1', 'irongate_bridge_dhcp_end' => '10.99.255.254']);
+dbx("UPDATE settings SET value='false' WHERE key='irongate_enabled'; DELETE FROM settings WHERE key IN ('interface','gateway')");
+$cfgText = (string)@file_get_contents('/etc/irongate/config.yaml');
+check('O3 save: a valid dual-NIC save regenerates config.yaml with the validated values (control)', ($r['json']['success'] ?? null) === true
+    && strpos($cfgText, "  bridge_ip: \"10.99.0.1\"\n") !== false && strpos($cfgText, "  isolated_interface: \"eth1\"\n") !== false
+    && strpos($cfgText, "  dhcp_end: \"10.99.255.254\"\n") !== false, brief($r));
+
+// ---- O3 unit level: the validator, the loop and the setSetting() backstop, loaded from the tree under test ----------
+foreach (['validIrongateSetting', 'irongateSettingsError', 'setSetting'] as $fn) {
+    if (preg_match('/^function ' . $fn . '\(.*?^\}\n/ms', $apiSrc, $fm)) { eval($fm[0]); }
+}
+check('O3 unit: validIrongateSetting(), irongateSettingsError() and setSetting() exist',
+    function_exists('validIrongateSetting') && function_exists('irongateSettingsError') && function_exists('setSetting'));
+if (function_exists('validIrongateSetting') && function_exists('irongateSettingsError') && function_exists('setSetting')) {
+    check('O3 unit: the empty key and a non-string key are refused', validIrongateSetting('', 'x') === false && validIrongateSetting(5, 'x') === false);
+    check('O3 unit: irongateSettingsError() ignores other keys and non-arrays', irongateSettingsError(['interface' => 'eth0; x', 'blockchain_x' => 'y']) === null
+        && irongateSettingsError(null) === null && irongateSettingsError('x') === null);
+    check('O3 unit: irongateSettingsError() names the key and never echoes the value', ($m = irongateSettingsError(['irongate_bridge_ip' => $inj])) !== null
+        && strpos($m, 'irongate_bridge_ip') !== false && strpos($m, 'PWNED') === false, (string)$m);
+    check('O3 unit: a control character in the key cannot reach the error text', strpos((string)irongateSettingsError(["irongate_\n\x01" => 'x']), "\n") === false);
+    $mem = new SQLite3(':memory:');
+    $mem->exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+    check('O3 unit: setSetting() refuses a hostile irongate_* value whoever calls it', setSetting($mem, 'irongate_bridge_ip', $inj) === false
+        && (int)$mem->querySingle('SELECT COUNT(*) FROM settings') === 0);
+    check('O3 unit: setSetting() refuses an unknown irongate_* key', setSetting($mem, 'irongate_evil', 'x') === false
+        && (int)$mem->querySingle('SELECT COUNT(*) FROM settings') === 0);
+    check('O3 unit: setSetting() stores a valid irongate_* value', setSetting($mem, 'irongate_bridge_ip', '10.99.0.1') === true
+        && $mem->querySingle("SELECT value FROM settings WHERE key='irongate_bridge_ip'") === '10.99.0.1');
+    check('O3 unit: setSetting() leaves every other key as it was (control)', setSetting($mem, 'lease_time', '24h; anything') === true
+        && $mem->querySingle("SELECT value FROM settings WHERE key='lease_time'") === '24h; anything');
+}
+
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

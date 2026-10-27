@@ -30,6 +30,15 @@
 # Deploy on any Debian/Raspbian SBC
 #######################################
 
+# ---- installer PATH: begin ----
+# A fixed, absolute PATH. The installer runs as root from sudo, from the updater's systemd unit or from
+# a shell whose PATH may hold "." or an empty or relative entry: `find -execdir` (used on /etc/irongate
+# below) refuses to run at all with such a PATH, and a root script should not pick its tools from
+# whatever directories the caller listed anyway.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# ---- installer PATH: end ----
+
 IRONGATE_REPO="https://github.com/beatboxes/irongate"
 IRONGATE_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
 IRONGATE_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
@@ -619,6 +628,10 @@ function getSetting($db, $key) {
 }
 
 function setSetting($db, $key, $value) {
+    // irongate-audit (O3): backstop for every caller, whatever the endpoint checked before.
+    if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+        return false;
+    }
     $stmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
     $stmt->bindValue(1, $key, SQLITE3_TEXT);
     $stmt->bindValue(2, $value, SQLITE3_TEXT);
@@ -666,6 +679,39 @@ function validZoneName($name) {
 
 function validDeviceIp($ip) {
     return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+// irongate-audit (O3): the irongate_* settings are copied into /etc/irongate/config.yaml, which the root
+// engine reads and, in dual-NIC mode, turns into bridge, nft and dnsmasq commands. yamlScalar() keeps a
+// value from breaking the YAML but not from being a hostile string, so every key has a fixed shape here
+// and an unknown irongate_* key is refused. Interface names follow the kernel's rules (1-15 characters,
+// not starting with '-' or '.'); the addresses are IPv4 literals; the empty string means "not set".
+// \z (not $) so a trailing newline cannot slip through.
+function validIrongateSetting($key, $value) {
+    static $flags = ['irongate_enabled', 'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
+                     'irongate_bypass_detection', 'irongate_firewall'];
+    static $addrs = ['irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end'];
+    if (!is_string($key) || !is_string($value)) return false;
+    if (in_array($key, $flags, true)) return $value === 'true' || $value === 'false';
+    if ($key === 'irongate_mode') return $value === 'single' || $value === 'dual';
+    if ($key === 'irongate_isolated_interface') {
+        return $value === '' || preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}\z/', $value) === 1;
+    }
+    if (in_array($key, $addrs, true)) {
+        return $value === '' || filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    }
+    return false;
+}
+
+// The first problem in the irongate_* entries of a settings POST, or null. Checked before anything is stored.
+function irongateSettingsError($data) {
+    if (!is_array($data)) return null;
+    foreach ($data as $key => $value) {
+        if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+            return 'Invalid value or unknown setting: ' . preg_replace('/[^\x20-\x7e]/', '?', substr($key, 0, 40));
+        }
+    }
+    return null;
 }
 
 function cidrToHosts($cidr) {
@@ -1298,7 +1344,14 @@ switch ($action) {
     case 'settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
-            
+            // This endpoint stores any key, the irongate_* ones included: same rules as irongate_settings.
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
+
             // Validate lease_time format (dnsmasq format: 30m, 24h, 7d, 1w, infinite, or raw seconds)
             if (isset($data['lease_time'])) {
                 $lt = trim($data['lease_time']);
@@ -1444,6 +1497,12 @@ switch ($action) {
     case 'irongate_settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
             // Layer 8 validation: never persist an enable without a contract
             // address, an unknown network, or a malformed indexer URL.
             if (is_array($data) && (array_key_exists('blockchain_enabled', $data)
@@ -4990,17 +5049,106 @@ WEBAUTH_LOGOUTEOF
 #######################################
 # Set permissions
 #######################################
+# ---- web-tree permission helper: begin ----
+# /var/www/irongate and /etc/dnsmasq.d are handed to www-data (the web UI writes there), so the web tier
+# can create, rename and symlink entries in them at any moment, also while this installer runs as root.
+# `chmod FILE` and `chmod -R` have no no-follow switch (they re-resolve the name after looking at it),
+# so a link planted there made root chmod an arbitrary file (`chmod 666 dhcp.db` on a link to a root-only
+# file made it world-writable). ig_perm_fix opens every entry relative to the directory it already
+# holds with O_NOFOLLOW and changes owner and mode of the OPEN inode (fchown/fchmod), so nothing can
+# be redirected after the type check:
+#   ig_perm_fix tree DIR  OWNER GROUP MODE   DIR itself and every directory and regular file below it
+#                                            (a directory keeps its setuid/setgid bits, like chmod -R)
+#                                            get OWNER:GROUP and MODE; symlinks, FIFOs, sockets and
+#                                            hard-linked files are left alone and listed on stderr
+#   ig_perm_fix file PATH OWNER GROUP MODE   the same for one file; a symlink, any other type or a file
+#                                            with a second hard link is refused (exit 3, nothing changed)
+ig_perm_fix() {
+    python3 -I - "$@" <<'IG_PERM_FIX_PY'
+import errno
+import grp
+import os
+import pwd
+import stat
+import sys
+
+kind, path, owner, group, mode = sys.argv[1:6]
+FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+left = []
+
+
+def fix(fd, st, label, uid, gid, mode):
+    """Give the inode behind fd to uid:gid with mode; False (and noted) unless it is a directory or a lone regular file."""
+    if stat.S_ISDIR(st.st_mode):
+        keep = st.st_mode & 0o6000
+    elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+        keep = 0
+    else:
+        left.append(label)
+        return False
+    os.fchown(fd, uid, gid)
+    os.fchmod(fd, keep | mode)
+    return True
+
+
+def walk(dfd, prefix, depth, uid, gid, mode):
+    for name in sorted(os.listdir(dfd)):
+        label = prefix + "/" + name
+        try:
+            fd = os.open(name, FLAGS, dir_fd=dfd)
+        except OSError:
+            left.append(label)
+            continue
+        try:
+            st = os.fstat(fd)
+            if fix(fd, st, label, uid, gid, mode) and stat.S_ISDIR(st.st_mode):
+                if depth < 32:
+                    walk(fd, label, depth + 1, uid, gid, mode)
+                else:
+                    left.append(label + "/...")
+        finally:
+            os.close(fd)
+
+
+try:
+    uid, gid, mode = pwd.getpwnam(owner).pw_uid, grp.getgrnam(group).gr_gid, int(mode, 8)
+    if kind == "tree":
+        top = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fix(top, os.fstat(top), path, uid, gid, mode)
+        walk(top, path, 0, uid, gid, mode)
+    elif kind == "file":
+        parent, name = os.path.split(path)
+        pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fd = os.open(name, FLAGS, dir_fd=pfd)
+        except OSError as exc:
+            sys.stderr.write("ig_perm_fix: %s %s: refusing to change it\n"
+                             % (path, "is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+            sys.exit(3)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not fix(fd, st, path, uid, gid, mode):
+            sys.stderr.write("ig_perm_fix: %s is not a regular file with a single link: refusing to change it\n" % path)
+            sys.exit(3)
+    else:
+        sys.exit("ig_perm_fix: unknown kind %r" % kind)
+except (KeyError, OSError) as exc:
+    sys.exit("ig_perm_fix: %s: %s" % (path, exc))
+for label in left:
+    sys.stderr.write("ig_perm_fix: left alone (symlink, special file or hard-linked): %r\n" % label)
+IG_PERM_FIX_PY
+}
+# ---- web-tree permission helper: end ----
 echo -e "${YELLOW}Setting permissions...${NC}"
 
-chown -R www-data:www-data /var/www/irongate
-chmod -R 755 /var/www/irongate
-chmod 666 /var/www/irongate/dhcp.db
+# dhcp.db: written by the web API (www-data) and by root's sqlite3 (installer, updater), nothing else
+# reads it, so 0664 is enough; it was 0666, i.e. writable by every local user.
+ig_perm_fix tree /var/www/irongate www-data www-data 755
+ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data 664
 
 # Allow www-data to write dnsmasq config
 chown www-data:www-data /etc/dnsmasq.conf
 chmod 664 /etc/dnsmasq.conf
-chown -R www-data:www-data /etc/dnsmasq.d
-chmod -R 775 /etc/dnsmasq.d
+ig_perm_fix tree /etc/dnsmasq.d www-data www-data 775
 
 # Ensure lease file has proper ownership for dnsmasq to write
 chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || chown nobody:nogroup /var/lib/dnsmasq/dnsmasq.leases
@@ -5238,6 +5386,28 @@ def _valid_ipv4(value):
     except ValueError:
         return None
     return str(addr) if addr.version == 4 else None
+
+
+# irongate-audit (O3): the dual-NIC bridge settings come from the same web-writable config.yaml and used to be
+# pasted into os.system() strings, i.e. into a root shell: a bridge_ip of "10.99.0.1/32 dev lo; touch /tmp/x #"
+# ran `touch` as root. Interface names are limited to what a kernel interface name can be (1-15 characters,
+# not starting with '-' or '.'), addresses must be IPv4 literals, and the commands run as argument lists
+# without a shell.
+_IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+
+
+def _valid_iface(name):
+    """True only for a str of 1-15 characters [A-Za-z0-9_.-] that does not start with '.' or '-' (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _IFACE_RE.fullmatch(name) is not None
+
+
+def _run(argv, quiet=False):
+    """Run argv WITHOUT a shell and return its exit status (127 if the program is missing)."""
+    out = subprocess.DEVNULL if quiet else None
+    try:
+        return subprocess.run(argv, stdout=out, stderr=out).returncode
+    except OSError:
+        return 127
 
 
 def _audit_log(blockchain, mac, ip, action, result):
@@ -6221,43 +6391,63 @@ table inet irongate {{{sets_section}{rules_section}}}
         bridge_name = bridge_cfg.get('bridge_name', 'br-irongate')
         isolated_iface = bridge_cfg.get('isolated_interface', '')
         bridge_ip = bridge_cfg.get('bridge_ip', '10.99.0.1')
+        net = self.config.get('network') or {}
+        uplink = net.get('interface', 'eth0')
+        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
+        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
         
         if not isolated_iface:
             logger.error("No isolated interface configured!")
             return False
+        
+        # irongate-audit (O3): nothing from the config reaches a command, an argument or the dnsmasq
+        # file before it has been checked. An empty uplink only means there is no NAT rule to add
+        # (the old command with an empty name was a broken rule that nft rejected).
+        names = [('bridge_name', bridge_name), ('isolated_interface', isolated_iface)]
+        if uplink:
+            names.append(('network.interface', uplink))
+        for what, value in names:
+            if not _valid_iface(value):
+                logger.error("Dual-NIC: invalid %s %r - not starting the bridge", what, value)
+                return False
+        addrs = {}
+        for what, value in (('bridge_ip', bridge_ip), ('dhcp_start', dhcp_start), ('dhcp_end', dhcp_end)):
+            addrs[what] = _valid_ipv4(value)
+            if addrs[what] is None:
+                logger.error("Dual-NIC: invalid %s %r (an IPv4 address is required) - not starting the bridge", what, value)
+                return False
+        bridge_ip, dhcp_start, dhcp_end = addrs['bridge_ip'], addrs['dhcp_start'], addrs['dhcp_end']
         
         if not os.path.exists(f'/sys/class/net/{isolated_iface}'):
             logger.error(f"Isolated interface {isolated_iface} not found!")
             return False
         
         logger.info(f"Creating bridge {bridge_name}")
-        os.system(f'ip link set {bridge_name} down 2>/dev/null')
-        os.system(f'brctl delbr {bridge_name} 2>/dev/null')
-        os.system(f'brctl addbr {bridge_name}')
-        os.system(f'brctl stp {bridge_name} off')
+        _run(['ip', 'link', 'set', bridge_name, 'down'], quiet=True)
+        _run(['brctl', 'delbr', bridge_name], quiet=True)
+        _run(['brctl', 'addbr', bridge_name])
+        _run(['brctl', 'stp', bridge_name, 'off'])
         
-        os.system(f'ip link set {isolated_iface} down')
-        os.system(f'ip addr flush dev {isolated_iface}')
-        os.system(f'brctl addif {bridge_name} {isolated_iface}')
-        os.system(f'ip link set {isolated_iface} up')
+        _run(['ip', 'link', 'set', isolated_iface, 'down'])
+        _run(['ip', 'addr', 'flush', 'dev', isolated_iface])
+        _run(['brctl', 'addif', bridge_name, isolated_iface])
+        _run(['ip', 'link', 'set', isolated_iface, 'up'])
         
-        os.system(f'ip addr add {bridge_ip}/16 dev {bridge_name}')
-        os.system(f'ip link set {bridge_name} up')
+        _run(['ip', 'addr', 'add', f'{bridge_ip}/16', 'dev', bridge_name])
+        _run(['ip', 'link', 'set', bridge_name, 'up'])
         
-        result = os.system(f'bridge link set dev {isolated_iface} isolated on 2>/dev/null')
+        result = _run(['bridge', 'link', 'set', 'dev', isolated_iface, 'isolated', 'on'], quiet=True)
         if result == 0:
             logger.info("Port isolation enabled")
         else:
-            os.system(f'ebtables -A FORWARD -i {isolated_iface} -o {isolated_iface} -j DROP')
+            _run(['ebtables', '-A', 'FORWARD', '-i', isolated_iface, '-o', isolated_iface, '-j', 'DROP'])
         
-        net = self.config.get('network', {})
-        uplink = net.get('interface', 'eth0')
-        os.system(f'nft add table nat 2>/dev/null')
-        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }} 2>/dev/null')
-        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade 2>/dev/null')
-        
-        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
-        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
+        _run(['nft', 'add', 'table', 'nat'], quiet=True)
+        _run(['nft', 'add', 'chain', 'nat', 'postrouting', '{', 'type', 'nat', 'hook', 'postrouting', 'priority', '100', ';', '}'], quiet=True)
+        if uplink:
+            _run(['nft', 'add', 'rule', 'nat', 'postrouting', 'oifname', uplink, 'masquerade'], quiet=True)
+        else:
+            logger.warning("Dual-NIC: no uplink interface configured - no NAT rule for the bridge")
         
         dnsmasq_conf = f"""
 interface={bridge_name}
@@ -6269,8 +6459,11 @@ dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
         with open('/etc/irongate/bridge-dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        os.system('pkill -f "dnsmasq.*bridge-dnsmasq" 2>/dev/null')
-        os.system('dnsmasq --conf-file=/etc/irongate/bridge-dnsmasq.conf &')
+        _run(['pkill', '-f', 'dnsmasq.*bridge-dnsmasq'], quiet=True)
+        try:
+            subprocess.Popen(['dnsmasq', '--conf-file=/etc/irongate/bridge-dnsmasq.conf'], stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            logger.error("Dual-NIC: cannot start dnsmasq: %s", exc)
         
         logger.info(f"Dual-NIC bridge active: {bridge_name} ({bridge_ip})")
         return True
@@ -8030,10 +8223,8 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     fi
     log "Integrity checks passed (${SCRIPT_SIZE} bytes, sha256 matches pin, syntax valid, commit ${TARGET_COMMIT})"
 
-    # Store the target commit BEFORE running update (in case script fails to set it)
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
-    log "Set target commit to $TARGET_COMMIT"
-
+    # installed_commit is stamped only AFTER the installer has exited 0 (below). Stamping it first made a
+    # failed installer look installed: the next scheduled run said "Already up to date" and never retried.
     chmod 700 "$SCRIPT_PATH"
     log "Running installer..."
     bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1

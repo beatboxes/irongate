@@ -203,6 +203,42 @@ check "installer exits non-zero: updater reports failure (exit 1)" $(ran && [ $R
 reset true oldoldo; cp "$T/selfwrite-installer.sh" "$T/served-installer"; goodpin "$SELF_SHA"; run --force
 check "installer rewrites the updater in place: no stray code executed afterwards" $(ran && [ $RC -eq 0 ] && [ ! -e "$MARK.garbage" ] && logged "Update complete"; echo $?) "rc=$RC garbage=$(cat "$MARK.garbage" 2>/dev/null | wc -l) log=$(tail -3 "$T/update.log")"
 
+# ---- O6: installed_commit is stamped only after the installer has exited 0 ------------------------------------------
+# A failed installer must not leave the pinned commit recorded as installed: the next scheduled run would answer
+# "Already up to date" and never retry. These fixtures do NOT stamp installed_commit themselves (the real installer
+# stamps main HEAD part-way through), so whatever the updater leaves behind is the updater's own doing, and each one
+# records what installed_commit held at the moment the installer started.
+make_plain_installer() {   # $1=file $2=extra body
+    {
+        echo '#!/bin/bash'
+        echo 'echo ran >> "$MARK"'
+        echo 'cat "$T/db/installed_commit" > "$MARK.seen"'
+        printf '%s\n' "$2"
+        yes '# padding to pass the updater size gate ------------------------------------' | head -n 1500
+    } > "$1"
+}
+# The case just above let a fixture installer overwrite $UPDATER (it simulates the real installer rewriting the
+# updater in place), so build the copy under test again from the same source with the same path rewrites.
+sed -e "s#/etc/irongate/updater-pin.conf#$T/pin.conf#g" \
+    -e "s#/opt/irongate/.update#$T/stage#g" \
+    -e "s#/var/www/irongate/dhcp.db#$T/db/dhcp.db#g" \
+    -e "s#/var/log/irongate-update.log#$T/update.log#g" "$SRC" > "$UPDATER"
+make_plain_installer "$T/plain-good.sh" ''
+make_plain_installer "$T/plain-fail.sh" 'exit 3'
+PGOOD_SHA=$(sha_of "$T/plain-good.sh"); PFAIL_SHA=$(sha_of "$T/plain-fail.sh")
+
+reset true oldoldo; rm -f "$MARK.seen"; cp "$T/plain-fail.sh" "$T/served-installer"; goodpin "$PFAIL_SHA"; run --force
+check "O6 failed installer (--force): updater exits 1 and installed_commit is NOT advanced to the pinned commit" $(ran && [ $RC -eq 1 ] && [ "$(installed)" = oldoldo ]; echo $?) "rc=$RC installed_commit=$(installed)"
+check "O6 failed installer: the installer itself saw the OLD installed_commit while it ran (nothing stamped in advance)" $([ "$(cat "$MARK.seen" 2>/dev/null)" = oldoldo ]; echo $?) "installer saw: $(cat "$MARK.seen" 2>/dev/null)"
+rm -f "$MARK"; run
+check "O6 after a failed run the next scheduled run (no --force) tries again instead of 'Already up to date'" $(ran && ! logged "Already up to date"; echo $?) "rc=$RC ran=$(ran && echo y) log=$(tail -3 "$T/update.log")"
+
+reset true oldoldo; rm -f "$MARK.seen"; cp "$T/plain-good.sh" "$T/served-installer"; goodpin "$PGOOD_SHA"; run --force
+check "O6 successful installer: installed_commit is the pinned short sha afterwards" $(ran && [ $RC -eq 0 ] && [ "$(installed)" = "${PINNED_COMMIT:0:7}" ]; echo $?) "rc=$RC installed_commit=$(installed)"
+check "O6 successful installer: it also saw the OLD installed_commit while it ran" $([ "$(cat "$MARK.seen" 2>/dev/null)" = oldoldo ]; echo $?) "installer saw: $(cat "$MARK.seen" 2>/dev/null)"
+rm -f "$MARK"; run
+check "O6 after a successful run the next scheduled run has nothing to do" $(! ran && [ $RC -eq 0 ] && logged "Already up to date"; echo $?) "rc=$RC ran=$(ran && echo y)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

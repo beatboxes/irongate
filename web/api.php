@@ -60,6 +60,10 @@ function getSetting($db, $key) {
 }
 
 function setSetting($db, $key, $value) {
+    // irongate-audit (O3): backstop for every caller, whatever the endpoint checked before.
+    if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+        return false;
+    }
     $stmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
     $stmt->bindValue(1, $key, SQLITE3_TEXT);
     $stmt->bindValue(2, $value, SQLITE3_TEXT);
@@ -107,6 +111,39 @@ function validZoneName($name) {
 
 function validDeviceIp($ip) {
     return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+// irongate-audit (O3): the irongate_* settings are copied into /etc/irongate/config.yaml, which the root
+// engine reads and, in dual-NIC mode, turns into bridge, nft and dnsmasq commands. yamlScalar() keeps a
+// value from breaking the YAML but not from being a hostile string, so every key has a fixed shape here
+// and an unknown irongate_* key is refused. Interface names follow the kernel's rules (1-15 characters,
+// not starting with '-' or '.'); the addresses are IPv4 literals; the empty string means "not set".
+// \z (not $) so a trailing newline cannot slip through.
+function validIrongateSetting($key, $value) {
+    static $flags = ['irongate_enabled', 'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
+                     'irongate_bypass_detection', 'irongate_firewall'];
+    static $addrs = ['irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end'];
+    if (!is_string($key) || !is_string($value)) return false;
+    if (in_array($key, $flags, true)) return $value === 'true' || $value === 'false';
+    if ($key === 'irongate_mode') return $value === 'single' || $value === 'dual';
+    if ($key === 'irongate_isolated_interface') {
+        return $value === '' || preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}\z/', $value) === 1;
+    }
+    if (in_array($key, $addrs, true)) {
+        return $value === '' || filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    }
+    return false;
+}
+
+// The first problem in the irongate_* entries of a settings POST, or null. Checked before anything is stored.
+function irongateSettingsError($data) {
+    if (!is_array($data)) return null;
+    foreach ($data as $key => $value) {
+        if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+            return 'Invalid value or unknown setting: ' . preg_replace('/[^\x20-\x7e]/', '?', substr($key, 0, 40));
+        }
+    }
+    return null;
 }
 
 function cidrToHosts($cidr) {
@@ -739,7 +776,14 @@ switch ($action) {
     case 'settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
-            
+            // This endpoint stores any key, the irongate_* ones included: same rules as irongate_settings.
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
+
             // Validate lease_time format (dnsmasq format: 30m, 24h, 7d, 1w, infinite, or raw seconds)
             if (isset($data['lease_time'])) {
                 $lt = trim($data['lease_time']);
@@ -885,6 +929,12 @@ switch ($action) {
     case 'irongate_settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
             // Layer 8 validation: never persist an enable without a contract
             // address, an unknown network, or a malformed indexer URL.
             if (is_array($data) && (array_key_exists('blockchain_enabled', $data)

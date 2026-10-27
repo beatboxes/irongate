@@ -270,8 +270,25 @@ or have their owner and mode set through a hard-link pin of the existing file. A
 non-regular file found at one of those names is renamed to `<name>.refused.<time>.<pid>` (never deleted), reported,
 and treated as absent; a genuine regular file ends up with exactly the owner and mode it had before
 (`root:www-data`, `0664` for `config.yaml`, `0660` for the two JSON files). `find -execdir` refuses to run when
-`PATH` contains `.` or an empty entry, so the installer must be started with an ordinary root `PATH` (it stops
-with find's error message otherwise).
+`PATH` contains `.` or an empty or relative entry, so the installer sets its own fixed absolute `PATH` before it
+does anything else.
+
+The two trees that belong to `www-data`, `/var/www/irongate` and `/etc/dnsmasq.d`, get the same care: the
+installer hands them over with a small helper that opens every entry with `O_NOFOLLOW` and changes owner and
+mode of the open file, never of a name, so a link planted there is not followed (a link, FIFO or hard-linked
+file inside the trees is left alone and listed; a link, directory or extra hard link at `dhcp.db` stops the
+installer). `dhcp.db` is `www-data:www-data 0664` (it was `0666`, writable by every local user); only the web
+API and root's `sqlite3` (installer, updater) use it. A `dhcp.db` that is a symlink (for example to another
+disk) is therefore no longer supported; use a bind mount.
+
+The updater records `installed_commit` only after the installer exited 0, so a failed update is tried again by
+the next scheduled run instead of being reported as "Already up to date".
+
+The web API accepts only well-formed `irongate_*` settings: `true`/`false` for the layer switches, `single` or
+`dual` for the mode, IPv4 addresses for the bridge address and DHCP range, and interface names of 1-15
+characters from `[A-Za-z0-9_.-]` that do not start with `-` or `.` (the empty string means "not set"). Any other
+value, and any unknown `irongate_*` key, is refused with HTTP 400 and nothing of that request is stored. The
+engine checks the same values again before it builds the dual-NIC bridge and runs its commands without a shell.
 
 The dashboard's *Check for updates* (`update_check`) still compares the installed commit with the newest
 commit on `main`, so it reports "update available" whenever `main` is ahead of the pin. *Update now* and the
