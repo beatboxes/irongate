@@ -358,6 +358,17 @@ class IndexerSSRFTests(unittest.TestCase):
         self.assertIsNone(verdict['verified'])  # undecided: defer to Layers 1-7, never "verified"
         self.assertIsNone(bc.get_stats()['indexer_url'])
 
+    def test_rejected_url_undecided_depends_on_fallback_allow(self):
+        """README: a rejected URL is 'undecided' only while fallback_allow is true; with false the layer fails closed."""
+        for fallback_allow, expected in [(True, None), (False, False)]:
+            with self.subTest(fallback_allow=fallback_allow):
+                bc, seen, verdict = self.run_with_reachable_net(
+                    {'enabled': True, 'network': 'preprod', 'contract_address': '0x' + '00' * 32,
+                     'indexer_url': 'http://169.254.169.254/latest/meta-data/', 'fallback_allow': fallback_allow},
+                    lambda bc: bc.verify_device('aa:bb:cc:dd:ee:ff', '192.168.1.100'))
+                self.assertEqual(seen, [])
+                self.assertIs(verdict['verified'], expected)
+
     def test_custom_url_on_known_indexer_host_is_honoured(self):
         for url in [MAINNET, PREPROD, 'https://indexer.preview.midnight.network/api/v4/graphql',
                     'https://INDEXER.mainnet.midnight.network:443/api/v4/graphql?x=1']:
@@ -509,6 +520,25 @@ class IndexerRedirectTests(unittest.TestCase):
         front = self.serve()
         data = self.client(front.server_port)._graphql('query { block { height } }')
         self.assertEqual(data, {'block': {'hash': '0xabc', 'height': 7, 'timestamp': 1}})
+
+
+class OpenerScopeTests(unittest.TestCase):
+    """blockchain.py installs its no-redirect opener process-wide (urllib.request.install_opener).
+
+    That is only safe while it is the one urllib user in the engine process; the tests above mock
+    urllib.request.urlopen, which is why a module-local opener's .open() is not used. If another
+    module of the engine starts using urllib, this test fails: give blockchain.py a module-local
+    opener at that point (and point the urlopen mocks at it) instead of widening the global one.
+    """
+
+    def test_blockchain_is_the_only_urllib_user_in_the_engine(self):
+        users = []
+        for name in sorted(os.listdir(SRC)):
+            if name.endswith('.py') and name != 'blockchain.py':
+                with open(os.path.join(SRC, name), encoding='utf-8') as fh:
+                    if 'urllib' in fh.read():
+                        users.append(name)
+        self.assertEqual(users, [], 'urllib is used outside blockchain.py: %s' % users)
 
 
 if __name__ == '__main__':

@@ -165,7 +165,9 @@ function validIndexerUrl($url) {
         return false;
     }
     $p = parse_url($url);
-    if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
+    // Exactly "https", no case folding: parse_url() keeps the case and PHP's stream layer does not
+    // fold it either (PHP 8.3 sends the request for an all-upper-case "HTTPS://" in cleartext).
+    if ($p === false || ($p['scheme'] ?? '') !== 'https') return false;
     if (isset($p['user']) || isset($p['pass'])) return false;
     if (isset($p['port']) && $p['port'] !== 443) return false;
     $hosts = [];
@@ -907,6 +909,11 @@ switch ($action) {
                     http_response_code(400);
                     echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
+                }
+                // Store exactly what was validated (trimmed), not the raw value: the engine refuses a
+                // URL with surrounding whitespace, so storing the padded text would silently switch Layer 8 off.
+                if (array_key_exists('blockchain_indexer_url', $data)) {
+                    $data['blockchain_indexer_url'] = $reqIndexer;
                 }
             }
             foreach ($data as $key => $value) {

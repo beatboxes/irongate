@@ -76,8 +76,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 # urlopen() below uses this opener. It is installed process-wide on purpose: this
-# module is the only urllib user in the engine process, and going through urlopen()
-# keeps it replaceable in tests.
+# module is the only urllib user in the engine process (tests/test_validation.py,
+# OpenerScopeTests, fails if another module starts using urllib), and going through
+# urllib.request.urlopen() keeps the transport replaceable in tests, which a
+# module-local opener's .open() would not. Switch to a module-local opener (and
+# point those test mocks at it) before any other urllib user is added.
 urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
 
 

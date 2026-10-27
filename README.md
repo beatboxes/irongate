@@ -92,8 +92,11 @@ indexer hosts (`indexer.preprod.midnight.network`, `indexer.preview.midnight.net
 `indexer.mainnet.midnight.network`), with no credentials, and redirects are never followed; the selected
 network's own preset (for example the local `undeployed` node) is also accepted. Any other value is
 refused by the dashboard (HTTP 400). If one is written into `config.yaml` by hand the engine logs a
-warning and makes **no** Layer 8 queries at all (the layer reports *undecided*); it does not fall back to the
-preset, so the misconfiguration is visible instead of silently querying another host.
+warning and makes **no** Layer 8 queries at all; it does not fall back to the preset, so the misconfiguration
+is visible instead of silently querying another host. With the default `fallback_allow: true` the layer then
+reports *undecided* and enforcement falls through to Layers 1-7; with `fallback_allow: false` it fails closed
+and blocks devices it cannot verify. The scheme is compared exactly (`https`, not `HTTPS`), and the dashboard
+stores the trimmed value it validated.
 
 **The write path is not implemented.** Registering a device on-chain requires a funded wallet and a
 ZK proof server, and the published proof-server image has no confirmed `aarch64` build, so it
@@ -259,6 +262,16 @@ The installer leaves the pin file alone: it is excluded from the recursive `chow
 genuine `root:root` pin keeps its owner and mode across re-installs (which the updater itself triggers),
 and a file or symlink that the web tier managed to put in its place (it can write that directory) is never
 promoted to `root:root`; the updater refuses it.
+
+The installer also never follows a link in `/etc/irongate` (the web tier can write that directory, also while
+the installer runs): the recursive `chown -h` runs with `find -execdir`, and `config.yaml`, `access-control.json`
+and `auth.json` are written to a root-only staging directory (`/etc/.irongate-stage`) and renamed into place,
+or have their owner and mode set through a hard-link pin of the existing file. A symlink, directory or other
+non-regular file found at one of those names is renamed to `<name>.refused.<time>.<pid>` (never deleted), reported,
+and treated as absent; a genuine regular file ends up with exactly the owner and mode it had before
+(`root:www-data`, `0664` for `config.yaml`, `0660` for the two JSON files). `find -execdir` refuses to run when
+`PATH` contains `.` or an empty entry, so the installer must be started with an ordinary root `PATH` (it stops
+with find's error message otherwise).
 
 The dashboard's *Check for updates* (`update_check`) still compares the installed commit with the newest
 commit on `main`, so it reports "update available" whenever `main` is ahead of the pin. *Update now* and the

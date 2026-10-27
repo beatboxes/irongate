@@ -180,6 +180,9 @@ $badIndexers = [
     'DEL in path'              => "https://indexer.preprod.midnight.network/api\x7fv4",
     'non-ASCII in path'        => "https://indexer.preprod.midnight.network/api\u{e9}",
     'CRLF header injection'    => "https://indexer.preprod.midnight.network/api\r\nHost: evil.example",
+    // The scheme is compared exactly: PHP 8.3 sends an all-upper-case HTTPS:// request in cleartext.
+    'upper-case HTTPS scheme'  => 'HTTPS://indexer.preprod.midnight.network/api/v4/graphql',
+    'mixed-case Https scheme'  => 'Https://indexer.preprod.midnight.network/api/v4/graphql',
 ];
 foreach ($badIndexers as $label => $url) {
     $r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_indexer_url' => $url]);
@@ -205,6 +208,30 @@ $r = call('POST', 'test_blockchain_connection', ['network' => 'undeployed', 'ind
 check('V2 probe: undeployed preset still used when no custom URL (control)', ($r['json']['success'] ?? null) === true
     && ($r['json']['endpoint'] ?? '') === 'http://127.0.0.1:8088/api/v4/graphql', brief($r));
 
+// ---- V2: the value that was validated is the value that is stored (F-C) ------------
+// The dashboard validates trim($url); the engine refuses a URL with surrounding whitespace. If the raw
+// text were stored, a padded but valid URL would be accepted here and silently switch Layer 8 off.
+$padded = " \thttps://indexer.preprod.midnight.network/api/v4/graphql \n";
+$trimmed = 'https://indexer.preprod.midnight.network/api/v4/graphql';
+// Irongate must be enabled for the save to regenerate /etc/irongate/config.yaml (inside the sandbox container).
+dbx("INSERT OR REPLACE INTO settings VALUES ('irongate_enabled','true'), ('interface','eth0'), ('gateway','192.168.1.1')");
+$r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_indexer_url' => $padded]);
+dbx("UPDATE settings SET value='false' WHERE key='irongate_enabled'; DELETE FROM settings WHERE key IN ('interface','gateway')");
+check('V2 save: a valid URL with surrounding whitespace is accepted (control)', ($r['json']['success'] ?? null) === true, brief($r));
+check('V2 save: ... and stored trimmed, exactly the value that was validated',
+    dbq("SELECT value FROM settings WHERE key='blockchain_indexer_url'") === $trimmed,
+    'stored=' . json_encode(dbq("SELECT value FROM settings WHERE key='blockchain_indexer_url'")));
+$cfgText = (string)@file_get_contents('/etc/irongate/config.yaml');
+check('V2 save: ... and config.yaml carries the trimmed URL', strpos($cfgText, '  indexer_url: "' . $trimmed . '"' . "\n") !== false,
+    'config indexer line=' . json_encode(preg_match('/^  indexer_url: .*$/m', $cfgText, $mm) ? $mm[0] : null));
+$r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_indexer_url' => "  \t "]);
+check('V2 save: a whitespace-only URL clears the override (stored as empty, not as the blanks)', ($r['json']['success'] ?? null) === true
+    && dbq("SELECT value FROM settings WHERE key='blockchain_indexer_url'") === '', brief($r) . ' stored=' . json_encode(dbq("SELECT value FROM settings WHERE key='blockchain_indexer_url'")));
+$r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_enabled' => 'false']);
+check('V2 save: a save without blockchain_indexer_url leaves the stored URL alone (control)', ($r['json']['success'] ?? null) === true
+    && dbq("SELECT value FROM settings WHERE key='blockchain_indexer_url'") === '', brief($r));
+dbx("DELETE FROM settings WHERE key='blockchain_indexer_url'");
+
 // ---- V2 unit level: validIndexerUrl() called directly ----------------------------
 // Its callers trim() the value, which would hide a trailing-newline bug inside the validator itself,
 // so the function (and the preset table it reads) is loaded from the tree under test and called here.
@@ -219,6 +246,10 @@ if (function_exists('validIndexerUrl')) {
     check('V2 unit: trailing newline is rejected (\z, not $)', validIndexerUrl($okUrl . "\n") === false);
     check('V2 unit: embedded newline is rejected', validIndexerUrl("https://indexer.preprod.midnight.network/a\nb") === false);
     check('V2 unit: non-string is rejected', validIndexerUrl(['x']) === false && validIndexerUrl(null) === false);
+    foreach (['HTTPS', 'Https', 'hTTps'] as $sch) {
+        check("V2 unit: scheme $sch:// is rejected (exact compare, no case folding)",
+            validIndexerUrl($sch . '://indexer.preprod.midnight.network/api/v4/graphql') === false);
+    }
 }
 
 // ---- V2: redirects from the indexer are never followed ----------------------

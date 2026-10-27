@@ -60,7 +60,7 @@ Network-dependent tests skip rather than fail when there is no route to the Midn
 deterministic suite stays meaningful offline.
 
 The input-validation suite (`tests/test_validation.py`, `tests/test_validation.php`,
-`tests/test_updater.sh`, `tests/test_installer_pin.sh`) needs no internet and no root on the device. Run it in
+`tests/test_updater.sh`, `tests/test_installer_pin.sh`, `tests/test_installer_links.sh`) needs no internet and no root on the device. Run it in
 disposable containers:
 
 ```bash
@@ -68,6 +68,7 @@ python3 -m pytest tests/test_validation.py            # or: python3 -m unittest 
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w php:8.3-cli php tests/test_validation.php web
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_updater.sh src/irongate-updater.sh
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_installer_pin.sh irongate-install.sh
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_installer_links.sh irongate-install.sh
 ```
 
 The PHP and shell tests overwrite `/var/www/irongate` or `/etc/irongate`, bind local ports or create

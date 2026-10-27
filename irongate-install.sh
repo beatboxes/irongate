@@ -724,7 +724,9 @@ function validIndexerUrl($url) {
         return false;
     }
     $p = parse_url($url);
-    if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
+    // Exactly "https", no case folding: parse_url() keeps the case and PHP's stream layer does not
+    // fold it either (PHP 8.3 sends the request for an all-upper-case "HTTPS://" in cleartext).
+    if ($p === false || ($p['scheme'] ?? '') !== 'https') return false;
     if (isset($p['user']) || isset($p['pass'])) return false;
     if (isset($p['port']) && $p['port'] !== 443) return false;
     $hosts = [];
@@ -1466,6 +1468,11 @@ switch ($action) {
                     http_response_code(400);
                     echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
+                }
+                // Store exactly what was validated (trimmed), not the raw value: the engine refuses a
+                // URL with surrounding whitespace, so storing the padded text would silently switch Layer 8 off.
+                if (array_key_exists('blockchain_indexer_url', $data)) {
+                    $data['blockchain_indexer_url'] = $reqIndexer;
                 }
             }
             foreach ($data as $key => $value) {
@@ -5066,6 +5073,71 @@ mkdir -p /opt/irongate
 mkdir -p /etc/irongate
 mkdir -p /var/log/irongate
 
+# ---- /etc/irongate fixed-file helpers: begin ----
+# /etc/irongate is root:www-data 0775 on purpose (the web UI rewrites config.yaml), so the web tier
+# can create, rename and symlink entries there at any moment, also while this installer runs as
+# root. A root process must therefore never open, chown or chmod a fixed name in it by path:
+# that follows a planted symlink to whatever it points at (`cat >` on a dangling link even creates
+# the target, and on a FIFO it blocks forever). These helpers do the work in a root-only staging
+# directory on the same filesystem and reach the final name only through rename(2) (replaces a
+# symlink, never follows it) or link(2) (links the symlink itself, never its target):
+#   ig_etc_check  NAME       0 = NAME is a regular file, 1 = absent. A symlink, directory, FIFO,
+#                            socket or device is renamed aside (NAME.refused.<time>.<pid>, never
+#                            deleted) and reported, and counts as absent
+#   ig_etc_fix    NAME MODE  root:www-data MODE for an existing regular NAME, without following links
+#   ig_etc_commit NAME MODE  install the file staged as $IG_STAGE/NAME as root:www-data MODE
+#   ig_etc_ensure NAME MODE  NAME exists as a regular root:www-data MODE file (created empty if
+#                            missing, content of an existing file kept)
+IG_ETC=/etc/irongate
+IG_STAGE=/etc/.irongate-stage
+ig_stage() {
+    install -d -m 0700 -o root -g root "$IG_STAGE"
+}
+ig_etc_check() {
+    local p="$IG_ETC/$1" aside
+    if [ -L "$p" ] || { [ -e "$p" ] && [ ! -f "$p" ]; }; then
+        aside="$p.refused.$(date +%s).$$"
+        echo -e "${RED}  ! $p is a symlink or not a regular file: not following it, moving it to $aside${NC}" >&2
+        mv -T -- "$p" "$aside" || true
+        return 1
+    fi
+    [ -f "$p" ]
+}
+ig_etc_fix() {
+    local pin="$IG_STAGE/$1.pin.$$" rc=0
+    ig_stage || return 1
+    # link(2) does not follow a symlink: $pin is a second name for exactly the inode that is at NAME
+    # right now, in a directory the web tier cannot reach, so the check and the chown/chmod below
+    # cannot be redirected by a swap of NAME in between.
+    if ! ln -fP -- "$IG_ETC/$1" "$pin" 2>/dev/null; then
+        echo -e "${RED}  ! cannot pin $IG_ETC/$1 (missing, or no hard links here): owner and mode left as they are${NC}" >&2
+        return 1
+    fi
+    if [ -L "$pin" ] || [ ! -f "$pin" ]; then
+        echo -e "${RED}  ! $IG_ETC/$1 is a symlink or not a regular file: owner and mode left as they are${NC}" >&2
+        rm -f -- "$pin"
+        return 1
+    fi
+    chown root:www-data "$pin" && chmod "$2" "$pin" || rc=1
+    rm -f -- "$pin"
+    return $rc
+}
+ig_etc_commit() {
+    local f="$IG_STAGE/$1"
+    chown root:www-data "$f" && chmod "$2" "$f" && mv -fT -- "$f" "$IG_ETC/$1"
+}
+ig_etc_ensure() {
+    local rc=0
+    if ig_etc_check "$1"; then
+        ig_etc_fix "$1" "$2" || rc=1
+    else
+        { ig_stage && : > "$IG_STAGE/$1" && ig_etc_commit "$1" "$2"; } || rc=1
+    fi
+    rmdir "$IG_STAGE" 2>/dev/null || true
+    return $rc
+}
+# ---- /etc/irongate fixed-file helpers: end ----
+
 # IMPORTANT: www-data needs to write to config.yaml from the web UI
 # Recursive chown of everything in /etc/irongate (links are not followed) EXCEPT the updater's
 # pin file, which is the updater's trust root and stays exactly as the operator left it:
@@ -5073,12 +5145,13 @@ mkdir -p /var/log/irongate
 # tier (www-data can write this directory) put there is never promoted to root:root and
 # never chown/chmod'ed through. The updater refuses anything but a regular root:root
 # 0644/0600 pin file.
-find /etc/irongate ! -path /etc/irongate/updater-pin.conf -exec chown -h root:www-data {} +
+# -execdir, not -exec: each chown runs in the directory find is standing in (by file descriptor)
+# on "./name", so a subdirectory the web tier swaps for a symlink after find listed it cannot
+# send root's chown to a file outside /etc/irongate.
+find /etc/irongate ! -path /etc/irongate/updater-pin.conf -execdir chown -h root:www-data {} +
 chmod 775 /etc/irongate
 # Config file will be created later, but set default permissions
-touch /etc/irongate/config.yaml 2>/dev/null || true
-chown root:www-data /etc/irongate/config.yaml 2>/dev/null || true
-chmod 664 /etc/irongate/config.yaml 2>/dev/null || true
+ig_etc_ensure config.yaml 664 || true
 
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
@@ -6338,8 +6411,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 # urlopen() below uses this opener. It is installed process-wide on purpose: this
-# module is the only urllib user in the engine process, and going through urlopen()
-# keeps it replaceable in tests.
+# module is the only urllib user in the engine process (tests/test_validation.py,
+# OpenerScopeTests, fails if another module starts using urllib), and going through
+# urllib.request.urlopen() keeps the transport replaceable in tests, which a
+# module-local opener's .open() would not. Switch to a module-local opener (and
+# point those test mocks at it) before any other urllib user is added.
 urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
 
 
@@ -7712,7 +7788,10 @@ if [ -f /var/www/irongate/dhcp.db ]; then
     fi
 fi
 
-cat > /etc/irongate/config.yaml << EOF
+# Staged in a root-only directory and renamed into place at the end (see the helpers above):
+# nothing below opens, chmods or chowns /etc/irongate/config.yaml by path.
+ig_stage
+cat > /etc/.irongate-stage/config.yaml << EOF
 # Irongate Configuration
 # Generated: $(date)
 
@@ -7769,12 +7848,15 @@ EOF
 
 # If no devices, clean up the empty devices section
 if [ -z "$DEVICES_YAML" ]; then
-    sed -i 's/^devices:$/devices: []/' /etc/irongate/config.yaml
+    sed -i 's/^devices:$/devices: []/' /etc/.irongate-stage/config.yaml
 fi
 
-# Set permissions so www-data can update config from web UI
-chown root:www-data /etc/irongate/config.yaml
-chmod 664 /etc/irongate/config.yaml
+# Set permissions so www-data can update config from web UI, then put the file in place.
+# A symlink or special file that was planted at /etc/irongate/config.yaml is moved aside,
+# never followed.
+ig_etc_check config.yaml || true
+ig_etc_commit config.yaml 664
+rmdir "$IG_STAGE" 2>/dev/null || true
 
 chown -R root:root /opt/irongate
 chmod -R 755 /opt/irongate
@@ -8232,14 +8314,16 @@ if ! visudo -cf /etc/sudoers.d/irongate-webauth; then
 fi
 
 # access-control.json — preserved across re-runs
+# (a planted symlink or special file at the name counts as absent: it is moved aside, never followed)
 mkdir -p /etc/irongate
-if [ ! -f /etc/irongate/access-control.json ]; then
+ig_stage
+if ! ig_etc_check access-control.json; then
     WEBAUTH_ADMIN_ALLOW=""
     if [ -n "${ADMIN_LAN_IP:-}" ]; then
         WEBAUTH_ADMIN_ALLOW=",
         \"${ADMIN_LAN_IP}\""
     fi
-    cat > /etc/irongate/access-control.json << WEBAUTH_ACLEOF
+    cat > /etc/.irongate-stage/access-control.json << WEBAUTH_ACLEOF
 {
     "enabled": true,
     "allowed_ips": [
@@ -8249,19 +8333,19 @@ if [ ! -f /etc/irongate/access-control.json ]; then
     "updated_at": "$(date -Iseconds)"
 }
 WEBAUTH_ACLEOF
+    ig_etc_commit access-control.json 660
     echo -e "${GREEN}  ✓ Created access-control.json${NC}"
 else
+    ig_etc_fix access-control.json 660 || { echo -e "${RED}ERROR: cannot set owner/mode of access-control.json safely${NC}"; exit 1; }
     echo -e "${GREEN}  ✓ Existing access-control.json preserved${NC}"
 fi
-chown root:www-data /etc/irongate/access-control.json
-chmod 660 /etc/irongate/access-control.json
 
 # auth.json — preserved across re-runs; random initial password printed at end
 WEBAUTH_INIT_PASSWORD=""
-if [ ! -f /etc/irongate/auth.json ]; then
+if ! ig_etc_check auth.json; then
     WEBAUTH_INIT_PASSWORD=$(php -r "echo bin2hex(random_bytes(10));")
     WEBAUTH_HASH=$(WEBAUTH_PW="$WEBAUTH_INIT_PASSWORD" php -r 'echo password_hash(getenv("WEBAUTH_PW"), PASSWORD_BCRYPT);')
-    cat > /etc/irongate/auth.json << WEBAUTH_AUTHEOF
+    cat > /etc/.irongate-stage/auth.json << WEBAUTH_AUTHEOF
 {
     "username": "admin",
     "password_hash": "${WEBAUTH_HASH}",
@@ -8272,12 +8356,13 @@ if [ ! -f /etc/irongate/auth.json ]; then
     "locked_until": 0
 }
 WEBAUTH_AUTHEOF
+    ig_etc_commit auth.json 660
     echo -e "${GREEN}  ✓ Created auth.json (credentials printed at end)${NC}"
 else
+    ig_etc_fix auth.json 660 || { echo -e "${RED}ERROR: cannot set owner/mode of auth.json safely${NC}"; exit 1; }
     echo -e "${GREEN}  ✓ Existing auth.json preserved (credentials unchanged)${NC}"
 fi
-chown root:www-data /etc/irongate/auth.json
-chmod 660 /etc/irongate/auth.json
+rmdir "$IG_STAGE" 2>/dev/null || true
 
 # Generate the nginx allow-list snippet now; reload failure is tolerated here
 # because the final bulletproof restart below brings nginx up regardless

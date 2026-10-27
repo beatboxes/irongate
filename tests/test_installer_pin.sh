@@ -1,7 +1,7 @@
 #!/bin/bash
 # Irongate installer: the updater's pin file must never be "laundered" into a trusted file (V4 follow-up).
 #
-# The installer runs `chown -R root:www-data /etc/irongate` (the web tier must write config.yaml) and must
+# The installer chowns everything in /etc/irongate to root:www-data (the web tier must write config.yaml) and must
 # keep /etc/irongate/updater-pin.conf, the updater's trust root, out of that. www-data can create, replace
 # and symlink files in /etc/irongate (the directory is 0775 root:www-data), so the installer must never
 # hand root:root ownership to a file the web tier could have planted, and never chown/chmod through a
@@ -37,6 +37,12 @@ n_start=$(grep -c "$START_RE" "$INSTALLER"); n_end=$(grep -c '^# Create Python v
 start=$(grep -n "$START_RE" "$INSTALLER" | cut -d: -f1)
 end=$(grep -n '^# Create Python virtual environment$' "$INSTALLER" | cut -d: -f1)
 sed -n "${start},$((end - 1))p" "$INSTALLER" > "$SEG"
+# The block calls the installer's /etc/irongate fixed-file helpers (ig_etc_*), defined just above it.
+hb=$(grep -n '^# ---- /etc/irongate fixed-file helpers: begin ----$' "$INSTALLER" | cut -d: -f1)
+he=$(grep -n '^# ---- /etc/irongate fixed-file helpers: end ----$' "$INSTALLER" | cut -d: -f1)
+if [ -n "$hb" ] && [ -n "$he" ] && [ "$hb" -lt "$he" ]; then
+    { echo 'RED=; GREEN=; YELLOW=; NC='; sed -n "${hb},${he}p" "$INSTALLER"; cat "$SEG"; } > "$SEG.new" && mv "$SEG.new" "$SEG"
+fi
 bash -n "$SEG" || { echo "extracted block does not parse" >&2; exit 2; }
 grep -q 'chown -R\|chown' "$SEG" || { echo "extracted block has no chown: wrong block?" >&2; exit 2; }
 
