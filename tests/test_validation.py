@@ -13,14 +13,17 @@ Runs under pytest or plain unittest, against whichever sources are on the path:
     python -m pytest tests/test_validation.py
     IRONGATE_DIR=/opt/irongate python -m unittest tests/test_validation.py
 
-No network, no root, no nft: os.system and urllib.request.urlopen are replaced.
-scapy is blocked from importing so the module loads the same everywhere.
+No internet, no root, no nft: os.system and urllib.request.urlopen are replaced
+(only the redirect tests open real sockets, on 127.0.0.1). scapy is blocked from
+importing so the module loads the same everywhere.
 """
 
+import http.server
 import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -148,6 +151,43 @@ class FirewallInjectionTests(unittest.TestCase):
                 self.assertIn('192.168.1.18', rules)
                 self.assertAbsent(str(bad), rules)
 
+    def test_zone_names_with_leading_digit_or_hyphen_not_rendered(self):
+        rules, _ = render_ruleset(make_config(
+            devices=[{'mac': 'aa:bb:cc:dd:ee:0c', 'ip': '192.168.1.19', 'zone': '0'},
+                     {'mac': 'aa:bb:cc:dd:ee:0d', 'ip': '192.168.1.24', 'zone': '-x'},
+                     {'mac': 'aa:bb:cc:dd:ee:0e', 'ip': '192.168.1.25', 'zone': '9lives'},
+                     {'mac': 'aa:bb:cc:dd:ee:0f', 'ip': '192.168.1.26', 'zone': '_ok'}],
+            groups=[{'name': '9lives', 'lan_access': 'none', 'can_access_groups': []},
+                    {'name': '_ok', 'lan_access': 'none', 'can_access_groups': []}]))
+        self.assertTrue(rules)
+        for needle in ('set 0_devices', 'set -x_devices', 'set 9lives_devices', '192.168.1.19',
+                       '192.168.1.24', '192.168.1.25'):
+            self.assertAbsent(needle, rules)
+        self.assertIn('set _ok_devices', rules)
+        self.assertIn('192.168.1.26', rules)
+
+    def test_non_string_can_access_targets_are_ignored(self):
+        """A hand-edited can_access_groups may hold lists/dicts/numbers; they must be skipped, not crash the firewall."""
+        rules, _ = render_ruleset(make_config(
+            devices=[{'mac': 'aa:bb:cc:dd:ee:14', 'ip': '192.168.1.27', 'zone': 'a'},
+                     {'mac': 'aa:bb:cc:dd:ee:15', 'ip': '192.168.1.28', 'zone': 'b'}],
+            groups=[{'name': 'a', 'lan_access': 'selected', 'can_access_groups': [['b'], {'b': 1}, 5, None, 'b']}]))
+        self.assertIn('ip saddr @a_devices ip daddr @b_devices accept', rules)
+        self.assertNotIn("['b']", rules)
+
+    def test_canonical_ip_is_what_gets_interpolated(self):
+        """Older interpreters accept '010.001.001.001' as 10.1.1.1: whatever the parser returns is rendered, never the raw text."""
+        real = irongate.ipaddress.ip_address
+
+        def lenient(value):
+            return real('10.1.1.1') if value == '010.001.001.001' else real(value)
+
+        with mock.patch.object(irongate.ipaddress, 'ip_address', lenient):
+            rules, _ = render_ruleset(make_config(devices=[
+                {'mac': 'aa:bb:cc:dd:ee:16', 'ip': '010.001.001.001', 'zone': 'isolated'}]))
+        self.assertIn('10.1.1.1', rules)
+        self.assertAbsent('010.001.001.001', rules)
+
     def test_valid_configuration_still_renders(self):
         """Characterization: valid zones/groups/IPs produce the same rules as before."""
         rules, commands = render_ruleset(make_config(
@@ -171,9 +211,15 @@ class FirewallInjectionTests(unittest.TestCase):
 @unittest.skipUnless(hasattr(irongate, '_valid_zone_name'), 'pre-fix irongate.py has no validators')
 class ValidatorHelperTests(unittest.TestCase):
     def test_zone_names(self):
-        for ok in ['a', 'isolated', 'iot-cams_1', 'A' * 32, '0', '_', '-']:
+        for ok in ['a', 'isolated', 'iot-cams_1', 'A' * 32, '_', '_0', 'a-', 'a0-_', 'Z9']:
             self.assertTrue(irongate._valid_zone_name(ok), ok)
         for bad in ['', 'a' * 33, 'lan; drop', 'a b', 'a\n', '\na', 'a.b', 'a/b', 'é', 'a\x00', None, 5, ['a']]:
+            self.assertFalse(irongate._valid_zone_name(bad), repr(bad))
+
+    def test_zone_names_must_start_with_a_letter_or_underscore(self):
+        # The name becomes the nft set identifier "<name>_devices"; nft identifiers cannot
+        # begin with a digit or '-' ('-x' would even be read as an option).
+        for bad in ['0', '-', '9lives', '0_x', '-a', '-_', '1' + 'a' * 31]:
             self.assertFalse(irongate._valid_zone_name(bad), repr(bad))
 
     def test_ipv4(self):
@@ -182,13 +228,53 @@ class ValidatorHelperTests(unittest.TestCase):
             self.assertIsNone(irongate._valid_ipv4(bad), repr(bad))
 
 
+HEAD_JSON = b'{"data": {"block": {"hash": "0xabc", "height": 7, "timestamp": 1}}}'
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ReachableEverywhere:
+    """Stand-in for urllib.request.urlopen where EVERY host answers like a healthy indexer.
+
+    It records the URL of each request. A test that expects "no request at all" is
+    therefore meaningful even on a machine that can reach the real Midnight indexers:
+    a fallback to a preset would show up in .seen and would be answered with a valid
+    chain head.
+    """
+
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, req, timeout=None):
+        self.seen.append(req.full_url if hasattr(req, 'full_url') else req)
+        return FakeResponse(HEAD_JSON)
+
+
 class IndexerSSRFTests(unittest.TestCase):
-    """V2: the engine may only talk to https Midnight indexer hosts from the presets."""
+    """V2: the engine may only talk to https Midnight indexer hosts from the presets.
+
+    A configured indexer_url that fails validation fails CLOSED: the layer makes no
+    request at all and reports 'undecided'. It is never replaced by a preset, because
+    that would silently send queries to a host the operator did not configure.
+    """
 
     MALICIOUS = [
         'http://169.254.169.254/latest/meta-data/',
         'file:///etc/shadow',
         'http://127.0.0.1:8088/api/v4/graphql',
+        'http://127.0.0.1:9/graphql',
         'http://localhost/',
         'ftp://indexer.preprod.midnight.network/',
         'http://indexer.preprod.midnight.network/api/v4/graphql',
@@ -221,12 +307,35 @@ class IndexerSSRFTests(unittest.TestCase):
         assert len(seen) == 1, seen
         return bc, seen[0]
 
-    def test_malicious_indexer_urls_fall_back_to_preset(self):
+    @staticmethod
+    def run_with_reachable_net(config, call):
+        """Build the client and run call(bc) while every host would answer like a healthy indexer."""
+        net = ReachableEverywhere()
+        with mock.patch.object(blockchain.urllib.request, 'urlopen', net):
+            bc = blockchain.IrongateBlockchain(config)
+            result = call(bc)
+        return bc, net.seen, result
+
+    def test_malicious_indexer_urls_fail_closed(self):
         for url in self.MALICIOUS:
-            with self.subTest(indexer_url=url):
-                bc, used = self.requested_url({'enabled': False, 'network': 'preprod', 'indexer_url': url})
-                self.assertEqual(used, PREPROD)
-                self.assertEqual(bc.indexer_url, PREPROD)
+            for network in ('preprod', 'undeployed'):
+                if url == UNDEPLOYED and network == 'undeployed':
+                    continue  # the selected network's own preset is the one non-https URL that is fine
+                with self.subTest(indexer_url=url, network=network):
+                    bc, seen, result = self.run_with_reachable_net(
+                        {'enabled': False, 'network': network, 'indexer_url': url},
+                        lambda bc: (bc._graphql('query { block { height } }'), bc._query_block()))
+                    self.assertIsNone(bc.indexer_url)
+                    self.assertEqual(result, (None, None))
+                    self.assertEqual(seen, [], 'a rejected indexer_url must not cause any request')
+
+    def test_rejected_url_never_falls_back_to_the_preset(self):
+        """The shape of tests/test_blockchain.py::test_unreachable_indexer_degrades_quietly."""
+        bc, seen, head = self.run_with_reachable_net(
+            {'enabled': False, 'indexer_url': 'http://127.0.0.1:9/graphql', 'timeout': 2},
+            lambda bc: bc._query_block())
+        self.assertIsNone(head)
+        self.assertEqual(seen, [], 'preprod (or any host) was queried although the configured URL was rejected')
 
     def test_rejection_is_logged(self):
         logging.disable(logging.NOTSET)
@@ -237,20 +346,17 @@ class IndexerSSRFTests(unittest.TestCase):
         finally:
             logging.disable(logging.CRITICAL)
         self.assertTrue(any('169.254.169.254' in line for line in cm.output), cm.output)
+        self.assertTrue(any('no queries' in line for line in cm.output), cm.output)
 
-    def test_enabled_startup_probe_never_touches_malicious_host(self):
-        """The constructor itself probes the indexer when enabled; it must use the preset."""
-        seen = []
-
-        def fake_urlopen(req, timeout=None):
-            seen.append(req.full_url)
-            raise blockchain.urllib.error.URLError('blocked in test')
-
-        with mock.patch.object(blockchain.urllib.request, 'urlopen', fake_urlopen):
-            blockchain.IrongateBlockchain({
-                'enabled': True, 'network': 'preprod', 'contract_address': '0x' + '00' * 32,
-                'indexer_url': 'http://169.254.169.254/latest/meta-data/'})
-        self.assertEqual(seen, [PREPROD])
+    def test_enabled_with_rejected_url_makes_no_request_and_stays_undecided(self):
+        """The constructor probes the indexer when enabled; with a rejected URL it must not probe anything."""
+        bc, seen, verdict = self.run_with_reachable_net(
+            {'enabled': True, 'network': 'preprod', 'contract_address': '0x' + '00' * 32,
+             'indexer_url': 'http://169.254.169.254/latest/meta-data/'},
+            lambda bc: bc.verify_device('aa:bb:cc:dd:ee:ff', '192.168.1.100'))
+        self.assertEqual(seen, [])
+        self.assertIsNone(verdict['verified'])  # undecided: defer to Layers 1-7, never "verified"
+        self.assertIsNone(bc.get_stats()['indexer_url'])
 
     def test_custom_url_on_known_indexer_host_is_honoured(self):
         for url in [MAINNET, PREPROD, 'https://indexer.preview.midnight.network/api/v4/graphql',
@@ -265,10 +371,11 @@ class IndexerSSRFTests(unittest.TestCase):
                 bc, used = self.requested_url({'enabled': False, 'network': network})
                 self.assertEqual(used, expected)
 
-    def test_undeployed_network_ignores_malicious_custom_url(self):
-        bc, used = self.requested_url(
-            {'enabled': False, 'network': 'undeployed', 'indexer_url': 'http://169.254.169.254/'})
-        self.assertEqual(used, UNDEPLOYED)
+    def test_blank_indexer_url_means_preset(self):
+        for blank in (None, ''):
+            with self.subTest(indexer_url=blank):
+                bc, used = self.requested_url({'enabled': False, 'network': 'preprod', 'indexer_url': blank})
+                self.assertEqual(used, PREPROD)
 
     def test_undeployed_own_preset_url_is_accepted_silently(self):
         logging.disable(logging.NOTSET)
@@ -288,6 +395,120 @@ class IndexerSSRFTests(unittest.TestCase):
             frozenset({'indexer.preprod.midnight.network',
                        'indexer.preview.midnight.network',
                        'indexer.mainnet.midnight.network'}))
+
+
+@unittest.skipUnless(hasattr(blockchain.IrongateBlockchain, 'validate_indexer_url'),
+                     'pre-fix blockchain.py has no validator')
+class ValidateIndexerUrlTests(unittest.TestCase):
+    """validate_indexer_url(): each rule is pinned by an input that ONLY that rule rejects
+    (the host is on the allowlist, scheme and port are fine), so removing a single rule fails a test."""
+
+    HOST = 'indexer.preprod.midnight.network'
+
+    def check(self, template, expected_ok):
+        url = template.replace('HOST', self.HOST)
+        got = blockchain.IrongateBlockchain.validate_indexer_url(url)
+        if expected_ok:
+            self.assertEqual(got, url, url)
+        else:
+            self.assertIsNone(got, url)
+
+    def test_userinfo_on_an_allowed_host_is_rejected(self):
+        for t in ['https://user:pw@HOST/api/v4/graphql', 'https://user@HOST/api/v4/graphql',
+                  'https://:@HOST/api/v4/graphql', 'https://@HOST/api/v4/graphql']:
+            with self.subTest(url=t):
+                self.check(t, False)
+
+    def test_backslash_anywhere_is_rejected(self):
+        for t in ['https://HOST/api\\v4/graphql', 'https://HOST/?q=\\', 'https://HOST/#\\', 'https://HOST/\\']:
+            with self.subTest(url=t):
+                self.check(t, False)
+
+    def test_non_printable_or_non_ascii_characters_are_rejected(self):
+        for t in ['https://HOST/api v4', 'https://HOST/api\tv4', 'https://HOST/api\x7fv4',
+                  'https://HOST/apié', 'https://HOST/api\r\nX: y', 'https://HOST/api\n']:
+            with self.subTest(url=t):
+                self.check(t, False)
+
+    def test_scheme_and_port_rules(self):
+        self.check('http://HOST/api/v4/graphql', False)
+        self.check('https://HOST:8443/api/v4/graphql', False)
+        self.check('https://HOST:443/api/v4/graphql', True)
+
+    def test_plain_urls_on_allowed_hosts_are_accepted(self):
+        for t in ['https://HOST/api/v4/graphql', 'https://HOST', 'https://HOST/api/v4/graphql?x=1']:
+            with self.subTest(url=t):
+                self.check(t, True)
+
+    def test_non_string_values_are_rejected(self):
+        for bad in (None, 5, ['https://%s/' % self.HOST], b'https://%s/' % self.HOST.encode()):
+            self.assertIsNone(blockchain.IrongateBlockchain.validate_indexer_url(bad), repr(bad))
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Loopback HTTP server: records every request; answers 200 + chain head, or a redirect."""
+
+    def log_message(self, *args):
+        pass
+
+    def _any(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        if length:
+            self.rfile.read(length)
+        self.server.hits.append((self.command, self.path))
+        if self.server.redirect_to:
+            self.send_response(self.server.code)
+            self.send_header('Location', self.server.redirect_to)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        else:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(HEAD_JSON)))
+            self.end_headers()
+            self.wfile.write(HEAD_JSON)
+
+    do_GET = do_POST = do_PUT = _any
+
+
+class IndexerRedirectTests(unittest.TestCase):
+    """V2: an indexer that answers 3xx must not be able to bounce the root engine to another URL.
+
+    Real loopback sockets and the real urllib stack (urlopen is NOT mocked): the redirect
+    policy lives in the opener that urlopen uses.
+    """
+
+    def serve(self, redirect_to=None, code=302):
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Recorder)
+        srv.hits, srv.redirect_to, srv.code = [], redirect_to, code
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def stop():
+            srv.shutdown()
+            srv.server_close()
+        self.addCleanup(stop)
+        return srv
+
+    @staticmethod
+    def client(port):
+        bc = blockchain.IrongateBlockchain({'enabled': False, 'network': 'undeployed', 'timeout': 5})
+        # Transport-level test: point the client at the loopback server, bypassing the config validator.
+        bc.indexer_url = 'http://127.0.0.1:%d/api/v4/graphql' % port
+        return bc
+
+    def test_redirects_are_not_followed(self):
+        internal = self.serve()
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                front = self.serve(redirect_to='http://127.0.0.1:%d/internal' % internal.server_port, code=code)
+                self.assertIsNone(self.client(front.server_port)._graphql('query { block { height } }'))
+                self.assertEqual(len(front.hits), 1)
+                self.assertEqual(internal.hits, [], 'the redirect target was requested')
+
+    def test_plain_200_still_works(self):
+        front = self.serve()
+        data = self.client(front.server_port)._graphql('query { block { height } }')
+        self.assertEqual(data, {'block': {'hash': '0xabc', 'height': 7, 'timestamp': 1}})
 
 
 if __name__ == '__main__':

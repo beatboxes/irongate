@@ -99,9 +99,10 @@ function safeApplyConfig($db) {
 
 // irongate-audit (V1): zone/group names and device IPs are interpolated into an
 // nftables ruleset by the root engine, so only strict values may be stored.
-// \z (not $) so a trailing newline cannot slip through.
+// \z (not $) so a trailing newline cannot slip through. The name becomes the nft
+// set identifier "<name>_devices", which cannot start with a digit or '-'.
 function validZoneName($name) {
-    return is_string($name) && preg_match('/^[A-Za-z0-9_-]{1,32}\z/', $name) === 1;
+    return is_string($name) && preg_match('/^[A-Za-z_][A-Za-z0-9_-]{0,31}\z/', $name) === 1;
 }
 
 function validDeviceIp($ip) {
@@ -157,11 +158,12 @@ function midnightNetworks() {
 // must be the host of one of the https presets above (same rule as
 // blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
 // cloud-metadata addresses from the web tier.
+// (FILTER_VALIDATE_URL is intentionally not used: it accepts exactly the
+// printable-ASCII set that the first check below already enforces.)
 function validIndexerUrl($url) {
     if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
         return false;
     }
-    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
     $p = parse_url($url);
     if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
     if (isset($p['user']) || isset($p['pass'])) return false;
@@ -201,6 +203,10 @@ function midnightProbe($endpoint, $timeout) {
             'content' => '{"query":"{__typename}"}',
             'timeout' => $timeout,
             'ignore_errors' => true,
+            // irongate-audit (V2): never follow a redirect. An allowed host must not be
+            // able to bounce the probe to loopback, the LAN or cloud metadata.
+            'follow_location' => 0,
+            'max_redirects' => 0,
         ],
     ]);
     $t0 = microtime(true);
@@ -214,7 +220,8 @@ function midnightProbe($endpoint, $timeout) {
         return ['reachable' => false, 'response_time_ms' => $ms, 'http_code' => 0,
                 'error' => $ms >= ($timeout * 1000 - 100) ? 'connection timeout' : 'connection failed'];
     }
-    $ok = $code >= 200 && $code < 400;
+    // A 3xx is not an answer: redirects are not followed (see above).
+    $ok = $code >= 200 && $code < 300;
     return ['reachable' => $ok, 'response_time_ms' => $ms, 'http_code' => $code,
             'error' => $ok ? null : 'indexer returned HTTP ' . $code];
 }
@@ -1015,7 +1022,7 @@ switch ($action) {
             }
             if (!validZoneName($name) || !$accessOk) {
                 http_response_code(400);
-                echo json_encode(['success' => false, 'error' => 'Invalid group name (A-Z a-z 0-9 _ - , max 32 characters)']);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
                 break;
             }
 
@@ -1126,7 +1133,7 @@ switch ($action) {
             $devZone = $data['zone'] ?? 'isolated';
             if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
                 http_response_code(400);
-                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (A-Z a-z 0-9 _ - , max 32 characters)']);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
                 break;
             }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');

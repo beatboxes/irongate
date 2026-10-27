@@ -87,6 +87,14 @@ blockchain:
   allow_rogue_devices: false
 ```
 
+**`indexer_url` is restricted.** A custom value must be `https://` on port 443 on one of the public Midnight
+indexer hosts (`indexer.preprod.midnight.network`, `indexer.preview.midnight.network`,
+`indexer.mainnet.midnight.network`), with no credentials, and redirects are never followed; the selected
+network's own preset (for example the local `undeployed` node) is also accepted. Any other value is
+refused by the dashboard (HTTP 400). If one is written into `config.yaml` by hand the engine logs a
+warning and makes **no** Layer 8 queries at all (the layer reports *undecided*); it does not fall back to the
+preset, so the misconfiguration is visible instead of silently querying another host.
+
 **The write path is not implemented.** Registering a device on-chain requires a funded wallet and a
 ZK proof server, and the published proof-server image has no confirmed `aarch64` build, so it
 cannot run on a Raspberry Pi. `register_device`, `revoke_device` and `log_access` raise
@@ -246,6 +254,15 @@ Compute the hash from the reviewed commit, e.g.
 hash) the updater logs the reason to `/var/log/irongate-update.log` and exits 1 without installing.
 After merging a new release, review it and update the pin; until then the host stays on the
 previously pinned commit. `auto_update_enabled=false` still disables scheduled runs entirely.
+
+The installer leaves the pin file alone: it is excluded from the recursive `chown` of `/etc/irongate`, so a
+genuine `root:root` pin keeps its owner and mode across re-installs (which the updater itself triggers),
+and a file or symlink that the web tier managed to put in its place (it can write that directory) is never
+promoted to `root:root`; the updater refuses it.
+
+The dashboard's *Check for updates* (`update_check`) still compares the installed commit with the newest
+commit on `main`, so it reports "update available" whenever `main` is ahead of the pin. *Update now* and the
+timer only ever install the pinned commit, so they change nothing until the pin is advanced.
 
 ## Requirements
 

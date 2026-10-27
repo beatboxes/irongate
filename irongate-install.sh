@@ -658,9 +658,10 @@ function safeApplyConfig($db) {
 
 // irongate-audit (V1): zone/group names and device IPs are interpolated into an
 // nftables ruleset by the root engine, so only strict values may be stored.
-// \z (not $) so a trailing newline cannot slip through.
+// \z (not $) so a trailing newline cannot slip through. The name becomes the nft
+// set identifier "<name>_devices", which cannot start with a digit or '-'.
 function validZoneName($name) {
-    return is_string($name) && preg_match('/^[A-Za-z0-9_-]{1,32}\z/', $name) === 1;
+    return is_string($name) && preg_match('/^[A-Za-z_][A-Za-z0-9_-]{0,31}\z/', $name) === 1;
 }
 
 function validDeviceIp($ip) {
@@ -716,11 +717,12 @@ function midnightNetworks() {
 // must be the host of one of the https presets above (same rule as
 // blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
 // cloud-metadata addresses from the web tier.
+// (FILTER_VALIDATE_URL is intentionally not used: it accepts exactly the
+// printable-ASCII set that the first check below already enforces.)
 function validIndexerUrl($url) {
     if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
         return false;
     }
-    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
     $p = parse_url($url);
     if ($p === false || strtolower($p['scheme'] ?? '') !== 'https') return false;
     if (isset($p['user']) || isset($p['pass'])) return false;
@@ -760,6 +762,10 @@ function midnightProbe($endpoint, $timeout) {
             'content' => '{"query":"{__typename}"}',
             'timeout' => $timeout,
             'ignore_errors' => true,
+            // irongate-audit (V2): never follow a redirect. An allowed host must not be
+            // able to bounce the probe to loopback, the LAN or cloud metadata.
+            'follow_location' => 0,
+            'max_redirects' => 0,
         ],
     ]);
     $t0 = microtime(true);
@@ -773,7 +779,8 @@ function midnightProbe($endpoint, $timeout) {
         return ['reachable' => false, 'response_time_ms' => $ms, 'http_code' => 0,
                 'error' => $ms >= ($timeout * 1000 - 100) ? 'connection timeout' : 'connection failed'];
     }
-    $ok = $code >= 200 && $code < 400;
+    // A 3xx is not an answer: redirects are not followed (see above).
+    $ok = $code >= 200 && $code < 300;
     return ['reachable' => $ok, 'response_time_ms' => $ms, 'http_code' => $code,
             'error' => $ok ? null : 'indexer returned HTTP ' . $code];
 }
@@ -1574,7 +1581,7 @@ switch ($action) {
             }
             if (!validZoneName($name) || !$accessOk) {
                 http_response_code(400);
-                echo json_encode(['success' => false, 'error' => 'Invalid group name (A-Z a-z 0-9 _ - , max 32 characters)']);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
                 break;
             }
 
@@ -1685,7 +1692,7 @@ switch ($action) {
             $devZone = $data['zone'] ?? 'isolated';
             if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
                 http_response_code(400);
-                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (A-Z a-z 0-9 _ - , max 32 characters)']);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
                 break;
             }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
@@ -5060,18 +5067,18 @@ mkdir -p /etc/irongate
 mkdir -p /var/log/irongate
 
 # IMPORTANT: www-data needs to write to config.yaml from the web UI
-chown -R root:www-data /etc/irongate
+# Recursive chown of everything in /etc/irongate (links are not followed) EXCEPT the updater's
+# pin file, which is the updater's trust root and stays exactly as the operator left it:
+# a genuine root:root pin keeps its owner and mode, while a file or symlink that the web
+# tier (www-data can write this directory) put there is never promoted to root:root and
+# never chown/chmod'ed through. The updater refuses anything but a regular root:root
+# 0644/0600 pin file.
+find /etc/irongate ! -path /etc/irongate/updater-pin.conf -exec chown -h root:www-data {} +
 chmod 775 /etc/irongate
 # Config file will be created later, but set default permissions
 touch /etc/irongate/config.yaml 2>/dev/null || true
 chown root:www-data /etc/irongate/config.yaml 2>/dev/null || true
 chmod 664 /etc/irongate/config.yaml 2>/dev/null || true
-# The updater's pin file is its trust root: keep it root:root even though the
-# recursive chown above would hand it to www-data (the updater refuses such a file).
-if [ -f /etc/irongate/updater-pin.conf ]; then
-    chown root:root /etc/irongate/updater-pin.conf
-    chmod 644 /etc/irongate/updater-pin.conf
-fi
 
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
@@ -5139,11 +5146,13 @@ except ImportError:
 # nftables ruleset text that is loaded as root. The config is writable by the
 # web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
 # otherwise become nft syntax. Only strict identifiers/addresses may reach it.
-_ZONE_NAME_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+# The name becomes the nft set identifier "<name>_devices", and nft identifiers
+# cannot start with a digit or '-': require a leading letter or underscore.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
 
 
 def _valid_zone_name(name):
-    """True only for a str matching [A-Za-z0-9_-]{1,32} (fullmatch: no trailing newline)."""
+    """True only for a str matching [A-Za-z_][A-Za-z0-9_-]{0,31} (fullmatch: no trailing newline)."""
     return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
 
 
@@ -6315,6 +6324,25 @@ BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN = 30.0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every HTTP redirect (irongate-audit, V2: SSRF).
+
+    indexer_url is checked against an allowlist, but a redirect would let an
+    allowed (or compromised) host send this root process to any other URL. With
+    redirect_request() returning None urllib raises HTTPError for a 3xx, which
+    _graphql() already treats as an indexer failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# urlopen() below uses this opener. It is installed process-wide on purpose: this
+# module is the only urllib user in the engine process, and going through urlopen()
+# keeps it replaceable in tests.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
+
+
 class VerificationResult(Enum):
     """Result of blockchain device verification"""
     VERIFIED = "verified"
@@ -6455,15 +6483,21 @@ class IrongateBlockchain:
 
         # An explicit indexer_url overrides the network preset, but only if it
         # is an https URL on a known Midnight indexer host (SSRF guard, V2).
+        # A configured URL that fails the check FAILS CLOSED: indexer_url becomes
+        # None and no query is ever made. It is deliberately NOT replaced by the
+        # network preset, which would send queries to a host the operator did not
+        # configure and hide the misconfiguration.
         self.indexer_url = self.NETWORKS[self.network]['indexer']
         custom_indexer = self.config.get('indexer_url')
         if custom_indexer and custom_indexer != self.indexer_url:
             if self.validate_indexer_url(custom_indexer):
                 self.indexer_url = custom_indexer
             else:
+                self.indexer_url = None
                 logger.warning(
                     "Blockchain Layer 8: indexer_url %r rejected (must be https on a "
-                    "known Midnight indexer host) - using the '%s' preset",
+                    "known Midnight indexer host) - no queries will be made until it is "
+                    "fixed or removed (it is not replaced by the '%s' preset)",
                     custom_indexer, self.network,
                 )
 
@@ -6504,6 +6538,10 @@ class IrongateBlockchain:
         Returns the 'data' object, or None on any transport/protocol failure.
         Never raises - callers treat None as 'chain undecided'.
         """
+        if self.indexer_url is None:
+            # A configured indexer_url was rejected (see __init__): make no request.
+            return None
+
         now = time.time()
         if now < self._breaker_until:
             logger.debug("Midnight indexer circuit breaker open for %.0fs more",
@@ -7704,7 +7742,13 @@ blockchain:
   network: "preprod"
   # Address of the deployed Midnight device-registry contract (required if enabled)
   contract_address: null
-  # Override the indexer endpoint; null uses the preset for the chosen network
+  # Override the indexer endpoint; null uses the preset for the chosen network.
+  # A custom URL must be https on port 443 on one of the Midnight indexer hosts
+  # (indexer.preprod / indexer.preview / indexer.mainnet .midnight.network), with no
+  # credentials; redirects are never followed. The selected network's own preset
+  # (e.g. the local 'undeployed' node) is also accepted. Any other value is refused
+  # by the dashboard (HTTP 400); if it is edited into this file by hand the engine
+  # makes NO Layer 8 queries (it does not fall back to the preset) and logs a warning.
   indexer_url: null
   # Cache TTL in seconds (reduces blockchain queries)
   cache_ttl: 60

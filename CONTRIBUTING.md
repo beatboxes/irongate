@@ -60,16 +60,20 @@ Network-dependent tests skip rather than fail when there is no route to the Midn
 deterministic suite stays meaningful offline.
 
 The input-validation suite (`tests/test_validation.py`, `tests/test_validation.php`,
-`tests/test_updater.sh`) needs no network and no root on the device. Run it in disposable containers:
+`tests/test_updater.sh`, `tests/test_installer_pin.sh`) needs no internet and no root on the device. Run it in
+disposable containers:
 
 ```bash
 python3 -m pytest tests/test_validation.py            # or: python3 -m unittest tests/test_validation.py
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w php:8.3-cli php tests/test_validation.php web
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_updater.sh src/irongate-updater.sh
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_installer_pin.sh irongate-install.sh
 ```
 
-The PHP and shell tests overwrite `/var/www/irongate` or create root-owned files, so they refuse to
-run unless `IRONGATE_TEST_SANDBOX=1` is set; never run them on a real device.
+The PHP and shell tests overwrite `/var/www/irongate` or `/etc/irongate`, bind local ports or create
+root-owned files, so they refuse to run unless `IRONGATE_TEST_SANDBOX=1` is set; never run them on a real
+device. `tests/test_blockchain.py` must keep passing both offline and on a host that can reach the real
+indexers (a rejected `indexer_url` makes no request, so it never depends on the network).
 
 If you fix a bug, add a test that fails before your fix and passes after it. Please say so in the PR
 so a reviewer can verify the same way.

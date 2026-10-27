@@ -153,6 +153,17 @@ check "installer sha256 differs from pin: refuse, exit 1, not executed" $(! ran 
 check "installer sha256 mismatch: staged file removed" $([ ! -e "$T/stage/irongate-install.sh" ]; echo $?) "$(ls "$T/stage")"
 check "installer sha256 mismatch: installed_commit not advanced" $([ "$(installed)" = oldoldo ]; echo $?) "installed_commit=$(installed)"
 
+# The pinned hash must be compared in full: a hash that agrees with the installer's on a prefix
+# (or on everything but one hex digit) is a different file and must be refused.
+flip() {   # $1=hex string $2=0-based index -> the same string with that one hex digit changed
+    local c=${1:$2:1} n; [ "$c" = "0" ] && n=1 || n=0
+    printf '%s%s%s' "${1:0:$2}" "$n" "${1:$(($2 + 1))}"
+}
+for idx in 63 40 8 0; do
+    reset true oldoldo; cp "$T/good-installer.sh" "$T/served-installer"; goodpin "$(flip "$GOOD_SHA" $idx)"; run --force
+    check "pinned sha256 differs from the installer's in hex digit #$idx only: refuse, not executed" $(! ran && [ $RC -eq 1 ] && logged "does not match pin" && [ "$(installed)" = oldoldo ]; echo $?) "rc=$RC ran=$(ran && echo y) installed=$(installed)"
+done
+
 reset true oldoldo; : > "$T/served-installer"; goodpin "$GOOD_SHA"; run --force
 check "empty download: refuse" $(! ran && [ $RC -eq 1 ]; echo $?) "rc=$RC"
 

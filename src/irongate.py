@@ -53,11 +53,13 @@ except ImportError:
 # nftables ruleset text that is loaded as root. The config is writable by the
 # web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
 # otherwise become nft syntax. Only strict identifiers/addresses may reach it.
-_ZONE_NAME_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+# The name becomes the nft set identifier "<name>_devices", and nft identifiers
+# cannot start with a digit or '-': require a leading letter or underscore.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
 
 
 def _valid_zone_name(name):
-    """True only for a str matching [A-Za-z0-9_-]{1,32} (fullmatch: no trailing newline)."""
+    """True only for a str matching [A-Za-z_][A-Za-z0-9_-]{0,31} (fullmatch: no trailing newline)."""
     return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
 
 

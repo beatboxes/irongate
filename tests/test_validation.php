@@ -104,6 +104,9 @@ $badDevices = [
     'ip as array'             => ['aa:00:00:00:00:08', ['1.2.3.4'], 'isolated'],
     'zone as array'           => ['aa:00:00:00:00:09', '192.168.1.9', ['x']],
     'empty zone'              => ['aa:00:00:00:00:0a', '192.168.1.10', ''],
+    'zone leading digit'      => ['aa:00:00:00:00:0b', '192.168.1.11', '0'],
+    'zone leading hyphen'     => ['aa:00:00:00:00:0c', '192.168.1.12', '-x'],
+    'zone digit-first word'   => ['aa:00:00:00:00:0d', '192.168.1.13', '9lives'],
 ];
 foreach ($badDevices as $label => [$mac, $ip, $zone]) {
     $r = call('POST', 'irongate_devices', $dev($mac, $ip, $zone));
@@ -113,6 +116,9 @@ foreach ($badDevices as $label => [$mac, $ip, $zone]) {
 $r = call('POST', 'irongate_devices', $dev('aa:00:00:00:00:20', '192.168.1.50', 'iot-cams_1'));
 check('V1 devices: accept valid ip/zone (control)', $r['status'] === 200 && ($r['json']['success'] ?? null) === true
     && dbq("SELECT zone FROM irongate_devices WHERE mac='aa:00:00:00:00:20'") === 'iot-cams_1', brief($r));
+$r = call('POST', 'irongate_devices', $dev('aa:00:00:00:00:23', '192.168.1.51', '_priv-1'));
+check('V1 devices: accept zone starting with an underscore (control)', ($r['json']['success'] ?? null) === true
+    && dbq("SELECT zone FROM irongate_devices WHERE mac='aa:00:00:00:00:23'") === '_priv-1', brief($r));
 $r = call('POST', 'irongate_devices', $dev('aa:00:00:00:00:21', '', 'isolated'));
 check('V1 devices: accept empty ip (control, engine skips such devices)', ($r['json']['success'] ?? null) === true, brief($r));
 $r = call('POST', 'irongate_devices', ['mac' => 'aa:00:00:00:00:22', 'ip' => '10.0.0.5']);
@@ -133,12 +139,24 @@ $r = call('POST', 'device_groups', ['name' => 'cams', 'lan_access' => 'selected'
 check('V1 groups: reject injected can_access_groups entry', $r['status'] === 400 && (int)dbq("SELECT COUNT(*) FROM device_groups") === 0, brief($r));
 $r = call('POST', 'device_groups', ['name' => 'cams', 'lan_access' => 'selected', 'can_access_groups' => 'servers']);
 check('V1 groups: reject non-array can_access_groups', $r['status'] === 400 && (int)dbq("SELECT COUNT(*) FROM device_groups") === 0, brief($r));
+foreach (['leading digit' => '1cams', 'leading hyphen' => '-cams'] as $label => $gname) {
+    $r = call('POST', 'device_groups', ['name' => $gname, 'lan_access' => 'none']);
+    check("V1 groups: reject name with $label", $r['status'] === 400 && (int)dbq("SELECT COUNT(*) FROM device_groups") === 0, brief($r));
+}
+// '0' is "empty" to PHP, so the pre-existing 'name is required' branch answers it (no 400 there).
+$r = call('POST', 'device_groups', ['name' => '0', 'lan_access' => 'none']);
+check('V1 groups: reject the name "0"', ($r['json']['success'] ?? null) === false && (int)dbq("SELECT COUNT(*) FROM device_groups") === 0, brief($r));
+$r = call('POST', 'device_groups', ['name' => 'cams', 'lan_access' => 'selected', 'can_access_groups' => ['0x']]);
+check('V1 groups: reject can_access_groups entry with a leading digit', $r['status'] === 400 && (int)dbq("SELECT COUNT(*) FROM device_groups") === 0, brief($r));
 $r = call('POST', 'device_groups', ['name' => 'servers', 'lan_access' => 'none']);
 check('V1 groups: reserved name still refused (control, unchanged message)', ($r['json']['success'] ?? null) === false
     && stripos($r['raw'], 'reserved') !== false, brief($r));
 $r = call('POST', 'device_groups', ['name' => 'cams', 'lan_access' => 'selected', 'can_access_groups' => ['servers', 'iot-cams_1']]);
 check('V1 groups: accept valid group (control)', ($r['json']['success'] ?? null) === true
     && (int)dbq("SELECT COUNT(*) FROM device_groups WHERE name='cams'") === 1, brief($r));
+$r = call('POST', 'device_groups', ['name' => '_grp-2', 'lan_access' => 'selected', 'can_access_groups' => ['_priv-1']]);
+check('V1 groups: accept names starting with an underscore (control)', ($r['json']['success'] ?? null) === true
+    && (int)dbq("SELECT COUNT(*) FROM device_groups WHERE name='_grp-2'") === 1, brief($r));
 
 // ---- V2: indexer URL ------------------------------------------------------
 $badIndexers = [
@@ -152,6 +170,16 @@ $badIndexers = [
     'backslash trick'          => 'https://evil.example\\@indexer.preprod.midnight.network/',
     'known host plain http'    => 'http://indexer.preprod.midnight.network/api/v4/graphql',
     'known host odd port'      => 'https://indexer.preprod.midnight.network:8443/api/v4/graphql',
+    // Each of the next ones is on an allowed host/scheme/port; only ONE rule of validIndexerUrl() rejects it.
+    'userinfo on allowed host' => 'https://user:pw@indexer.preprod.midnight.network/api/v4/graphql',
+    'user-only on allowed host'=> 'https://user@indexer.preprod.midnight.network/api/v4/graphql',
+    'backslash in path'        => 'https://indexer.preprod.midnight.network/api\\v4/graphql',
+    'backslash in query'       => 'https://indexer.preprod.midnight.network/?q=\\',
+    'space in path'            => 'https://indexer.preprod.midnight.network/api v4',
+    'tab in path'              => "https://indexer.preprod.midnight.network/api\tv4",
+    'DEL in path'              => "https://indexer.preprod.midnight.network/api\x7fv4",
+    'non-ASCII in path'        => "https://indexer.preprod.midnight.network/api\u{e9}",
+    'CRLF header injection'    => "https://indexer.preprod.midnight.network/api\r\nHost: evil.example",
 ];
 foreach ($badIndexers as $label => $url) {
     $r = call('POST', 'irongate_settings', ['blockchain_network' => 'preprod', 'blockchain_indexer_url' => $url]);
@@ -176,6 +204,64 @@ check('V2 probe: known indexer host is probed (control)', ($r['json']['success']
 $r = call('POST', 'test_blockchain_connection', ['network' => 'undeployed', 'indexer_url' => '']);
 check('V2 probe: undeployed preset still used when no custom URL (control)', ($r['json']['success'] ?? null) === true
     && ($r['json']['endpoint'] ?? '') === 'http://127.0.0.1:8088/api/v4/graphql', brief($r));
+
+// ---- V2 unit level: validIndexerUrl() called directly ----------------------------
+// Its callers trim() the value, which would hide a trailing-newline bug inside the validator itself,
+// so the function (and the preset table it reads) is loaded from the tree under test and called here.
+$apiSrc = (string)file_get_contents("$docroot/api.php");
+foreach (['midnightNetworks', 'validIndexerUrl'] as $fn) {
+    if (preg_match('/^function ' . $fn . '\(.*?^\}\n/ms', $apiSrc, $fm)) { eval($fm[0]); }
+}
+check('V2 unit: validIndexerUrl() exists', function_exists('validIndexerUrl'));
+if (function_exists('validIndexerUrl')) {
+    $okUrl = 'https://indexer.preprod.midnight.network/api/v4/graphql';
+    check('V2 unit: plain URL on a known host is valid (control)', validIndexerUrl($okUrl) === true);
+    check('V2 unit: trailing newline is rejected (\z, not $)', validIndexerUrl($okUrl . "\n") === false);
+    check('V2 unit: embedded newline is rejected', validIndexerUrl("https://indexer.preprod.midnight.network/a\nb") === false);
+    check('V2 unit: non-string is rejected', validIndexerUrl(['x']) === false && validIndexerUrl(null) === false);
+}
+
+// ---- V2: redirects from the indexer are never followed ----------------------
+// The 'undeployed' preset (http://127.0.0.1:8088/...) is the one non-https URL the probe may
+// contact. A front server on that address answers 3xx; an "internal" server on :8089 records
+// every request it receives. If the probe followed the redirect, :8089 would see a hit.
+$frontRouter = '/tmp/irongate-test-front.php';
+$internalRouter = '/tmp/irongate-test-internal.php';
+$hitsFile = '/tmp/irongate-test-internal-hits.log';
+$codeFile = '/tmp/irongate-test-redirect-code';
+file_put_contents($frontRouter, '<?php
+$code = (int)@file_get_contents("' . $codeFile . '");
+if ($code >= 300) { http_response_code($code); header("Location: http://127.0.0.1:8089/internal-secret"); exit; }
+header("Content-Type: application/json"); echo "{\"data\":{\"__typename\":\"Query\"}}";');
+file_put_contents($internalRouter, '<?php
+file_put_contents("' . $hitsFile . '", $_SERVER["REQUEST_METHOD"] . " " . $_SERVER["REQUEST_URI"] . "\n", FILE_APPEND);
+header("Content-Type: application/json"); echo "{\"data\":{\"__typename\":\"Query\"}}";');
+$helpers = [];
+foreach ([[8088, $frontRouter], [8089, $internalRouter]] as [$hport, $router]) {
+    $helpers[] = proc_open(['php', '-S', "127.0.0.1:$hport", $router],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', "/tmp/irongate-test-helper-$hport.log", 'w']], $hp);
+    $up = false;
+    for ($i = 0; $i < 50 && !$up; $i++) {
+        $c = @fsockopen('127.0.0.1', $hport, $en, $es, 0.2);
+        if ($c) { fclose($c); $up = true; } else { usleep(100000); }
+    }
+    if (!$up) { fwrite(STDERR, "helper server on :$hport did not start\n"); exit(2); }
+}
+register_shutdown_function(function () use ($helpers) { foreach ($helpers as $h) { if (is_resource($h)) { proc_terminate($h); proc_close($h); } } });
+foreach ([301, 302, 303, 307, 308] as $rcode) {
+    file_put_contents($codeFile, (string)$rcode);
+    @unlink($hitsFile);
+    $r = call('POST', 'test_blockchain_connection', ['network' => 'undeployed', 'indexer_url' => '']);
+    $hit = is_file($hitsFile) ? trim((string)file_get_contents($hitsFile)) : '';
+    check("V2 probe: HTTP $rcode from the indexer is not followed", $hit === ''
+        && ($r['json']['success'] ?? null) === true && ($r['json']['reachable'] ?? null) === false
+        && ($r['json']['http_code'] ?? null) === $rcode, brief($r) . ' internal_hits=' . json_encode($hit));
+}
+file_put_contents($codeFile, '0');
+@unlink($hitsFile);
+$r = call('POST', 'test_blockchain_connection', ['network' => 'undeployed', 'indexer_url' => '']);
+check('V2 probe: an indexer answering 200 is still reachable (control)', ($r['json']['reachable'] ?? null) === true
+    && ($r['json']['http_code'] ?? null) === 200 && !is_file($hitsFile), brief($r));
 
 // ---- V3: CORS -------------------------------------------------------------
 foreach ([['GET', 'irongate_devices'], ['POST', 'irongate_devices'], ['OPTIONS', 'irongate_devices']] as [$m, $a]) {
