@@ -100,13 +100,14 @@ mktree() {
     plant 0:0 644
 }
 mktree
-chown -R root:www-data /etc/irongate; chmod 775 /etc/irongate
-touch /etc/irongate/config.yaml; chown root:www-data /etc/irongate/config.yaml; chmod 664 /etc/irongate/config.yaml
+chown -R root:www-data /etc/irongate   # corrected per item E (I:6762-6763): no chmod 775, the directory keeps the mode mktree gave it (0755)
+touch /etc/irongate/config.yaml; chown root:www-data /etc/irongate/config.yaml; chmod 640 /etc/irongate/config.yaml   # corrected per item E (I:6765): a new config.yaml is 0640
 lst | grep -v '^/etc/irongate/updater-pin.conf ' > "$T/reference.lst"
 mktree; run_block
 lst | grep -v '^/etc/irongate/updater-pin.conf ' > "$T/actual.lst"
-check "every path other than the pin gets exactly the ownership/mode of the plain recursive chown" $(diff -q "$T/reference.lst" "$T/actual.lst" >/dev/null; echo $?) "$(diff "$T/reference.lst" "$T/actual.lst" | head -6)"
-check "config.yaml is root:www-data 0664 and /etc/irongate is root:www-data 0775 (web UI can still save config)" $([ "$(st /etc/irongate/config.yaml)" = "0:33:664:regular file" ] && [ "$(st /etc/irongate)" = "0:33:775:directory" ]; echo $?) "$(st /etc/irongate/config.yaml) $(st /etc/irongate)"
+check "every path other than the pin gets exactly the ownership/mode of the plain recursive chown (the directory keeps its mode, a new config.yaml is 0640)" $(diff -q "$T/reference.lst" "$T/actual.lst" >/dev/null; echo $?) "$(diff "$T/reference.lst" "$T/actual.lst" | head -6)"  # corrected per item E (I:6762-6763, I:6765)
+# corrected per item E (I:6762-6763, I:6765)
+check "config.yaml is created root:www-data 0640 and the existing /etc/irongate keeps its mode 0755 (owner root:www-data)" $([ "$(st /etc/irongate/config.yaml)" = "0:33:640:regular file" ] && [ "$(st /etc/irongate)" = "0:33:755:directory" ]; echo $?) "$(st /etc/irongate/config.yaml) $(st /etc/irongate)"
 check "linked file outside /etc/irongate keeps its ownership (chown does not follow symlinks)" $([ "$(st $TGT)" = "33:33:640:regular file" ]; echo $?) "$(st $TGT)"
 
 rm -rf /etc/irongate /opt/irongate /var/log/irongate "$TGT"

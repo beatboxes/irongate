@@ -45,7 +45,7 @@ IRONGATE_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
 
 # Get current commit hash from GitHub (will be stored after install)
 echo "Fetching commit hash from GitHub API..."
-API_RESPONSE=$(curl -sf -H "User-Agent: Irongate-Updater" "$IRONGATE_API" 2>/dev/null)
+API_RESPONSE=$(curl -sf --max-time 30 -H "User-Agent: Irongate-Updater" "$IRONGATE_API" 2>/dev/null)
 if [ -n "$API_RESPONSE" ]; then
     IRONGATE_COMMIT=$(echo "$API_RESPONSE" | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
 fi
@@ -109,6 +109,15 @@ fi
 
 WEBUI_PORT="80"
 
+# First install of the nginx site, decided ONCE here, before this run touches nginx: neither of our site files
+# exists yet. Only then are the other sites (the distribution's "default") removed; on a re-run (which is also what
+# the updater does) another site the operator keeps in nginx is left alone. A dangling sites-enabled link left by
+# the EXIT trap of a run that failed early does not count (-e follows links).
+IG_NGINX_FIRST_INSTALL=0
+if [ ! -e /etc/nginx/sites-available/irongate ] && [ ! -e /etc/nginx/sites-enabled/irongate ]; then
+    IG_NGINX_FIRST_INSTALL=1
+fi
+
 # Detect primary network interface
 echo -e "${YELLOW}Detecting network interface...${NC}"
 INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
@@ -126,15 +135,43 @@ echo -e "Current Gateway: ${GREEN}$CURRENT_GATEWAY${NC}"
 
 # Update system
 echo -e "${YELLOW}Updating system and installing packages...${NC}"
-apt update
+# Only packages that are missing are installed, so a re-run (the updater runs this installer) never upgrades a
+# package that is already there, and `apt update` runs only when something is missing. `dpkg -s` also succeeds for a
+# package that was removed but kept its configuration files, so the Status line is what decides.
+ig_pkg_installed() {
+    local s re=$'(^|\n)Status: [a-z]+ ok installed($|\n)'
+    s=$(dpkg -s "$1" 2>/dev/null) || return 1
+    [[ "$s" =~ $re ]]
+}
+ig_pkgs_missing() {   # the packages among the arguments that are not installed, on one line
+    local p out=""
+    for p in "$@"; do
+        ig_pkg_installed "$p" || out="${out:+$out }$p"
+    done
+    printf '%s' "$out"
+}
+IG_PKGS_CORE="dnsmasq nginx php-fpm php-sqlite3 sqlite3 jq"
+IG_PKGS_DEPS="python3 python3-pip python3-venv python3-dev nftables iptables arptables ebtables bridge-utils libpcap-dev arp-scan tcpdump net-tools conntrack ipset"
+IG_MISSING_CORE=$(ig_pkgs_missing $IG_PKGS_CORE)
+IG_MISSING_DEPS=$(ig_pkgs_missing $IG_PKGS_DEPS)
+if [ -n "$IG_MISSING_CORE$IG_MISSING_DEPS" ]; then
+    apt update
+else
+    echo -e "${GREEN}All required packages are already installed - no apt run${NC}"
+fi
+if [ "$IG_MISSING_CORE" = "$IG_PKGS_CORE" ]; then
+# nothing of the core set is installed yet: the plain install of the whole set (this exact line is pinned by
+# tests/test_installer_o4.py)
 apt install -y dnsmasq nginx php-fpm php-sqlite3 sqlite3 jq
+elif [ -n "$IG_MISSING_CORE" ]; then
+    apt-get install -y $IG_MISSING_CORE
+fi
 
 # Install Irongate dependencies
 echo -e "${YELLOW}Installing Irongate network isolation dependencies...${NC}"
-apt install -y python3 python3-pip python3-venv python3-dev \
-    nftables iptables arptables ebtables bridge-utils \
-    libpcap-dev arp-scan tcpdump net-tools \
-    conntrack ipset 2>/dev/null || true
+if [ -n "$IG_MISSING_DEPS" ]; then
+    apt-get install -y $IG_MISSING_DEPS 2>/dev/null || true
+fi
 
 # Detect PHP version installed
 PHP_VERSION=$(php -v 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1)
@@ -185,8 +222,11 @@ cleanup_on_exit() {
         sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php/php${TRAP_PHP_VER}-fpm.sock;|" /etc/nginx/sites-available/irongate
     fi
     
-    # CRITICAL: Ensure IronGate is the ONLY enabled nginx site
-    rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+    # On the FIRST install IronGate is the ONLY enabled nginx site; on a re-run the operator's other sites stay
+    # (IG_NGINX_FIRST_INSTALL is decided once at the top; unset, as in an isolated test of this trap, means "no")
+    if [ "${IG_NGINX_FIRST_INSTALL:-0}" = 1 ]; then
+        rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+    fi
     ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
     
     # Start services in correct order (dnsmasq only on a tree the audit accepts: a failed lockdown must not
@@ -387,6 +427,11 @@ echo -e "${YELLOW}Checking for existing installations...${NC}"
 
 # Create new directory structure
 mkdir -p /var/www/irongate
+# /etc/irongate: root:www-data 0750 where this run creates it (item E: the mode is set at creation, never widened later);
+# an existing directory keeps the owner and mode it has - the permissions block further down does not chmod it
+if [ ! -e /etc/irongate ] && [ ! -L /etc/irongate ]; then
+    install -d -m 0750 -o root -g www-data /etc/irongate
+fi
 mkdir -p /etc/irongate
 
 # Check for old DHCP-admin installation and migrate
@@ -434,9 +479,20 @@ fi
 #######################################
 echo -e "${YELLOW}Setting up database...${NC}"
 
+IG_DB_MODE_BEFORE=""   # the mode dhcp.db has when this run starts (permission and mode step further down)
+IG_DB_CREATED=0
+IG_DB_BACKUP=""
 if [ -f /var/www/irongate/dhcp.db ]; then
+    # keep the permission bits the operator gave the file - except setuid/setgid/sticky and world-write (0666 was the
+    # mode the O1 hardening took away from every local user); a link is not looked through
+    if [ ! -L /var/www/irongate/dhcp.db ]; then
+        IG_DB_MODE_BEFORE=$(stat -c %a /var/www/irongate/dhcp.db 2>/dev/null) || IG_DB_MODE_BEFORE=""
+        [ -z "$IG_DB_MODE_BEFORE" ] || IG_DB_MODE_BEFORE=$(printf '%o' $(( 8#$IG_DB_MODE_BEFORE & 8#775 )))
+    fi
     # BACKUP THE DATABASE FIRST - safety measure
-    cp /var/www/irongate/dhcp.db /var/www/irongate/dhcp.db.bak.$(date +%s)
+    # (a backup holds everything dhcp.db does: it is created 0600, never wider - umask 077)
+    IG_DB_BACKUP=/var/www/irongate/dhcp.db.bak.$(date +%s)
+    ( umask 077; cp /var/www/irongate/dhcp.db "$IG_DB_BACKUP" )
     echo -e "${GREEN}Created database backup${NC}"
     
     # Count existing reservations
@@ -535,6 +591,7 @@ EOSQL
     fi
 else
     echo -e "${YELLOW}Creating new database${NC}"
+    IG_DB_CREATED=1
     sqlite3 /var/www/irongate/dhcp.db << 'EOSQL'
 CREATE TABLE IF NOT EXISTS reservations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1938,6 +1995,21 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'update_now requires POST']);
             break;
         }
+        // This starts a root process. It needs an authenticated session of its own - the localhost bypass of the
+        // session guard (cli-server only) never applies to it - and the CSRF token of that session in the
+        // X-CSRF-Token header (compared in constant time); a cross-site POST carries the cookie but not the token.
+        if (($_SESSION['authenticated'] ?? false) !== true) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'error' => 'auth_required']);
+            break;
+        }
+        $csrfSent = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+        $csrfWant = $_SESSION['csrf_token'] ?? '';
+        if (!is_string($csrfSent) || !is_string($csrfWant) || $csrfWant === '' || !hash_equals($csrfWant, $csrfSent)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'error' => 'invalid csrf token']);
+            break;
+        }
         // Perform update
         $repoRaw = 'https://raw.githubusercontent.com/beatboxes/irongate/main';
         $githubApi = 'https://api.github.com/repos/beatboxes/irongate/commits/main';
@@ -1962,7 +2034,16 @@ switch ($action) {
         // before running. No attacker-supplied bytes are ever executed from here.
         exec("sudo touch /var/log/irongate-update.log");
         exec("sudo chown www-data /var/log/irongate-update.log");
-        exec("sudo /bin/bash /opt/irongate/irongate-updater.sh --force > /dev/null 2>&1 &");
+        // The update runs as its own systemd unit (own cgroup: it is not a child of php-fpm, which the installer
+        // restarts); the only thing sudo allows www-data to run for it is exactly this command.
+        $out = [];
+        $rc = 1;
+        exec("sudo -n /usr/bin/systemctl start --no-block irongate-updater-now.service", $out, $rc);
+        if ($rc !== 0) {
+            http_response_code(500);
+            echo json_encode(['success' => false, 'error' => 'Could not start the update service']);
+            break;
+        }
         
         echo json_encode([
             'success' => true,
@@ -2354,6 +2435,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="<?php echo htmlspecialchars($_SESSION['csrf_token'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
     <title>Irongate</title>
     <style>
         :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--primary:#e94560;--success:#00bf63;--warning:#ffc107;--danger:#dc3545;--text:#eee;--text-secondary:#aaa;}
@@ -3314,7 +3396,7 @@ cat > /var/www/irongate/index.php << 'EOHTML'
                 if(opts.params)Object.entries(opts.params).forEach(([k,v])=>url+=`&${k}=${v}`);
                 const res=await fetch(url,{
                     method:opts.method||'GET',
-                    headers:opts.body?{'Content-Type':'application/json'}:{},
+                    headers:Object.assign(opts.body?{'Content-Type':'application/json'}:{},{'X-CSRF-Token':(document.querySelector('meta[name="csrf-token"]')||{}).content||''}),
                     body:opts.body?JSON.stringify(opts.body):undefined
                 });
                 if(res.status===401){window.location.href='/login.php';return{success:false,error:'auth_required'};}
@@ -4854,7 +4936,10 @@ cat > /var/www/irongate/session_check.php << 'WEBAUTH_SESSEOF'
  * - api.php: unauthenticated -> 401 JSON (the SPA fetch() helper handles the
  *   redirect; a 302-to-HTML would corrupt every frontend JSON error path)
  * - Local service bypass: requests from 127.0.0.1/::1 to api.php that carry
- *   no session cookie are exempted (defensive: no current local callers).
+ *   no session cookie are exempted, but ONLY under PHP's built-in web server
+ *   (cli-server, which is how the test suite drives api.php). Under php-fpm
+ *   (fpm-fcgi, the real deployment) the bypass does not exist for any endpoint.
+ * - update_now is never exempted: it also requires a session and its CSRF token.
  */
 
 if (session_status() === PHP_SESSION_NONE) {
@@ -4866,10 +4951,16 @@ $IRONGATE_SESSION_TIMEOUT = 4 * 60 * 60; // 4 hours of inactivity
 
 $isApi = basename($_SERVER['SCRIPT_NAME'] ?? '') === 'api.php';
 
-// Local service-to-service API bypass (no session cookie presented)
+// Local service-to-service API bypass (no session cookie presented). The decision is a function of the SAPI so
+// that it can be tested for fpm-fcgi: it is true only for the built-in web server (cli-server) on loopback.
+function irongate_local_bypass_allowed(string $sapi, string $addr, bool $hasCookie): bool {
+    return $sapi === 'cli-server'
+        && in_array($addr, ['127.0.0.1', '::1'], true)
+        && !$hasCookie;
+}
+
 if ($isApi
-    && in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
-    && !isset($_COOKIE[session_name()])) {
+    && irongate_local_bypass_allowed(PHP_SAPI, (string)($_SERVER['REMOTE_ADDR'] ?? ''), isset($_COOKIE[session_name()]))) {
     return;
 }
 
@@ -4897,6 +4988,11 @@ if (!$authed) {
 }
 
 $_SESSION['last_activity'] = time();
+
+// CSRF token of this session: login.php creates it; a session that predates it gets one here.
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
 WEBAUTH_SESSEOF
 
 cat > /var/www/irongate/login.php << 'WEBAUTH_LOGINEOF'
@@ -6614,6 +6710,19 @@ if ! /opt/irongate/dnsmasq-apply --audit; then
     exit 1
 fi
 # ---- dnsmasq lockdown: end ----
+# ---- dhcp.db modes: begin ----
+# The permission step above (kept as it is, pinned by the O1 tests) gives every file of the web tree - dhcp.db and the
+# backups of it too - www-data:www-data 0755 / 0664. Here dhcp.db gets back the mode it had when this run started (without
+# world-write; 0660 only when this run created it) and the backup made by this run is root:root 0600, as it was created.
+if [ -n "$IG_DB_BACKUP" ]; then
+    ig_perm_fix file "$IG_DB_BACKUP" root root 600 || echo -e "${YELLOW}  ! could not restrict $IG_DB_BACKUP to root${NC}"
+fi
+if [ -n "$IG_DB_MODE_BEFORE" ]; then
+    ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data "$IG_DB_MODE_BEFORE"
+elif [ "$IG_DB_CREATED" = 1 ]; then
+    ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data 660
+fi
+# ---- dhcp.db modes: end ----
 chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || chown nobody:nogroup /var/lib/dnsmasq/dnsmasq.leases
 chmod 644 /var/lib/dnsmasq/dnsmasq.leases
 
@@ -6626,7 +6735,13 @@ chmod 644 /var/log/dnsmasq.log
 usermod -a -G systemd-journal www-data 2>/dev/null || true
 usermod -a -G adm www-data 2>/dev/null || true
 
-cat > /etc/sudoers.d/dnsmasq-web << EOF
+# Like the drop-in of the dnsmasq root helper above: sudo ignores every file of /etc/sudoers.d whose name contains a dot, and
+# a sudoers file with a syntax error makes sudo refuse to work at all, so this file is written under a dotted name, checked
+# there with visudo and only then renamed (atomically) to its real name. If the check fails, the file that is in place
+# stays as it is and an error is printed.
+IG_SUDOERS_WEB_NEW=/etc/sudoers.d/.irongate-dnsmasq-web.new
+rm -f "$IG_SUDOERS_WEB_NEW"
+cat << EOF > "$IG_SUDOERS_WEB_NEW"
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart dnsmasq
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl start dnsmasq
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop dnsmasq
@@ -6645,11 +6760,18 @@ www-data ALL=(ALL) NOPASSWD: /usr/bin/chmod 664 /var/log/dnsmasq.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u dnsmasq *
 www-data ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u irongate *
 www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
-www-data ALL=(ALL) NOPASSWD: /bin/bash /opt/irongate/irongate-updater.sh --force
+www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block irongate-updater-now.service
 www-data ALL=(ALL) NOPASSWD: /usr/bin/touch /var/log/irongate-update.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chown www-data /var/log/irongate-update.log
 EOF
-chmod 440 /etc/sudoers.d/dnsmasq-web
+chown root:root "$IG_SUDOERS_WEB_NEW"
+chmod 440 "$IG_SUDOERS_WEB_NEW"
+if visudo -cf "$IG_SUDOERS_WEB_NEW"; then
+    mv -T "$IG_SUDOERS_WEB_NEW" /etc/sudoers.d/dnsmasq-web
+else
+    echo -e "${RED}ERROR: dnsmasq-web sudoers failed validation - the file in place (if any) is left as it is; the web UI's sudo rules are not updated${NC}"
+    rm -f "$IG_SUDOERS_WEB_NEW"
+fi
 
 #######################################
 # Create systemd watchdog for auto-recovery
@@ -6685,8 +6807,9 @@ mkdir -p /etc/irongate
 mkdir -p /var/log/irongate
 
 # ---- /etc/irongate fixed-file helpers: begin ----
-# /etc/irongate is root:www-data 0775 on purpose (the web UI rewrites config.yaml), so the web tier
-# can create, rename and symlink entries there at any moment, also while this installer runs as
+# /etc/irongate can be group-writable for www-data (an installation made by an older version has it
+# 0775 and its mode is kept; a new one is created 0750), so the web tier may be able to
+# create, rename and symlink entries there at any moment, also while this installer runs as
 # root. A root process must therefore never open, chown or chmod a fixed name in it by path:
 # that follows a planted symlink to whatever it points at (`cat >` on a dangling link even creates
 # the target, and on a FIFO it blocks forever). These helpers do the work in a root-only staging
@@ -6695,10 +6818,13 @@ mkdir -p /var/log/irongate
 #   ig_etc_check  NAME       0 = NAME is a regular file, 1 = absent. A symlink, directory, FIFO,
 #                            socket or device is renamed aside (NAME.refused.<time>.<pid>, never
 #                            deleted) and reported, and counts as absent
-#   ig_etc_fix    NAME MODE  root:www-data MODE for an existing regular NAME, without following links
+#   ig_etc_fix    NAME MODE  root:www-data for an existing regular NAME, without following links;
+#                            MODE `keep` leaves the mode as it is, MODE `keep-o` only removes the
+#                            `other` permission bits (never adds any); a numeric MODE is set exactly
 #   ig_etc_commit NAME MODE  install the file staged as $IG_STAGE/NAME as root:www-data MODE
-#   ig_etc_ensure NAME MODE  NAME exists as a regular root:www-data MODE file (created empty if
-#                            missing, content of an existing file kept)
+#   ig_etc_ensure NAME MODE  NAME exists as a regular file: created empty as root:www-data MODE if
+#                            missing; an existing file keeps its content, owner, group and u/g mode
+#                            bits and loses every `other` bit (never widened)
 IG_ETC=/etc/irongate
 IG_STAGE=/etc/.irongate-stage
 ig_stage() {
@@ -6729,7 +6855,7 @@ ig_etc_fix() {
         rm -f -- "$pin"
         return 1
     fi
-    chown root:www-data "$pin" && chmod "$2" "$pin" || rc=1
+    chown root:www-data "$pin" && { case "$2" in keep) ;; keep-o) chmod o-rwx "$pin" ;; *) chmod "$2" "$pin" ;; esac; } || rc=1
     rm -f -- "$pin"
     return $rc
 }
@@ -6740,7 +6866,7 @@ ig_etc_commit() {
 ig_etc_ensure() {
     local rc=0
     if ig_etc_check "$1"; then
-        ig_etc_fix "$1" "$2" || rc=1
+        ig_etc_fix "$1" keep-o || rc=1
     else
         { ig_stage && : > "$IG_STAGE/$1" && ig_etc_commit "$1" "$2"; } || rc=1
     fi
@@ -6760,18 +6886,462 @@ ig_etc_ensure() {
 # on "./name", so a subdirectory the web tier swaps for a symlink after find listed it cannot
 # send root's chown to a file outside /etc/irongate.
 find /etc/irongate ! -path /etc/irongate/updater-pin.conf -execdir chown -h root:www-data {} +
-chmod 775 /etc/irongate
-# Config file will be created later, but set default permissions
-ig_etc_ensure config.yaml 664 || true
+# The directory keeps the mode it has (0750 when this run created it, see above): it is never widened to 0775 here.
+# config.yaml: an existing file keeps its content and mode; a missing one starts as an empty 0640 placeholder
+# (an empty config.yaml counts as absent: it is generated further down).
+ig_etc_ensure config.yaml 640 || true
 
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
+# Dependencies: every package is pinned to one version and to the sha256 of each of its published files, and pip runs in
+# --require-hashes mode, so nothing else (a newer release, a replaced file, a dependency not listed) can be installed.
+# The lists are carried by this installer (the updater downloads this one file and nothing else) and written to a
+# root-only temporary directory. The first is what the virtual environment holds (every PyPI file of that exact
+# version); the second is for the system python3 that the fallbacks below install into.
+IG_REQ_DIR=$(mktemp -d /tmp/irongate-req.XXXXXX)
+chmod 700 "$IG_REQ_DIR"
+cat << 'IG_REQ_VENV' > "$IG_REQ_DIR/requirements-venv.txt"
+cffi==2.0.0 \
+    --hash=sha256:00bdf7acc5f795150faa6957054fbbca2439db2f775ce831222b66f192f03beb \
+    --hash=sha256:07b271772c100085dd28b74fa0cd81c8fb1a3ba18b21e03d7c27f3436a10606b \
+    --hash=sha256:087067fa8953339c723661eda6b54bc98c5625757ea62e95eb4898ad5e776e9f \
+    --hash=sha256:0a1527a803f0a659de1af2e1fd700213caba79377e27e4693648c2923da066f9 \
+    --hash=sha256:0cf2d91ecc3fcc0625c2c530fe004f82c110405f101548512cce44322fa8ac44 \
+    --hash=sha256:0f6084a0ea23d05d20c3edcda20c3d006f9b6f3fefeac38f59262e10cef47ee2 \
+    --hash=sha256:12873ca6cb9b0f0d3a0da705d6086fe911591737a59f28b7936bdfed27c0d47c \
+    --hash=sha256:19f705ada2530c1167abacb171925dd886168931e0a7b78f5bffcae5c6b5be75 \
+    --hash=sha256:1cd13c99ce269b3ed80b417dcd591415d3372bcac067009b6e0f59c7d4015e65 \
+    --hash=sha256:1e3a615586f05fc4065a8b22b8152f0c1b00cdbc60596d187c2a74f9e3036e4e \
+    --hash=sha256:1f72fb8906754ac8a2cc3f9f5aaa298070652a0ffae577e0ea9bd480dc3c931a \
+    --hash=sha256:1fc9ea04857caf665289b7a75923f2c6ed559b8298a1b8c49e59f7dd95c8481e \
+    --hash=sha256:203a48d1fb583fc7d78a4c6655692963b860a417c0528492a6bc21f1aaefab25 \
+    --hash=sha256:2081580ebb843f759b9f617314a24ed5738c51d2aee65d31e02f6f7a2b97707a \
+    --hash=sha256:21d1152871b019407d8ac3985f6775c079416c282e431a4da6afe7aefd2bccbe \
+    --hash=sha256:24b6f81f1983e6df8db3adc38562c83f7d4a0c36162885ec7f7b77c7dcbec97b \
+    --hash=sha256:256f80b80ca3853f90c21b23ee78cd008713787b1b1e93eae9f3d6a7134abd91 \
+    --hash=sha256:28a3a209b96630bca57cce802da70c266eb08c6e97e5afd61a75611ee6c64592 \
+    --hash=sha256:2c8f814d84194c9ea681642fd164267891702542f028a15fc97d4674b6206187 \
+    --hash=sha256:2de9a304e27f7596cd03d16f1b7c72219bd944e99cc52b84d0145aefb07cbd3c \
+    --hash=sha256:38100abb9d1b1435bc4cc340bb4489635dc2f0da7456590877030c9b3d40b0c1 \
+    --hash=sha256:3925dd22fa2b7699ed2617149842d2e6adde22b262fcbfada50e3d195e4b3a94 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
+    --hash=sha256:3e837e369566884707ddaf85fc1744b47575005c0a229de3327f8f9a20f4efeb \
+    --hash=sha256:3f4d46d8b35698056ec29bca21546e1551a205058ae1a181d871e278b0b28165 \
+    --hash=sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529 \
+    --hash=sha256:45d5e886156860dc35862657e1494b9bae8dfa63bf56796f2fb56e1679fc0bca \
+    --hash=sha256:4647afc2f90d1ddd33441e5b0e85b16b12ddec4fca55f0d9671fef036ecca27c \
+    --hash=sha256:4671d9dd5ec934cb9a73e7ee9676f9362aba54f7f34910956b84d727b0d73fb6 \
+    --hash=sha256:53f77cbe57044e88bbd5ed26ac1d0514d2acf0591dd6bb02a3ae37f76811b80c \
+    --hash=sha256:5eda85d6d1879e692d546a078b44251cdd08dd1cfb98dfb77b670c97cee49ea0 \
+    --hash=sha256:5fed36fccc0612a53f1d4d9a816b50a36702c28a2aa880cb8a122b3466638743 \
+    --hash=sha256:61d028e90346df14fedc3d1e5441df818d095f3b87d286825dfcbd6459b7ef63 \
+    --hash=sha256:66f011380d0e49ed280c789fbd08ff0d40968ee7b665575489afa95c98196ab5 \
+    --hash=sha256:6824f87845e3396029f3820c206e459ccc91760e8fa24422f8b0c3d1731cbec5 \
+    --hash=sha256:6c6c373cfc5c83a975506110d17457138c8c63016b563cc9ed6e056a82f13ce4 \
+    --hash=sha256:6d02d6655b0e54f54c4ef0b94eb6be0607b70853c45ce98bd278dc7de718be5d \
+    --hash=sha256:6d50360be4546678fc1b79ffe7a66265e28667840010348dd69a314145807a1b \
+    --hash=sha256:730cacb21e1bdff3ce90babf007d0a0917cc3e6492f336c2f0134101e0944f93 \
+    --hash=sha256:737fe7d37e1a1bffe70bd5754ea763a62a066dc5913ca57e957824b72a85e205 \
+    --hash=sha256:74a03b9698e198d47562765773b4a8309919089150a0bb17d829ad7b44b60d27 \
+    --hash=sha256:7553fb2090d71822f02c629afe6042c299edf91ba1bf94951165613553984512 \
+    --hash=sha256:7a66c7204d8869299919db4d5069a82f1561581af12b11b3c9f48c584eb8743d \
+    --hash=sha256:7cc09976e8b56f8cebd752f7113ad07752461f48a58cbba644139015ac24954c \
+    --hash=sha256:81afed14892743bbe14dacb9e36d9e0e504cd204e0b165062c488942b9718037 \
+    --hash=sha256:8941aaadaf67246224cee8c3803777eed332a19d909b47e29c9842ef1e79ac26 \
+    --hash=sha256:89472c9762729b5ae1ad974b777416bfda4ac5642423fa93bd57a09204712322 \
+    --hash=sha256:8ea985900c5c95ce9db1745f7933eeef5d314f0565b27625d9a10ec9881e1bfb \
+    --hash=sha256:8eca2a813c1cb7ad4fb74d368c2ffbbb4789d377ee5bb8df98373c2cc0dee76c \
+    --hash=sha256:92b68146a71df78564e4ef48af17551a5ddd142e5190cdf2c5624d0c3ff5b2e8 \
+    --hash=sha256:9332088d75dc3241c702d852d4671613136d90fa6881da7d770a483fd05248b4 \
+    --hash=sha256:94698a9c5f91f9d138526b48fe26a199609544591f859c870d477351dc7b2414 \
+    --hash=sha256:9a67fc9e8eb39039280526379fb3a70023d77caec1852002b4da7e8b270c4dd9 \
+    --hash=sha256:9de40a7b0323d889cf8d23d1ef214f565ab154443c42737dfe52ff82cf857664 \
+    --hash=sha256:a05d0c237b3349096d3981b727493e22147f934b20f6f125a3eba8f994bec4a9 \
+    --hash=sha256:afb8db5439b81cf9c9d0c80404b60c3cc9c3add93e114dcae767f1477cb53775 \
+    --hash=sha256:b18a3ed7d5b3bd8d9ef7a8cb226502c6bf8308df1525e1cc676c3680e7176739 \
+    --hash=sha256:b1e74d11748e7e98e2f426ab176d4ed720a64412b6a15054378afdb71e0f37dc \
+    --hash=sha256:b21e08af67b8a103c71a250401c78d5e0893beff75e28c53c98f4de42f774062 \
+    --hash=sha256:b4c854ef3adc177950a8dfc81a86f5115d2abd545751a304c5bcf2c2c7283cfe \
+    --hash=sha256:b882b3df248017dba09d6b16defe9b5c407fe32fc7c65a9c69798e6175601be9 \
+    --hash=sha256:baf5215e0ab74c16e2dd324e8ec067ef59e41125d3eade2b863d294fd5035c92 \
+    --hash=sha256:c649e3a33450ec82378822b3dad03cc228b8f5963c0c12fc3b1e0ab940f768a5 \
+    --hash=sha256:c654de545946e0db659b3400168c9ad31b5d29593291482c43e3564effbcee13 \
+    --hash=sha256:c6638687455baf640e37344fe26d37c404db8b80d037c3d29f58fe8d1c3b194d \
+    --hash=sha256:c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26 \
+    --hash=sha256:cb527a79772e5ef98fb1d700678fe031e353e765d1ca2d409c92263c6d43e09f \
+    --hash=sha256:cf364028c016c03078a23b503f02058f1814320a56ad535686f90565636a9495 \
+    --hash=sha256:d48a880098c96020b02d5a1f7d9251308510ce8858940e6fa99ece33f610838b \
+    --hash=sha256:d68b6cef7827e8641e8ef16f4494edda8b36104d79773a334beaa1e3521430f6 \
+    --hash=sha256:d9b29c1f0ae438d5ee9acb31cadee00a58c46cc9c0b2f9038c6b0b3470877a8c \
+    --hash=sha256:d9b97165e8aed9272a6bb17c01e3cc5871a594a446ebedc996e2397a1c1ea8ef \
+    --hash=sha256:da68248800ad6320861f129cd9c1bf96ca849a2771a59e0344e88681905916f5 \
+    --hash=sha256:da902562c3e9c550df360bfa53c035b2f241fed6d9aef119048073680ace4a18 \
+    --hash=sha256:dbd5c7a25a7cb98f5ca55d258b103a2054f859a46ae11aaf23134f9cc0d356ad \
+    --hash=sha256:dd4f05f54a52fb558f1ba9f528228066954fee3ebe629fc1660d874d040ae5a3 \
+    --hash=sha256:de8dad4425a6ca6e4e5e297b27b5c824ecc7581910bf9aee86cb6835e6812aa7 \
+    --hash=sha256:e11e82b744887154b182fd3e7e8512418446501191994dbf9c9fc1f32cc8efd5 \
+    --hash=sha256:e6e73b9e02893c764e7e8d5bb5ce277f1a009cd5243f8228f75f842bf937c534 \
+    --hash=sha256:f73b96c41e3b2adedc34a7356e64c8eb96e03a3782b535e043a986276ce12a49 \
+    --hash=sha256:f93fd8e5c8c0a4aa1f424d6173f14a892044054871c771f8566e4008eaa359d2 \
+    --hash=sha256:fc33c5141b55ed366cfaad382df24fe7dcbc686de5be719b207bb248e3053dc5 \
+    --hash=sha256:fc7de24befaeae77ba923797c7c87834c73648a05a4bde34b3b7e5588973a453 \
+    --hash=sha256:fe562eb1a64e67dd297ccc4f5addea2501664954f2692b69a76449ec7913ecbf
+docstring-parser==0.14.1 \
+    --hash=sha256:14ac6ec1f1ba6905c4d8cb90fd0bc55394f5678183752c90e44812bf28d7a515 \
+    --hash=sha256:2c77522e31b7c88b1ab457a1f3c9ae38947ad719732260ba77ee8a3deb58622a
+executing==2.0.1 \
+    --hash=sha256:35afe2ce3affba8ee97f2d69927fa823b08b472b7b994e36a52a964b93d16147 \
+    --hash=sha256:eac49ca94516ccc753f9fb5ce82603156e590b27525a8bc32cce8ae302eb61bc
+msgpack==1.1.2 \
+    --hash=sha256:0051fffef5a37ca2cd16978ae4f0aef92f164df86823871b5162812bebecd8e2 \
+    --hash=sha256:04fb995247a6e83830b62f0b07bf36540c213f6eac8e851166d8d86d83cbd014 \
+    --hash=sha256:180759d89a057eab503cf62eeec0aa61c4ea1200dee709f3a8e9397dbb3b6931 \
+    --hash=sha256:1d1418482b1ee984625d88aa9585db570180c286d942da463533b238b98b812b \
+    --hash=sha256:1de460f0403172cff81169a30b9a92b260cb809c4cb7e2fc79ae8d0510c78b6b \
+    --hash=sha256:1fdf7d83102bf09e7ce3357de96c59b627395352a4024f6e2458501f158bf999 \
+    --hash=sha256:1fff3d825d7859ac888b0fbda39a42d59193543920eda9d9bea44d958a878029 \
+    --hash=sha256:283ae72fc89da59aa004ba147e8fc2f766647b1251500182fac0350d8af299c0 \
+    --hash=sha256:2929af52106ca73fcb28576218476ffbb531a036c2adbcf54a3664de124303e9 \
+    --hash=sha256:2e86a607e558d22985d856948c12a3fa7b42efad264dca8a3ebbcfa2735d786c \
+    --hash=sha256:350ad5353a467d9e3b126d8d1b90fe05ad081e2e1cef5753f8c345217c37e7b8 \
+    --hash=sha256:354e81bcdebaab427c3df4281187edc765d5d76bfb3a7c125af9da7a27e8458f \
+    --hash=sha256:365c0bbe981a27d8932da71af63ef86acc59ed5c01ad929e09a0b88c6294e28a \
+    --hash=sha256:372839311ccf6bdaf39b00b61288e0557916c3729529b301c52c2d88842add42 \
+    --hash=sha256:3b60763c1373dd60f398488069bcdc703cd08a711477b5d480eecc9f9626f47e \
+    --hash=sha256:41d1a5d875680166d3ac5c38573896453bbbea7092936d2e107214daf43b1d4f \
+    --hash=sha256:42eefe2c3e2af97ed470eec850facbe1b5ad1d6eacdbadc42ec98e7dcf68b4b7 \
+    --hash=sha256:446abdd8b94b55c800ac34b102dffd2f6aa0ce643c55dfc017ad89347db3dbdb \
+    --hash=sha256:454e29e186285d2ebe65be34629fa0e8605202c60fbc7c4c650ccd41870896ef \
+    --hash=sha256:4efd7b5979ccb539c221a4c4e16aac1a533efc97f3b759bb5a5ac9f6d10383bf \
+    --hash=sha256:5559d03930d3aa0f3aacb4c42c776af1a2ace2611871c84a75afe436695e6245 \
+    --hash=sha256:5928604de9b032bc17f5099496417f113c45bc6bc21b5c6920caf34b3c428794 \
+    --hash=sha256:59415c6076b1e30e563eb732e23b994a61c159cec44deaf584e5cc1dd662f2af \
+    --hash=sha256:5a46bf7e831d09470ad92dff02b8b1ac92175ca36b087f904a0519857c6be3ff \
+    --hash=sha256:602b6740e95ffc55bfb078172d279de3773d7b7db1f703b2f1323566b878b90e \
+    --hash=sha256:61c8aa3bd513d87c72ed0b37b53dd5c5a0f58f2ff9f26e1555d3bd7948fb7296 \
+    --hash=sha256:67016ae8c8965124fdede9d3769528ad8284f14d635337ffa6a713a580f6c030 \
+    --hash=sha256:6bde749afe671dc44893f8d08e83bf475a1a14570d67c4bb5cec5573463c8833 \
+    --hash=sha256:6c15b7d74c939ebe620dd8e559384be806204d73b4f9356320632d783d1f7939 \
+    --hash=sha256:70a0dff9d1f8da25179ffcf880e10cf1aad55fdb63cd59c9a49a1b82290062aa \
+    --hash=sha256:70c5a7a9fea7f036b716191c29047374c10721c389c21e9ffafad04df8c52c90 \
+    --hash=sha256:7bc8813f88417599564fafa59fd6f95be417179f76b40325b500b3c98409757c \
+    --hash=sha256:80a0ff7d4abf5fecb995fcf235d4064b9a9a8a40a3ab80999e6ac1e30b702717 \
+    --hash=sha256:86f8136dfa5c116365a8a651a7d7484b65b13339731dd6faebb9a0242151c406 \
+    --hash=sha256:897c478140877e5307760b0ea66e0932738879e7aa68144d9b78ea4c8302a84a \
+    --hash=sha256:8b696e83c9f1532b4af884045ba7f3aa741a63b2bc22617293a2c6a7c645f251 \
+    --hash=sha256:8e22ab046fa7ede9e36eeb4cfad44d46450f37bb05d5ec482b02868f451c95e2 \
+    --hash=sha256:94fd7dc7d8cb0a54432f296f2246bc39474e017204ca6f4ff345941d4ed285a7 \
+    --hash=sha256:99e2cb7b9031568a2a5c73aa077180f93dd2e95b4f8d3b8e14a73ae94a9e667e \
+    --hash=sha256:9ade919fac6a3e7260b7f64cea89df6bec59104987cbea34d34a2fa15d74310b \
+    --hash=sha256:9fba231af7a933400238cb357ecccf8ab5d51535ea95d94fc35b7806218ff844 \
+    --hash=sha256:a465f0dceb8e13a487e54c07d04ae3ba131c7c5b95e2612596eafde1dccf64a9 \
+    --hash=sha256:a605409040f2da88676e9c9e5853b3449ba8011973616189ea5ee55ddbc5bc87 \
+    --hash=sha256:a668204fa43e6d02f89dbe79a30b0d67238d9ec4c5bd8a940fc3a004a47b721b \
+    --hash=sha256:a7787d353595c7c7e145e2331abf8b7ff1e6673a6b974ded96e6d4ec09f00c8c \
+    --hash=sha256:a8f6e7d30253714751aa0b0c84ae28948e852ee7fb0524082e6716769124bc23 \
+    --hash=sha256:ad09b984828d6b7bb52d1d1d0c9be68ad781fa004ca39216c8a1e63c0f34ba3c \
+    --hash=sha256:bafca952dc13907bdfdedfc6a5f579bf4f292bdd506fadb38389afa3ac5b208e \
+    --hash=sha256:be52a8fc79e45b0364210eef5234a7cf8d330836d0a64dfbb878efa903d84620 \
+    --hash=sha256:be5980f3ee0e6bd44f3a9e9dea01054f175b50c3e6cdb692bc9424c0bbb8bf69 \
+    --hash=sha256:c63eea553c69ab05b6747901b97d620bb2a690633c77f23feb0c6a947a8a7b8f \
+    --hash=sha256:d198d275222dc54244bf3327eb8cbe00307d220241d9cec4d306d49a44e85f68 \
+    --hash=sha256:d62ce1f483f355f61adb5433ebfd8868c5f078d1a52d042b0a998682b4fa8c27 \
+    --hash=sha256:d99ef64f349d5ec3293688e91486c5fdb925ed03807f64d98d205d2713c60b46 \
+    --hash=sha256:db6192777d943bdaaafb6ba66d44bf65aa0e9c5616fa1d2da9bb08828c6b39aa \
+    --hash=sha256:e23ce8d5f7aa6ea6d2a2b326b4ba46c985dbb204523759984430db7114f8aa00 \
+    --hash=sha256:e64c8d2f5e5d5fda7b842f55dec6133260ea8f53c4257d64494c534f306bf7a9 \
+    --hash=sha256:e69b39f8c0aa5ec24b57737ebee40be647035158f14ed4b40e6f150077e21a84 \
+    --hash=sha256:ea5405c46e690122a76531ab97a079e184c0daf491e588592d6a23d3e32af99e \
+    --hash=sha256:f2cb069d8b981abc72b41aea1c580ce92d57c673ec61af4c500153a626cb9e20 \
+    --hash=sha256:fac4be746328f90caa3cd4bc67e6fe36ca2bf61d5c6eb6d895b6527e3f05071e \
+    --hash=sha256:fffee09044073e69f2bad787071aeec727183e7580443dfeb8556cbf1978d162
+netifaces==0.11.0 \
+    --hash=sha256:043a79146eb2907edf439899f262b3dfe41717d34124298ed281139a8b93ca32 \
+    --hash=sha256:08e3f102a59f9eaef70948340aeb6c89bd09734e0dca0f3b82720305729f63ea \
+    --hash=sha256:0f6133ac02521270d9f7c490f0c8c60638ff4aec8338efeff10a1b51506abe85 \
+    --hash=sha256:18917fbbdcb2d4f897153c5ddbb56b31fa6dd7c3fa9608b7e3c3a663df8206b5 \
+    --hash=sha256:2479bb4bb50968089a7c045f24d120f37026d7e802ec134c4490eae994c729b5 \
+    --hash=sha256:2650beee182fed66617e18474b943e72e52f10a24dc8cac1db36c41ee9c041b7 \
+    --hash=sha256:28f4bf3a1361ab3ed93c5ef360c8b7d4a4ae060176a3529e72e5e4ffc4afd8b0 \
+    --hash=sha256:3ecb3f37c31d5d51d2a4d935cfa81c9bc956687c6f5237021b36d6fdc2815b2c \
+    --hash=sha256:469fc61034f3daf095e02f9f1bbac07927b826c76b745207287bc594884cfd05 \
+    --hash=sha256:48324183af7f1bc44f5f197f3dad54a809ad1ef0c78baee2c88f16a5de02c4c9 \
+    --hash=sha256:50721858c935a76b83dd0dd1ab472cad0a3ef540a1408057624604002fcfb45b \
+    --hash=sha256:54ff6624eb95b8a07e79aa8817288659af174e954cca24cdb0daeeddfc03c4ff \
+    --hash=sha256:5be83986100ed1fdfa78f11ccff9e4757297735ac17391b95e17e74335c2047d \
+    --hash=sha256:5f9ca13babe4d845e400921973f6165a4c2f9f3379c7abfc7478160e25d196a4 \
+    --hash=sha256:73ff21559675150d31deea8f1f8d7e9a9a7e4688732a94d71327082f517fc6b4 \
+    --hash=sha256:7dbb71ea26d304e78ccccf6faccef71bb27ea35e259fb883cfd7fd7b4f17ecb1 \
+    --hash=sha256:815eafdf8b8f2e61370afc6add6194bd5a7252ae44c667e96c4c1ecf418811e4 \
+    --hash=sha256:841aa21110a20dc1621e3dd9f922c64ca64dd1eb213c47267a2c324d823f6c8f \
+    --hash=sha256:84e4d2e6973eccc52778735befc01638498781ce0e39aa2044ccfd2385c03246 \
+    --hash=sha256:8f7da24eab0d4184715d96208b38d373fd15c37b0dafb74756c638bd619ba150 \
+    --hash=sha256:96c0fe9696398253f93482c84814f0e7290eee0bfec11563bd07d80d701280c3 \
+    --hash=sha256:aab1dbfdc55086c789f0eb37affccf47b895b98d490738b81f3b2360100426be \
+    --hash=sha256:c03fb2d4ef4e393f2e6ffc6376410a22a3544f164b336b3a355226653e5efd89 \
+    --hash=sha256:c37a1ca83825bc6f54dddf5277e9c65dec2f1b4d0ba44b8fd42bc30c91aa6ea1 \
+    --hash=sha256:c92ff9ac7c2282009fe0dcb67ee3cd17978cffbe0c8f4b471c00fe4325c9b4d4 \
+    --hash=sha256:c9a3a47cd3aaeb71e93e681d9816c56406ed755b9442e981b07e3618fb71d2ac \
+    --hash=sha256:cb925e1ca024d6f9b4f9b01d83215fd00fe69d095d0255ff3f64bffda74025c8 \
+    --hash=sha256:d07b01c51b0b6ceb0f09fc48ec58debd99d2c8430b09e56651addeaf5de48048 \
+    --hash=sha256:e76c7f351e0444721e85f975ae92718e21c1f361bda946d60a214061de1f00a1 \
+    --hash=sha256:eb4813b77d5df99903af4757ce980a98c4d702bbcb81f32a0b305a1537bdf0b1
+py-algorand-sdk==2.11.1 \
+    --hash=sha256:40c8db5e65420ade023c78dda1fff44f5af4666c4b12c8a0e976a6c33fb819b6 \
+    --hash=sha256:ccca589b00f7939e6bfdf5a5ace261a4b26c9b4baf02b376c46fb61aa182c800
+pycparser==3.0 \
+    --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+pycryptodomex==3.23.0 \
+    --hash=sha256:02d87b80778c171445d67e23d1caef279bf4b25c3597050ccd2e13970b57fd51 \
+    --hash=sha256:06698f957fe1ab229a99ba2defeeae1c09af185baa909a31a5d1f9d42b1aaed6 \
+    --hash=sha256:14c37aaece158d0ace436f76a7bb19093db3b4deade9797abfc39ec6cd6cc2fe \
+    --hash=sha256:189afbc87f0b9f158386bf051f720e20fa6145975f1e76369303d0f31d1a8d7c \
+    --hash=sha256:1c3a65ad441746b250d781910d26b7ed0a396733c6f2dbc3327bd7051ec8a541 \
+    --hash=sha256:1c6d919fc8429e5cb228ba8c0d4d03d202a560b421c14867a65f6042990adc8e \
+    --hash=sha256:267a3038f87a8565bd834317dbf053a02055915acf353bf42ededb9edaf72010 \
+    --hash=sha256:27e13c80ac9a0a1d050ef0a7e0a18cc04c8850101ec891815b6c5a0375e8a245 \
+    --hash=sha256:43c446e2ba8df8889e0e16f02211c25b4934898384c1ec1ec04d7889c0333587 \
+    --hash=sha256:47f6d318fe864d02d5e59a20a18834819596c4ed1d3c917801b22b92b3ffa648 \
+    --hash=sha256:4e79f1aaff5a3a374e92eb462fa9e598585452135012e2945f96874ca6eeb1ff \
+    --hash=sha256:4f2596e643d4365e14d0879dc5aafe6355616c61c2176009270f3048f6d9a61f \
+    --hash=sha256:52e5ca58c3a0b0bd5e100a9fbc8015059b05cffc6c66ce9d98b4b45e023443b9 \
+    --hash=sha256:55ccbe27f049743a4caf4f4221b166560d3438d0b1e5ab929e07ae1702a4d6fd \
+    --hash=sha256:58b851b9effd0d072d4ca2e4542bf2a4abcf13c82a29fd2c93ce27ee2a2e9462 \
+    --hash=sha256:6b8962204c47464d5c1c4038abeadd4514a133b28748bcd9fa5b6d62e3cec6fa \
+    --hash=sha256:6bbcb1dd0f646484939e142462d9e532482bc74475cecf9c4903d4e1cd21f003 \
+    --hash=sha256:71909758f010c82bc99b0abf4ea12012c98962fbf0583c2164f8b84533c2e4da \
+    --hash=sha256:7b37e08e3871efe2187bc1fd9320cc81d87caf19816c648f24443483005ff886 \
+    --hash=sha256:7de1e40a41a5d7f1ac42b6569b10bcdded34339950945948529067d8426d2785 \
+    --hash=sha256:8a4fcd42ccb04c31268d1efeecfccfd1249612b4de6374205376b8f280321744 \
+    --hash=sha256:91979028227543010d7b2ba2471cf1d1e398b3f183cb105ac584df0c36dac28d \
+    --hash=sha256:a33986a0066860f7fcf7c7bd2bc804fa90e434183645595ae7b33d01f3c91ed8 \
+    --hash=sha256:a9d446e844f08299236780f2efa9898c818fe7e02f17263866b8550c7d5fb328 \
+    --hash=sha256:add243d204e125f189819db65eed55e6b4713f70a7e9576c043178656529cec7 \
+    --hash=sha256:b2c2537863eccef2d41061e82a881dcabb04944c5c06c5aa7110b577cc487545 \
+    --hash=sha256:bc65bdd9fc8de7a35a74cab1c898cab391a4add33a8fe740bda00f5976ca4708 \
+    --hash=sha256:bdc69d0d3d989a1029df0eed67cc5e8e5d968f3724f4519bd03e0ec68df7543c \
+    --hash=sha256:bffc92138d75664b6d543984db7893a628559b9e78658563b0395e2a5fb47ed9 \
+    --hash=sha256:c25e30a20e1b426e1f0fa00131c516f16e474204eee1139d1603e132acffc314 \
+    --hash=sha256:c7947ab8d589e3178da3d7cdeabe14f841b391e17046954f2fbcd941705762b5 \
+    --hash=sha256:c84b239a1f4ec62e9c789aafe0543f0594f0acd90c8d9e15bcece3efe55eca66 \
+    --hash=sha256:c885da45e70139464f082018ac527fdaad26f1657a99ee13eecdce0f0ca24ab4 \
+    --hash=sha256:d9825410197a97685d6a1fa2a86196430b01877d64458a20e95d4fd00d739a08 \
+    --hash=sha256:da4fa650cef02db88c2b98acc5434461e027dce0ae8c22dd5a69013eaf510006 \
+    --hash=sha256:df027262368334552db2c0ce39706b3fb32022d1dce34673d0f9422df004b96a \
+    --hash=sha256:ebfff755c360d674306e5891c564a274a47953562b42fb74a5c25b8fc1fb1cb5 \
+    --hash=sha256:eca54f4bb349d45afc17e3011ed4264ef1cc9e266699874cdd1349c504e64798 \
+    --hash=sha256:f489c4765093fb60e2edafdf223397bc716491b2b69fe74367b70d6999257a5c \
+    --hash=sha256:fdfac7cda115bca3a5abb2f9e43bc2fb66c2b65ab074913643803ca7083a79ea \
+    --hash=sha256:febec69c0291efd056c65691b6d9a339f8b4bc43c6635b8699471248fe897fea
+PyNaCl==1.6.2 \
+    --hash=sha256:018494d6d696ae03c7e656e5e74cdfd8ea1326962cc401bcf018f1ed8436811c \
+    --hash=sha256:04316d1fc625d860b6c162fff704eb8426b1a8bcd3abacea11142cbd99a6b574 \
+    --hash=sha256:22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4 \
+    --hash=sha256:26bfcd00dcf2cf160f122186af731ae30ab120c18e8375684ec2670dccd28130 \
+    --hash=sha256:2fef529ef3ee487ad8113d287a593fa26f48ee3620d92ecc6f1d09ea38e0709b \
+    --hash=sha256:320ef68a41c87547c91a8b58903c9caa641ab01e8512ce291085b5fe2fcb7590 \
+    --hash=sha256:3bffb6d0f6becacb6526f8f42adfb5efb26337056ee0831fb9a7044d1a964444 \
+    --hash=sha256:44081faff368d6c5553ccf55322ef2819abb40e25afaec7e740f159f74813634 \
+    --hash=sha256:46065496ab748469cdd999246d17e301b2c24ae2fdf739132e580a0e94c94a87 \
+    --hash=sha256:5811c72b473b2f38f7e2a3dc4f8642e3a3e9b5e7317266e4ced1fba85cae41aa \
+    --hash=sha256:622d7b07cc5c02c666795792931b50c91f3ce3c2649762efb1ef0d5684c81594 \
+    --hash=sha256:62985f233210dee6548c223301b6c25440852e13d59a8b81490203c3227c5ba0 \
+    --hash=sha256:68be3a09455743ff9505491220b64440ced8973fe930f270c8e07ccfa25b1f9e \
+    --hash=sha256:834a43af110f743a754448463e8fd61259cd4ab5bbedcf70f9dabad1d28a394c \
+    --hash=sha256:8845c0631c0be43abdd865511c41eab235e0be69c81dc66a50911594198679b0 \
+    --hash=sha256:8a66d6fb6ae7661c58995f9c6435bda2b1e68b54b598a6a10247bfcdadac996c \
+    --hash=sha256:8b097553b380236d51ed11356c953bf8ce36a29a3e596e934ecabe76c985a577 \
+    --hash=sha256:a84bf1c20339d06dc0c85d9aea9637a24f718f375d861b2668b2f9f96fa51145 \
+    --hash=sha256:a9f9932d8d2811ce1a8ffa79dcbdf3970e7355b5c8eb0c1a881a57e7f7d96e88 \
+    --hash=sha256:bc4a36b28dd72fb4845e5d8f9760610588a96d5a51f01d84d8c6ff9849968c14 \
+    --hash=sha256:c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6 \
+    --hash=sha256:c949ea47e4206af7c8f604b8278093b674f7c79ed0d4719cc836902bf4517465 \
+    --hash=sha256:d071c6a9a4c94d79eb665db4ce5cedc537faf74f2355e4d502591d850d3913c0 \
+    --hash=sha256:d29bfe37e20e015a7d8b23cfc8bd6aa7909c92a1b8f41ee416bbb3e79ef182b2 \
+    --hash=sha256:fe9847ca47d287af41e82be1dd5e23023d3c31a951da134121ab02e42ac218c9
+pyteal==0.27.0 \
+    --hash=sha256:d1fa79c6a7a94c82847b13d8f37e03158d0b05e6b361b936644b49d4d150d59e \
+    --hash=sha256:f5630bc4587ed1304102ffba9c8f8a13344d2f3c161504ba2912a781533e48b1
+PyYAML==6.0.3 \
+    --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
+    --hash=sha256:0150219816b6a1fa26fb4699fb7daa9caf09eb1999f3b70fb6e786805e80375a \
+    --hash=sha256:02893d100e99e03eda1c8fd5c441d8c60103fd175728e23e431db1b589cf5ab3 \
+    --hash=sha256:02ea2dfa234451bbb8772601d7b8e426c2bfa197136796224e50e35a78777956 \
+    --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6 \
+    --hash=sha256:10892704fc220243f5305762e276552a0395f7beb4dbf9b14ec8fd43b57f126c \
+    --hash=sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65 \
+    --hash=sha256:1d37d57ad971609cf3c53ba6a7e365e40660e3be0e5175fa9f2365a379d6095a \
+    --hash=sha256:1ebe39cb5fc479422b83de611d14e2c0d3bb2a18bbcb01f229ab3cfbd8fee7a0 \
+    --hash=sha256:214ed4befebe12df36bcc8bc2b64b396ca31be9304b8f59e25c11cf94a4c033b \
+    --hash=sha256:2283a07e2c21a2aa78d9c4442724ec1eb15f5e42a723b99cb3d822d48f5f7ad1 \
+    --hash=sha256:22ba7cfcad58ef3ecddc7ed1db3409af68d023b7f940da23c6c2a1890976eda6 \
+    --hash=sha256:27c0abcb4a5dac13684a37f76e701e054692a9b2d3064b70f5e4eb54810553d7 \
+    --hash=sha256:28c8d926f98f432f88adc23edf2e6d4921ac26fb084b028c733d01868d19007e \
+    --hash=sha256:2e71d11abed7344e42a8849600193d15b6def118602c4c176f748e4583246007 \
+    --hash=sha256:34d5fcd24b8445fadc33f9cf348c1047101756fd760b4dacb5c3e99755703310 \
+    --hash=sha256:37503bfbfc9d2c40b344d06b2199cf0e96e97957ab1c1b546fd4f87e53e5d3e4 \
+    --hash=sha256:3c5677e12444c15717b902a5798264fa7909e41153cdf9ef7ad571b704a63dd9 \
+    --hash=sha256:3ff07ec89bae51176c0549bc4c63aa6202991da2d9a6129d7aef7f1407d3f295 \
+    --hash=sha256:41715c910c881bc081f1e8872880d3c650acf13dfa8214bad49ed4cede7c34ea \
+    --hash=sha256:418cf3f2111bc80e0933b2cd8cd04f286338bb88bdc7bc8e6dd775ebde60b5e0 \
+    --hash=sha256:44edc647873928551a01e7a563d7452ccdebee747728c1080d881d68af7b997e \
+    --hash=sha256:4a2e8cebe2ff6ab7d1050ecd59c25d4c8bd7e6f400f5f82b96557ac0abafd0ac \
+    --hash=sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9 \
+    --hash=sha256:501a031947e3a9025ed4405a168e6ef5ae3126c59f90ce0cd6f2bfc477be31b7 \
+    --hash=sha256:5190d403f121660ce8d1d2c1bb2ef1bd05b5f68533fc5c2ea899bd15f4399b35 \
+    --hash=sha256:5498cd1645aa724a7c71c8f378eb29ebe23da2fc0d7a08071d89469bf1d2defb \
+    --hash=sha256:5cf4e27da7e3fbed4d6c3d8e797387aaad68102272f8f9752883bc32d61cb87b \
+    --hash=sha256:5e0b74767e5f8c593e8c9b5912019159ed0533c70051e9cce3e8b6aa699fcd69 \
+    --hash=sha256:5ed875a24292240029e4483f9d4a4b8a1ae08843b9c54f43fcc11e404532a8a5 \
+    --hash=sha256:5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b \
+    --hash=sha256:5fdec68f91a0c6739b380c83b951e2c72ac0197ace422360e6d5a959d8d97b2c \
+    --hash=sha256:6344df0d5755a2c9a276d4473ae6b90647e216ab4757f8426893b5dd2ac3f369 \
+    --hash=sha256:64386e5e707d03a7e172c0701abfb7e10f0fb753ee1d773128192742712a98fd \
+    --hash=sha256:652cb6edd41e718550aad172851962662ff2681490a8a711af6a4d288dd96824 \
+    --hash=sha256:66291b10affd76d76f54fad28e22e51719ef9ba22b29e1d7d03d6777a9174198 \
+    --hash=sha256:66e1674c3ef6f541c35191caae2d429b967b99e02040f5ba928632d9a7f0f065 \
+    --hash=sha256:6adc77889b628398debc7b65c073bcb99c4a0237b248cacaf3fe8a557563ef6c \
+    --hash=sha256:79005a0d97d5ddabfeeea4cf676af11e647e41d81c9a7722a193022accdb6b7c \
+    --hash=sha256:7c6610def4f163542a622a73fb39f534f8c101d690126992300bf3207eab9764 \
+    --hash=sha256:7f047e29dcae44602496db43be01ad42fc6f1cc0d8cd6c83d342306c32270196 \
+    --hash=sha256:8098f252adfa6c80ab48096053f512f2321f0b998f98150cea9bd23d83e1467b \
+    --hash=sha256:850774a7879607d3a6f50d36d04f00ee69e7fc816450e5f7e58d7f17f1ae5c00 \
+    --hash=sha256:8d1fab6bb153a416f9aeb4b8763bc0f22a5586065f86f7664fc23339fc1c1fac \
+    --hash=sha256:8da9669d359f02c0b91ccc01cac4a67f16afec0dac22c2ad09f46bee0697eba8 \
+    --hash=sha256:8dc52c23056b9ddd46818a57b78404882310fb473d63f17b07d5c40421e47f8e \
+    --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28 \
+    --hash=sha256:93dda82c9c22deb0a405ea4dc5f2d0cda384168e466364dec6255b293923b2f3 \
+    --hash=sha256:96b533f0e99f6579b3d4d4995707cf36df9100d67e0c8303a0c55b27b5f99bc5 \
+    --hash=sha256:9c57bb8c96f6d1808c030b1687b9b5fb476abaa47f0db9c0101f5e9f394e97f4 \
+    --hash=sha256:9c7708761fccb9397fe64bbc0395abcae8c4bf7b0eac081e12b809bf47700d0b \
+    --hash=sha256:9f3bfb4965eb874431221a3ff3fdcddc7e74e3b07799e0e84ca4a0f867d449bf \
+    --hash=sha256:a33284e20b78bd4a18c8c2282d549d10bc8408a2a7ff57653c0cf0b9be0afce5 \
+    --hash=sha256:a80cb027f6b349846a3bf6d73b5e95e782175e52f22108cfa17876aaeff93702 \
+    --hash=sha256:b30236e45cf30d2b8e7b3e85881719e98507abed1011bf463a8fa23e9c3e98a8 \
+    --hash=sha256:b3bc83488de33889877a0f2543ade9f70c67d66d9ebb4ac959502e12de895788 \
+    --hash=sha256:b865addae83924361678b652338317d1bd7e79b1f4596f96b96c77a5a34b34da \
+    --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:bdb2c67c6c1390b63c6ff89f210c8fd09d9a1217a465701eac7316313c915e4c \
+    --hash=sha256:c1ff362665ae507275af2853520967820d9124984e0f7466736aea23d8611fba \
+    --hash=sha256:c2514fceb77bc5e7a2f7adfaa1feb2fb311607c9cb518dbc378688ec73d8292f \
+    --hash=sha256:c3355370a2c156cffb25e876646f149d5d68f5e0a3ce86a5084dd0b64a994917 \
+    --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5 \
+    --hash=sha256:d0eae10f8159e8fdad514efdc92d74fd8d682c933a6dd088030f3834bc8e6b26 \
+    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f \
+    --hash=sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b \
+    --hash=sha256:eda16858a3cab07b80edaf74336ece1f986ba330fdb8ee0d6c0d68fe82bc96be \
+    --hash=sha256:ee2922902c45ae8ccada2c5b501ab86c36525b883eff4255313a253a3160861c \
+    --hash=sha256:efd7b85f94a6f21e4932043973a7ba2613b059c4a000551892ac9f1d11f5baf3 \
+    --hash=sha256:f7057c9a337546edc7973c0d3ba84ddcdf0daa14533c2065749c9075001090e6 \
+    --hash=sha256:fa160448684b4e94d80416c0fa4aac48967a969efe22931448d853ada8baf926 \
+    --hash=sha256:fc09d0aa354569bc501d4e787133afc08552722d3ab34836a80547331bb5d4a0
+scapy==2.7.0 \
+    --hash=sha256:bfc1ef1b93280aea1ddee53be7f74232aa28ac3d891244d41ee85200d24aa446 \
+    --hash=sha256:eb22786da92be6fd8e5c694ae5595e4f5b9ac1f4364c9c45986844f3e3063561
+semantic-version==2.10.0 \
+    --hash=sha256:bdabb6d336998cbb378d4b9db3a4b56a1e3235701dc05ea2690d9a997ed5041c \
+    --hash=sha256:de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177
+tabulate==0.9.0 \
+    --hash=sha256:0095b12bf5966de529c0feb1fa08671671b3368eec77d7ef7ab114be2c068b3c \
+    --hash=sha256:024ca478df22e9340661486f85298cff5f6dcdba14f3813e8830015b9ed1948f
+IG_REQ_VENV
+cat << 'IG_REQ_SYSTEM' > "$IG_REQ_DIR/requirements-system.txt"
+netifaces==0.11.0 \
+    --hash=sha256:043a79146eb2907edf439899f262b3dfe41717d34124298ed281139a8b93ca32 \
+    --hash=sha256:08e3f102a59f9eaef70948340aeb6c89bd09734e0dca0f3b82720305729f63ea \
+    --hash=sha256:0f6133ac02521270d9f7c490f0c8c60638ff4aec8338efeff10a1b51506abe85 \
+    --hash=sha256:18917fbbdcb2d4f897153c5ddbb56b31fa6dd7c3fa9608b7e3c3a663df8206b5 \
+    --hash=sha256:2479bb4bb50968089a7c045f24d120f37026d7e802ec134c4490eae994c729b5 \
+    --hash=sha256:2650beee182fed66617e18474b943e72e52f10a24dc8cac1db36c41ee9c041b7 \
+    --hash=sha256:28f4bf3a1361ab3ed93c5ef360c8b7d4a4ae060176a3529e72e5e4ffc4afd8b0 \
+    --hash=sha256:3ecb3f37c31d5d51d2a4d935cfa81c9bc956687c6f5237021b36d6fdc2815b2c \
+    --hash=sha256:469fc61034f3daf095e02f9f1bbac07927b826c76b745207287bc594884cfd05 \
+    --hash=sha256:48324183af7f1bc44f5f197f3dad54a809ad1ef0c78baee2c88f16a5de02c4c9 \
+    --hash=sha256:50721858c935a76b83dd0dd1ab472cad0a3ef540a1408057624604002fcfb45b \
+    --hash=sha256:54ff6624eb95b8a07e79aa8817288659af174e954cca24cdb0daeeddfc03c4ff \
+    --hash=sha256:5be83986100ed1fdfa78f11ccff9e4757297735ac17391b95e17e74335c2047d \
+    --hash=sha256:5f9ca13babe4d845e400921973f6165a4c2f9f3379c7abfc7478160e25d196a4 \
+    --hash=sha256:73ff21559675150d31deea8f1f8d7e9a9a7e4688732a94d71327082f517fc6b4 \
+    --hash=sha256:7dbb71ea26d304e78ccccf6faccef71bb27ea35e259fb883cfd7fd7b4f17ecb1 \
+    --hash=sha256:815eafdf8b8f2e61370afc6add6194bd5a7252ae44c667e96c4c1ecf418811e4 \
+    --hash=sha256:841aa21110a20dc1621e3dd9f922c64ca64dd1eb213c47267a2c324d823f6c8f \
+    --hash=sha256:84e4d2e6973eccc52778735befc01638498781ce0e39aa2044ccfd2385c03246 \
+    --hash=sha256:8f7da24eab0d4184715d96208b38d373fd15c37b0dafb74756c638bd619ba150 \
+    --hash=sha256:96c0fe9696398253f93482c84814f0e7290eee0bfec11563bd07d80d701280c3 \
+    --hash=sha256:aab1dbfdc55086c789f0eb37affccf47b895b98d490738b81f3b2360100426be \
+    --hash=sha256:c03fb2d4ef4e393f2e6ffc6376410a22a3544f164b336b3a355226653e5efd89 \
+    --hash=sha256:c37a1ca83825bc6f54dddf5277e9c65dec2f1b4d0ba44b8fd42bc30c91aa6ea1 \
+    --hash=sha256:c92ff9ac7c2282009fe0dcb67ee3cd17978cffbe0c8f4b471c00fe4325c9b4d4 \
+    --hash=sha256:c9a3a47cd3aaeb71e93e681d9816c56406ed755b9442e981b07e3618fb71d2ac \
+    --hash=sha256:cb925e1ca024d6f9b4f9b01d83215fd00fe69d095d0255ff3f64bffda74025c8 \
+    --hash=sha256:d07b01c51b0b6ceb0f09fc48ec58debd99d2c8430b09e56651addeaf5de48048 \
+    --hash=sha256:e76c7f351e0444721e85f975ae92718e21c1f361bda946d60a214061de1f00a1 \
+    --hash=sha256:eb4813b77d5df99903af4757ce980a98c4d702bbcb81f32a0b305a1537bdf0b1
+PyYAML==6.0.1 \
+    --hash=sha256:04ac92ad1925b2cff1db0cfebffb6ffc43457495c9b3c39d3fcae417d7125dc5 \
+    --hash=sha256:062582fca9fabdd2c8b54a3ef1c978d786e0f6b3a1510e0ac93ef59e0ddae2bc \
+    --hash=sha256:0d3304d8c0adc42be59c5f8a4d9e3d7379e6955ad754aa9d6ab7a398b59dd1df \
+    --hash=sha256:1635fd110e8d85d55237ab316b5b011de701ea0f29d07611174a1b42f1444741 \
+    --hash=sha256:184c5108a2aca3c5b3d3bf9395d50893a7ab82a38004c8f61c258d4428e80206 \
+    --hash=sha256:18aeb1bf9a78867dc38b259769503436b7c72f7a1f1f4c93ff9a17de54319b27 \
+    --hash=sha256:1d4c7e777c441b20e32f52bd377e0c409713e8bb1386e1099c2415f26e479595 \
+    --hash=sha256:1e2722cc9fbb45d9b87631ac70924c11d3a401b2d7f410cc0e3bbf249f2dca62 \
+    --hash=sha256:1fe35611261b29bd1de0070f0b2f47cb6ff71fa6595c077e42bd0c419fa27b98 \
+    --hash=sha256:28c119d996beec18c05208a8bd78cbe4007878c6dd15091efb73a30e90539696 \
+    --hash=sha256:326c013efe8048858a6d312ddd31d56e468118ad4cdeda36c719bf5bb6192290 \
+    --hash=sha256:40df9b996c2b73138957fe23a16a4f0ba614f4c0efce1e9406a184b6d07fa3a9 \
+    --hash=sha256:42f8152b8dbc4fe7d96729ec2b99c7097d656dc1213a3229ca5383f973a5ed6d \
+    --hash=sha256:49a183be227561de579b4a36efbb21b3eab9651dd81b1858589f796549873dd6 \
+    --hash=sha256:4fb147e7a67ef577a588a0e2c17b6db51dda102c71de36f8549b6816a96e1867 \
+    --hash=sha256:50550eb667afee136e9a77d6dc71ae76a44df8b3e51e41b77f6de2932bfe0f47 \
+    --hash=sha256:510c9deebc5c0225e8c96813043e62b680ba2f9c50a08d3724c7f28a747d1486 \
+    --hash=sha256:5773183b6446b2c99bb77e77595dd486303b4faab2b086e7b17bc6bef28865f6 \
+    --hash=sha256:596106435fa6ad000c2991a98fa58eeb8656ef2325d7e158344fb33864ed87e3 \
+    --hash=sha256:6965a7bc3cf88e5a1c3bd2e0b5c22f8d677dc88a455344035f03399034eb3007 \
+    --hash=sha256:69b023b2b4daa7548bcfbd4aa3da05b3a74b772db9e23b982788168117739938 \
+    --hash=sha256:6c22bec3fbe2524cde73d7ada88f6566758a8f7227bfbf93a408a9d86bcc12a0 \
+    --hash=sha256:704219a11b772aea0d8ecd7058d0082713c3562b4e271b849ad7dc4a5c90c13c \
+    --hash=sha256:7e07cbde391ba96ab58e532ff4803f79c4129397514e1413a7dc761ccd755735 \
+    --hash=sha256:81e0b275a9ecc9c0c0c07b4b90ba548307583c125f54d5b6946cfee6360c733d \
+    --hash=sha256:855fb52b0dc35af121542a76b9a84f8d1cd886ea97c84703eaa6d88e37a2ad28 \
+    --hash=sha256:8d4e9c88387b0f5c7d5f281e55304de64cf7f9c0021a3525bd3b1c542da3b0e4 \
+    --hash=sha256:9046c58c4395dff28dd494285c82ba00b546adfc7ef001486fbf0324bc174fba \
+    --hash=sha256:9eb6caa9a297fc2c2fb8862bc5370d0303ddba53ba97e71f08023b6cd73d16a8 \
+    --hash=sha256:a08c6f0fe150303c1c6b71ebcd7213c2858041a7e01975da3a99aed1e7a378ef \
+    --hash=sha256:a0cd17c15d3bb3fa06978b4e8958dcdc6e0174ccea823003a106c7d4d7899ac5 \
+    --hash=sha256:afd7e57eddb1a54f0f1a974bc4391af8bcce0b444685d936840f125cf046d5bd \
+    --hash=sha256:b1275ad35a5d18c62a7220633c913e1b42d44b46ee12554e5fd39c70a243d6a3 \
+    --hash=sha256:b786eecbdf8499b9ca1d697215862083bd6d2a99965554781d0d8d1ad31e13a0 \
+    --hash=sha256:ba336e390cd8e4d1739f42dfe9bb83a3cc2e80f567d8805e11b46f4a943f5515 \
+    --hash=sha256:baa90d3f661d43131ca170712d903e6295d1f7a0f595074f151c0aed377c9b9c \
+    --hash=sha256:bc1bf2925a1ecd43da378f4db9e4f799775d6367bdb94671027b73b393a7c42c \
+    --hash=sha256:bd4af7373a854424dabd882decdc5579653d7868b8fb26dc7d0e99f823aa5924 \
+    --hash=sha256:bf07ee2fef7014951eeb99f56f39c9bb4af143d8aa3c21b1677805985307da34 \
+    --hash=sha256:bfdf460b1736c775f2ba9f6a92bca30bc2095067b8a9d77876d1fad6cc3b4a43 \
+    --hash=sha256:c8098ddcc2a85b61647b2590f825f3db38891662cfc2fc776415143f599bb859 \
+    --hash=sha256:d2b04aac4d386b172d5b9692e2d2da8de7bfb6c387fa4f801fbf6fb2e6ba4673 \
+    --hash=sha256:d483d2cdf104e7c9fa60c544d92981f12ad66a457afae824d146093b8c294c54 \
+    --hash=sha256:d858aa552c999bc8a8d57426ed01e40bef403cd8ccdd0fc5f6f04a00414cac2a \
+    --hash=sha256:e7d73685e87afe9f3b36c799222440d6cf362062f78be1013661b00c5c6f678b \
+    --hash=sha256:f003ed9ad21d6a4713f0a9b5a7a0a79e08dd0f221aff4525a2be4c346ee60aab \
+    --hash=sha256:f22ac1c3cac4dbc50079e965eba2c1058622631e526bd9afd45fedd49ba781fa \
+    --hash=sha256:faca3bdcf85b2fc05d06ff3fbc1f83e1391b3e724afa3feba7d13eeab355484c \
+    --hash=sha256:fca0e3a251908a499833aa292323f32437106001d436eca0e6e7833256674585 \
+    --hash=sha256:fd1592b3fdf65fff2ad0004b5e363300ef59ced41c2e6b3a99d4089fa8c5435d \
+    --hash=sha256:fd66fc5d0da6d9815ba2cebeb4205f95818ff4b79c3ebe268e75d961704af52f
+scapy==2.7.0 \
+    --hash=sha256:bfc1ef1b93280aea1ddee53be7f74232aa28ac3d891244d41ee85200d24aa446 \
+    --hash=sha256:eb22786da92be6fd8e5c694ae5595e4f5b9ac1f4364c9c45986844f3e3063561
+IG_REQ_SYSTEM
 # Core dependencies
-/opt/irongate/venv/bin/pip install --quiet pyyaml scapy netifaces 2>/dev/null || \
-    pip3 install --quiet --break-system-packages pyyaml scapy netifaces 2>/dev/null || true
+/opt/irongate/venv/bin/pip install --quiet --require-hashes -r "$IG_REQ_DIR/requirements-venv.txt" 2>/dev/null || \
+    pip3 install --quiet --break-system-packages --require-hashes -r "$IG_REQ_DIR/requirements-system.txt" 2>/dev/null || true
 
 # Fallback install with break-system-packages
-pip3 install --quiet --break-system-packages pyyaml scapy netifaces 2>/dev/null || true
+pip3 install --quiet --break-system-packages --require-hashes -r "$IG_REQ_DIR/requirements-system.txt" 2>/dev/null || true
+rm -rf "${IG_REQ_DIR:?}"
 
 # Create Irongate main script
 cat > /opt/irongate/irongate.py << 'IRONGATEPY'
@@ -9446,6 +10016,10 @@ fi
 
 # Staged in a root-only directory and renamed into place at the end (see the helpers above):
 # nothing below opens, chmods or chowns /etc/irongate/config.yaml by path.
+# config.yaml is generated ONLY when there is none: no file, a link or special file that is moved aside, or an EMPTY
+# file (the placeholder the permissions block above creates). Any non-empty config.yaml - what the dashboard saved
+# or the operator wrote - is left exactly as it is: not rewritten, not chowned, not chmod'ed.
+if ! ig_etc_check config.yaml || [ ! -s /etc/irongate/config.yaml ]; then
 ig_stage
 cat > /etc/.irongate-stage/config.yaml << EOF
 # Irongate Configuration
@@ -9507,15 +10081,22 @@ if [ -z "$DEVICES_YAML" ]; then
     sed -i 's/^devices:$/devices: []/' /etc/.irongate-stage/config.yaml
 fi
 
-# Set permissions so www-data can update config from web UI, then put the file in place.
-# A symlink or special file that was planted at /etc/irongate/config.yaml is moved aside,
-# never followed.
+# A new config.yaml is root:www-data 0640. Put the file in place: a symlink or special file that was
+# planted at /etc/irongate/config.yaml is moved aside, never followed.
 ig_etc_check config.yaml || true
-ig_etc_commit config.yaml 664
+ig_etc_commit config.yaml 640
 rmdir "$IG_STAGE" 2>/dev/null || true
+fi
 
 chown -R root:root /opt/irongate
-chmod -R 755 /opt/irongate
+# `chmod -R 755` used to give EVERY file below /opt/irongate world read and execute: the updater's 0700 staging directory
+# and the installer in it, a 0600 backup, everything. Now nothing is made more open than it is: /opt/irongate itself is
+# 0755, every directory and regular file below it loses only group/other WRITE, and the files this installer wrote that
+# must be executable were made executable where they were written. /opt/irongate/audit-bak (root's backups of old
+# configuration, which can hold key material) is not entered by the mode pass at all. (The ownership line above is the
+# end marker of a block that tests/test_installer_links.sh cuts out by that exact text; it only ever gives root:root.)
+chmod 755 /opt/irongate
+find /opt/irongate -path /opt/irongate/audit-bak -prune -o \( -type d -o -type f \) -exec chmod go-w {} +
 
 systemctl daemon-reload
 systemctl enable irongate 2>/dev/null || true
@@ -9572,6 +10153,21 @@ LOG_FILE="/var/log/irongate-update.log"
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
+
+# One update at a time (the daily timer, the dashboard's "Update now" and an operator can all start this script): the
+# second one logs it and exits non-zero. The lock is held on fd 9 until this process exits (the installer it runs gets
+# fd 9 closed, so nothing it leaves running can keep the lock).
+LOCK_FILE="/run/irongate-updater.lock"
+# The lock file is created root-only (0600) by opening it under a restricted umask; an existing lock file keeps its
+# mode. fd 9 must stay open in THIS shell, so the umask applies only in a subshell that touches the creation.
+if ! { ( umask 077; : >>"$LOCK_FILE" ) && exec 9>>"$LOCK_FILE"; } 2>/dev/null; then
+    log "ERROR: cannot open lock file $LOCK_FILE - refusing to update"
+    exit 1
+fi
+if ! flock -n 9; then
+    log "another update is running (lock $LOCK_FILE is held) - exiting"
+    exit 1
+fi
 
 # Load and validate the pin file. Sets PINNED_COMMIT and PINNED_INSTALLER_SHA256,
 # or returns 1 after logging why. The file is opened once and that open file is
@@ -9641,6 +10237,13 @@ log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 # Update last check time
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
+# --force re-runs nothing that is already installed: at the pinned commit it is a logged no-op (nothing is downloaded)
+if [ "$FORCE" -eq 1 ] && [ "$CURRENT_COMMIT" = "$TARGET_COMMIT" ]; then
+    log "--force: installed == pin ($TARGET_COMMIT), nothing to do - not downloading"
+    log "Update check finished"
+    exit 0
+fi
+
 # Compare commits
 if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
     log "Update available! Downloading..."
@@ -9656,7 +10259,7 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     # Fetch the pinned commit, never the moving main ref.
     SRC_URL="$REPO_RAW_BASE/$TARGET_SHA/irongate-install.sh"
     log "Downloading $SRC_URL"
-    curl -sf -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
+    curl -sf --max-time 60 -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
 
     if [ ! -s "$SCRIPT_PATH" ]; then
         log "ERROR: downloaded installer is missing or empty - aborting"
@@ -9689,13 +10292,38 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     # installed_commit is stamped only AFTER the installer has exited 0 (below). Stamping it first made a
     # failed installer look installed: the next scheduled run said "Already up to date" and never retried.
     chmod 700 "$SCRIPT_PATH"
-    log "Running installer..."
-    bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
-    INSTALL_RC=$?
-    if [ "$INSTALL_RC" -ne 0 ]; then
-        log "ERROR: installer exited with status $INSTALL_RC"
+
+    # The installer rewrites the configuration directory (the pin file's directory). Before it runs, that directory is
+    # snapshotted, owners and modes included, to a root-only tarball next to the staged installer (0600, root:root);
+    # if the installer fails, the directory is put back from it (it holds what the dashboard saved, the login and the
+    # access list).
+    CONF_DIR="${PIN_FILE%/*}"
+    SNAPSHOT="$STAGE_DIR/conf-snapshot.tar"
+    rm -f "$SNAPSHOT"
+    if ! ( umask 077; tar -C "$CONF_DIR" --numeric-owner -cpf "$SNAPSHOT" . ) 2>/dev/null; then
+        log "ERROR: cannot snapshot $CONF_DIR - not running the installer"
+        rm -f "$SNAPSHOT"
         exit 1
     fi
+    chown root:root "$SNAPSHOT" && chmod 600 "$SNAPSHOT"
+    log "Snapshot of $CONF_DIR taken (root:root 0600)"
+
+    log "Running installer..."
+    bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1 9>&-
+    INSTALL_RC=$?
+    if [ "$INSTALL_RC" -ne 0 ]; then
+        if tar -C "$CONF_DIR" --same-owner -p --numeric-owner -xf "$SNAPSHOT" 2>/dev/null; then
+            RESTORE_MSG="$CONF_DIR restored from the snapshot taken before the installer ran (extracted over the directory; entries the failed run created are left in place)"
+            rm -f "$SNAPSHOT"
+        else
+            RESTORE_MSG="ERROR: restoring $CONF_DIR from $SNAPSHOT failed - the snapshot is kept"
+        fi
+        log "ERROR: installer exited with status $INSTALL_RC"
+        log "$RESTORE_MSG"
+        exit 1
+    fi
+    rm -f "$SNAPSHOT"
+    log "Installer succeeded - snapshot removed"
     # The installer stamps installed_commit with the moving main HEAD; restore
     # the pinned commit so the next scheduled run does not reinstall.
     sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
@@ -9728,6 +10356,20 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# The dashboard's "Update now" starts this unit (sudo systemctl start --no-block, see the dnsmasq-web sudoers rule): a
+# system unit has its own cgroup, so the update is not a child of php-fpm and survives the php-fpm restart that the
+# installer does. It is never enabled or started at boot (no [Install] section).
+cat > /etc/systemd/system/irongate-updater-now.service << EOF
+[Unit]
+Description=Irongate Auto-Updater (web-triggered)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/irongate/irongate-updater.sh --force
+StandardOutput=journal
+StandardError=journal
 EOF
 
 # Create systemd timer for daily auto-updates
@@ -9876,12 +10518,17 @@ server {
 }
 EOF
 
-# CRITICAL: Remove ALL other sites and ensure only IronGate is enabled
-rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+# On the FIRST install (decided once at the top) remove ALL other sites so that only IronGate is enabled;
+# on a re-run the other sites of the operator are left alone
+if [ "${IG_NGINX_FIRST_INSTALL:-0}" = 1 ]; then
+    rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+fi
 ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
 
-# Also remove the default site config entirely to prevent it from ever coming back
-rm -f /etc/nginx/sites-available/default 2>/dev/null || true
+# Also remove the default site config entirely to prevent it from ever coming back (first install only)
+if [ "${IG_NGINX_FIRST_INSTALL:-0}" = 1 ]; then
+    rm -f /etc/nginx/sites-available/default 2>/dev/null || true
+fi
 
 # Verify the symlink exists
 if [ ! -L /etc/nginx/sites-enabled/irongate ]; then
@@ -9999,6 +10646,15 @@ WEBAUTH_INIT_PASSWORD=""
 if ! ig_etc_check auth.json; then
     WEBAUTH_INIT_PASSWORD=$(php -r "echo bin2hex(random_bytes(10));")
     WEBAUTH_HASH=$(WEBAUTH_PW="$WEBAUTH_INIT_PASSWORD" php -r 'echo password_hash(getenv("WEBAUTH_PW"), PASSWORD_BCRYPT);')
+    # The generated password is never printed: this installer's output is appended to the update log, which the
+    # dashboard serves. It goes to a root-only file instead (created 0600 by umask and noclobber, so it is never
+    # readable by anyone else, not even for an instant). This is done BEFORE auth.json is put in place, so that a
+    # failure here stops the installer while there is still no login whose password nobody knows.
+    IG_ADMIN_PW_FILE=/root/irongate-initial-admin-password
+    rm -f -- "$IG_ADMIN_PW_FILE"
+    ( umask 077; set -C; printf '%s\n' "$WEBAUTH_INIT_PASSWORD" > "$IG_ADMIN_PW_FILE" )
+    chown root:root "$IG_ADMIN_PW_FILE"
+    chmod 600 "$IG_ADMIN_PW_FILE"
     cat > /etc/.irongate-stage/auth.json << WEBAUTH_AUTHEOF
 {
     "username": "admin",
@@ -10010,10 +10666,11 @@ if ! ig_etc_check auth.json; then
     "locked_until": 0
 }
 WEBAUTH_AUTHEOF
-    ig_etc_commit auth.json 660
-    echo -e "${GREEN}  ✓ Created auth.json (credentials printed at end)${NC}"
+    ig_etc_commit auth.json 640
+    echo -e "${GREEN}  ✓ Created auth.json (initial password written to ${IG_ADMIN_PW_FILE}, root only)${NC}"
 else
-    ig_etc_fix auth.json 660 || { echo -e "${RED}ERROR: cannot set owner/mode of auth.json safely${NC}"; exit 1; }
+    # an existing auth.json keeps its mode (it is created 0640; the owner is root:www-data as for every file here)
+    ig_etc_fix auth.json keep || { echo -e "${RED}ERROR: cannot set owner of auth.json safely${NC}"; exit 1; }
     echo -e "${GREEN}  ✓ Existing auth.json preserved (credentials unchanged)${NC}"
 fi
 rmdir "$IG_STAGE" 2>/dev/null || true
@@ -10071,7 +10728,7 @@ systemctl restart nginx
 # CRITICAL: Verify web UI is working, fix if not
 echo -e "${YELLOW}Verifying web UI...${NC}"
 sleep 2
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
 
 if [ "$HTTP_CODE" != "200" ]; then
     echo -e "${RED}Web UI not responding (HTTP $HTTP_CODE), attempting fix...${NC}"
@@ -10088,7 +10745,7 @@ if [ "$HTTP_CODE" != "200" ]; then
         systemctl restart php${FIX_PHP_VER}-fpm
         systemctl restart nginx
         sleep 2
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
+        HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1/health 2>/dev/null || echo "000")
     fi
 fi
 
@@ -10230,7 +10887,7 @@ if [ -n "$WEBAUTH_INIT_PASSWORD" ]; then
     echo -e "${CYAN}=============================================${NC}"
     echo -e "${CYAN}WEBUI INITIAL CREDENTIALS (change after first login):${NC}"
     echo -e "  Username: ${BOLD}admin${NC}"
-    echo -e "  Password: ${BOLD}${WEBAUTH_INIT_PASSWORD}${NC}"
+    echo -e "  Password: in ${BOLD}${IG_ADMIN_PW_FILE}${NC} (root only; not printed)"
     echo -e "${CYAN}=============================================${NC}"
 fi
 

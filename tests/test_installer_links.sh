@@ -243,19 +243,19 @@ check "F-A the swap is not silently ignored: the real directory was chowned, or 
 CFG=/etc/irongate/config.yaml
 fresh; victim; ln -s "$V/target" $CFG; run B
 check "B symlink config.yaml -> root file: target untouched" $([ "$(vstate)" = "$VICTIM_OK" ]; echo $?) "victim now $(vstate)"
-check "B symlink config.yaml: replaced by a regular root:www-data 0664 file" $([ "$(st $CFG)" = "0:33:664:regular file" ]; echo $?) "config.yaml now $(st $CFG)"
+check "B symlink config.yaml: replaced by a regular root:www-data 0640 file" $([ "$(st $CFG)" = "0:33:640:regular file" ]; echo $?) "config.yaml now $(st $CFG)"  # corrected per item E (I:6765)
 check "B symlink config.yaml: the planted link is kept aside, still pointing at the target (evidence)" $([ "$(ls /etc/irongate | grep -c '^config.yaml.refused\.')" = 1 ] && [ "$(readlink /etc/irongate/config.yaml.refused.* 2>/dev/null)" = "$V/target" ]; echo $?) "ls: $(ls /etc/irongate | tr '\n' ' ')"
 check "B symlink config.yaml: installer block still exits 0" $([ $RC -eq 0 ]; echo $?) "rc=$RC $(tail -3 $T/run.out)"
 
 fresh; ln -s "$V/created-by-touch" $CFG; run B
 check "B dangling symlink config.yaml: the target is not created" $([ ! -e "$V/created-by-touch" ] && [ ! -L "$V/created-by-touch" ]; echo $?) "target now $(st $V/created-by-touch)"
-check "B dangling symlink config.yaml: a regular file takes its place" $([ "$(st $CFG)" = "0:33:664:regular file" ]; echo $?) "config.yaml now $(st $CFG)"
+check "B dangling symlink config.yaml: a regular 0640 file takes its place" $([ "$(st $CFG)" = "0:33:640:regular file" ]; echo $?) "config.yaml now $(st $CFG)"  # corrected per item E (I:6765)
 
 fresh; mkdir "$V/dir"; echo keep > "$V/dir/f"; chown 77:77 "$V/dir" "$V/dir/f"; ln -s "$V/dir" $CFG; run B
 check "B symlink config.yaml -> directory: directory and its content untouched" $([ "$(st $V/dir)" = "77:77:755:directory" ] && [ "$(st $V/dir/f)" = "77:77:644:regular file" ]; echo $?) "dir $(st $V/dir) f $(st $V/dir/f)"
 
 fresh; mkdir $CFG; echo x > $CFG/inner; run B
-check "B directory at config.yaml: moved aside, regular file in its place" $([ "$(st $CFG)" = "0:33:664:regular file" ] && [ "$(ls /etc/irongate | grep -c '^config.yaml.refused\.')" = 1 ]; echo $?) "config.yaml $(st $CFG) ls: $(ls /etc/irongate | tr '\n' ' ')"
+check "B directory at config.yaml: moved aside, regular 0640 file in its place" $([ "$(st $CFG)" = "0:33:640:regular file" ] && [ "$(ls /etc/irongate | grep -c '^config.yaml.refused\.')" = 1 ]; echo $?) "config.yaml $(st $CFG) ls: $(ls /etc/irongate | tr '\n' ' ')"  # corrected per item E (I:6765)
 
 fresh; victim; echo "genuine config" > $CFG; chown 33:33 $CFG; chmod 666 $CFG
 export IG_SWAP_FILE=config.yaml; SWAP=1 run B; unset IG_SWAP_FILE
@@ -271,24 +271,25 @@ fi
 
 # genuine file: unchanged content, root:www-data 0664
 fresh; echo "genuine config" > $CFG; chown 33:33 $CFG; chmod 666 $CFG; ino=$(stat -c %i $CFG); run B
-check "B genuine config.yaml: content kept, becomes root:www-data 0664, no staging directory left" $([ "$(st $CFG)" = "0:33:664:regular file" ] && [ "$(cat $CFG)" = "genuine config" ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) $(cat $CFG) stage=$(ls -d /etc/.irongate-stage 2>&1)"
+check "B genuine config.yaml: content kept, every other bit removed (0666 -> 0660), root:www-data, no staging directory left" $([ "$(st $CFG)" = "0:33:660:regular file" ] && [ "$(cat $CFG)" = "genuine config" ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) $(cat $CFG) stage=$(ls -d /etc/.irongate-stage 2>&1)"  # corrected per item E (I:6765)
 fresh; run B
-check "B no config.yaml: an empty root:www-data 0664 file is created, no staging directory left" $([ "$(st $CFG)" = "0:33:664:regular file" ] && [ ! -s $CFG ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) stage=$(ls -d /etc/.irongate-stage 2>&1)"
+check "B no config.yaml: an empty root:www-data 0640 file is created, no staging directory left" $([ "$(st $CFG)" = "0:33:640:regular file" ] && [ ! -s $CFG ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) stage=$(ls -d /etc/.irongate-stage 2>&1)"  # corrected per item E (I:6765)
 
 # ======================= OOS-1, block C: config.yaml generation =======================
 fresh; victim; ln -s "$V/target" $CFG; run C
 check "C symlink config.yaml -> root file: target not overwritten, not chowned/chmodded" $([ "$(vstate)" = "$VICTIM_OK" ]; echo $?) "victim now $(vstate)"
-check "C symlink config.yaml: a regular file with the generated config is written instead" $([ "$(st $CFG)" = "0:33:664:regular file" ] && grep -q '^# Irongate Configuration$' $CFG && grep -q '^devices: \[\]$' $CFG; echo $?) "config.yaml $(st $CFG) rc=$RC"
+check "C symlink config.yaml: a regular 0640 file with the generated config is written instead" $([ "$(st $CFG)" = "0:33:640:regular file" ] && grep -q '^# Irongate Configuration$' $CFG && grep -q '^devices: \[\]$' $CFG; echo $?) "config.yaml $(st $CFG) rc=$RC"  # corrected per item E (I:9450-9514)
 fresh; ln -s "$V/created-by-cat" $CFG; run C
 check "C dangling symlink config.yaml: the target is not created" $([ ! -e "$V/created-by-cat" ] && [ ! -L "$V/created-by-cat" ]; echo $?) "target now $(st $V/created-by-cat)"
 fresh; mkfifo $CFG; run C
-check "C FIFO at config.yaml: no hang (60 s timeout = hang), replaced by a regular file" $([ $RC -ne 124 ] && [ "$(st $CFG)" = "0:33:664:regular file" ]; echo $?) "rc=$RC config.yaml $(st $CFG)"
-fresh; victim; echo "old config" > $CFG; chown 33:33 $CFG; chmod 600 $CFG
+check "C FIFO at config.yaml: no hang (60 s timeout = hang), replaced by a regular 0640 file" $([ $RC -ne 124 ] && [ "$(st $CFG)" = "0:33:640:regular file" ]; echo $?) "rc=$RC config.yaml $(st $CFG)"  # corrected per item E (I:9450-9514)
+fresh; victim; : > $CFG; chown 33:33 $CFG; chmod 600 $CFG   # corrected per item E (I:9450-9514): the regenerated file is the empty placeholder, a non-empty config.yaml is never rewritten
 export IG_SWAP_FILE=config.yaml; SWAP=1 run C; unset IG_SWAP_FILE
-check "C race: config.yaml swapped for a symlink during the installer's own chown/chmod (shim fired)" $([ -e /tmp/ig-swapped ]; echo $?) "shim did not fire (rc=$RC)"
+check "C race: config.yaml swapped for a symlink during the installer's own chown/chmod of the regenerated empty config.yaml (shim fired)" $([ -e /tmp/ig-swapped ]; echo $?) "shim did not fire (rc=$RC)"  # corrected per item E (I:9450-9514)
 check "C race: target of the swapped-in symlink untouched" $([ "$(vstate)" = "$VICTIM_OK" ]; echo $?) "victim now $(vstate)"
 fresh; echo "old config" > $CFG; chown 33:33 $CFG; chmod 600 $CFG; run C
-check "C genuine config.yaml: regenerated, root:www-data 0664, nothing stray left in /etc/irongate or /etc" $([ "$(st $CFG)" = "0:33:664:regular file" ] && ! grep -q 'old config' $CFG && [ "$(ls -A /etc/irongate)" = "config.yaml" ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) ls: $(ls -A /etc/irongate | tr '\n' ' ')"
+check "C genuine config.yaml: preserved byte for byte with its owner and mode (33:33 0600), nothing stray left in /etc/irongate or /etc" $([ "$(st $CFG)" = "33:33:600:regular file" ] && printf 'old config\n' | cmp -s - $CFG && [ "$(ls -A /etc/irongate)" = "config.yaml" ] && [ ! -e /etc/.irongate-stage ]; echo $?) "now $(st $CFG) ls: $(ls -A /etc/irongate | tr '\n' ' ')"  # corrected per item E (I:9450-9514)
+fresh; run C   # corrected per item E (I:9450-9514): setup, the completeness check below needs a freshly generated config.yaml (an existing one is no longer regenerated)
 check "C the generated config is complete (header, layers, blockchain, devices)" $(grep -q '^mode: "single"$' $CFG && grep -q '^  interface: "eth0"$' $CFG && grep -q '^layers:$' $CFG && grep -q '^blockchain:$' $CFG && grep -q '^  fallback_allow: true$' $CFG; echo $?) "$(head -5 $CFG)"
 
 # ======================= OOS-1, block D: access-control.json / auth.json =======================
@@ -297,13 +298,13 @@ for f in $ACL $AUTH; do
     n=$(basename $f)
     fresh; victim; ln -s "$V/target" $f; run D
     check "D symlink $n -> root file: target untouched" $([ "$(vstate)" = "$VICTIM_OK" ]; echo $?) "victim now $(vstate)"
-    check "D symlink $n: replaced by a fresh regular root:www-data 0660 file" $([ "$(st $f)" = "0:33:660:regular file" ] && grep -q '^{$' $f; echo $?) "$n now $(st $f) rc=$RC"
+    check "D symlink $n: replaced by a fresh regular root:www-data file (access-control.json 0660, auth.json 0640)" $([ "$(st $f)" = "0:33:$([ $n = auth.json ] && echo 640 || echo 660):regular file" ] && grep -q '^{$' $f; echo $?) "$n now $(st $f) rc=$RC"  # corrected per item E (I:10013, I:10016)
     fresh; ln -s "$V/created-by-cat" $f; run D
     check "D dangling symlink $n: the target is not created" $([ ! -e "$V/created-by-cat" ] && [ ! -L "$V/created-by-cat" ]; echo $?) "target now $(st $V/created-by-cat)"
     fresh; mkfifo $f; run D
-    check "D FIFO at $n: no hang, replaced by a regular file" $([ $RC -ne 124 ] && [ "$(st $f)" = "0:33:660:regular file" ]; echo $?) "rc=$RC $n $(st $f)"
+    check "D FIFO at $n: no hang, replaced by a regular file (access-control.json 0660, auth.json 0640)" $([ $RC -ne 124 ] && [ "$(st $f)" = "0:33:$([ $n = auth.json ] && echo 640 || echo 660):regular file" ]; echo $?) "rc=$RC $n $(st $f)"  # corrected per item E (I:10013, I:10016)
     fresh; mkdir $f; echo x > $f/inner; run D
-    check "D directory at $n: moved aside, regular file in its place" $([ "$(st $f)" = "0:33:660:regular file" ] && [ "$(ls /etc/irongate | grep -c "^$n.refused\.")" = 1 ]; echo $?) "$n $(st $f) rc=$RC"
+    check "D directory at $n: moved aside, regular file in its place (access-control.json 0660, auth.json 0640)" $([ "$(st $f)" = "0:33:$([ $n = auth.json ] && echo 640 || echo 660):regular file" ] && [ "$(ls /etc/irongate | grep -c "^$n.refused\.")" = 1 ]; echo $?) "$n $(st $f) rc=$RC"  # corrected per item E (I:10013, I:10016)
     # race on the PRESERVED genuine file: chown/chmod must not be redirected by a swap
     fresh; victim; echo '{"genuine":true}' > $f; chown 33:33 $f; chmod 600 $f
     export IG_SWAP_FILE=$n; SWAP=1 run D; unset IG_SWAP_FILE
@@ -317,9 +318,9 @@ for f in $ACL $AUTH; do
     fi
     # genuine preserved file
     fresh; echo '{"genuine":true}' > $f; chown 33:33 $f; chmod 600 $f; run D
-    check "D genuine $n is preserved byte for byte and becomes root:www-data 0660" $([ "$(st $f)" = "0:33:660:regular file" ] && [ "$(cat $f)" = '{"genuine":true}' ]; echo $?) "$n now $(st $f): $(cat $f)"
+    check "D genuine $n is preserved byte for byte and is root:www-data (access-control.json becomes 0660, auth.json keeps its mode 0600)" $([ "$(st $f)" = "0:33:$([ $n = auth.json ] && echo 600 || echo 660):regular file" ] && [ "$(cat $f)" = '{"genuine":true}' ]; echo $?) "$n now $(st $f): $(cat $f)"  # corrected per item E (I:10013, I:10016)
     fresh; run D
-    check "D no $n: created root:www-data 0660" $([ "$(st $f)" = "0:33:660:regular file" ]; echo $?) "$n now $(st $f)"
+    check "D no $n: created root:www-data (access-control.json 0660, auth.json 0640)" $([ "$(st $f)" = "0:33:$([ $n = auth.json ] && echo 640 || echo 660):regular file" ]; echo $?) "$n now $(st $f)"  # corrected per item E (I:10013, I:10016)
 done
 fresh; ADMIN_LAN_IP=192.168.1.77 run D
 check "D fresh install: access-control.json lists loopback, tailnet and the admin LAN IP" $(grep -q '"127.0.0.1"' $ACL && grep -q '"100.64.0.0/10"' $ACL && grep -q '"192.168.1.77"' $ACL && grep -q '"enabled": true' $ACL; echo $?) "$(cat $ACL)"
@@ -342,7 +343,7 @@ runp() {   # $1 = caller PATH, $2... = segments, sourced in order after the PATH
 check "R3-1 the installer pins an absolute PATH at its top (segment found)" $([ "$HAVE_PATHSEG" = 1 ]; echo $?) "no '# ---- installer PATH: begin ----' block in the installer"
 for CALLERPATH in ".:/usr/local/bin:/usr/bin:/bin" ":/usr/local/bin:/usr/bin:/bin" "/usr/bin::/bin" "/usr/bin:/bin:" "bin:/usr/bin:/bin" "relative/dir:/usr/bin:/bin"; do
     fresh; runp "$CALLERPATH" "$T/H.sh" "$T/B.sh"
-    check "R3-1 caller PATH='$CALLERPATH': block B (find -execdir) still completes" $([ $RC -eq 0 ] && [ "$(st /etc/irongate/config.yaml)" = "0:33:664:regular file" ]; echo $?) "rc=$RC $(tail -2 $T/run.out | cut -c1-200)"
+    check "R3-1 caller PATH='$CALLERPATH': block B (find -execdir) still completes" $([ $RC -eq 0 ] && [ "$(st /etc/irongate/config.yaml)" = "0:33:640:regular file" ]; echo $?) "rc=$RC $(tail -2 $T/run.out | cut -c1-200)"  # corrected per item E (I:6765)
 done
 fresh; got=$(env PATH=".:/x:" "$BASH" -c ". $T/P.sh; printf '%s' \"\$PATH\"")
 check "R3-1 after the PATH segment PATH is exactly the fixed absolute list" $([ "$got" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ]; echo $?) "PATH=$got"
@@ -361,7 +362,7 @@ runx() {   # like run(), with the commit-swap chmod shim first on PATH
         . $T/$1.sh" > "$T/run.out" 2>&1
     RC=$?
 }
-for spec in "B config.yaml 664" "C config.yaml 664" "D access-control.json 660" "D auth.json 660"; do
+for spec in "B config.yaml 640" "C config.yaml 640" "D access-control.json 660" "D auth.json 640"; do  # corrected per item E (I:6765, I:9514, I:10013)
     set -- $spec; blk=$1; nm=$2; mode=$3
     fresh; mkdir -p "$V/targetdir"; export IG_SWAP_COMMIT=$nm; runx $blk; unset IG_SWAP_COMMIT
     check "R3-2 block $blk: $nm swapped for a symlink to a directory right before the commit rename (shim fired)" $([ -e /tmp/ig-swapped ]; echo $?) "no swap: rc=$RC $(tail -2 $T/run.out | cut -c1-160)"

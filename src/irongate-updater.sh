@@ -25,6 +25,21 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# One update at a time (the daily timer, the dashboard's "Update now" and an operator can all start this script): the
+# second one logs it and exits non-zero. The lock is held on fd 9 until this process exits (the installer it runs gets
+# fd 9 closed, so nothing it leaves running can keep the lock).
+LOCK_FILE="/run/irongate-updater.lock"
+# The lock file is created root-only (0600) by opening it under a restricted umask; an existing lock file keeps its
+# mode. fd 9 must stay open in THIS shell, so the umask applies only in a subshell that touches the creation.
+if ! { ( umask 077; : >>"$LOCK_FILE" ) && exec 9>>"$LOCK_FILE"; } 2>/dev/null; then
+    log "ERROR: cannot open lock file $LOCK_FILE - refusing to update"
+    exit 1
+fi
+if ! flock -n 9; then
+    log "another update is running (lock $LOCK_FILE is held) - exiting"
+    exit 1
+fi
+
 # Load and validate the pin file. Sets PINNED_COMMIT and PINNED_INSTALLER_SHA256,
 # or returns 1 after logging why. The file is opened once and that open file is
 # inspected and read, so a swap between the check and the read cannot matter.
@@ -93,6 +108,13 @@ log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 # Update last check time
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
+# --force re-runs nothing that is already installed: at the pinned commit it is a logged no-op (nothing is downloaded)
+if [ "$FORCE" -eq 1 ] && [ "$CURRENT_COMMIT" = "$TARGET_COMMIT" ]; then
+    log "--force: installed == pin ($TARGET_COMMIT), nothing to do - not downloading"
+    log "Update check finished"
+    exit 0
+fi
+
 # Compare commits
 if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
     log "Update available! Downloading..."
@@ -108,7 +130,7 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     # Fetch the pinned commit, never the moving main ref.
     SRC_URL="$REPO_RAW_BASE/$TARGET_SHA/irongate-install.sh"
     log "Downloading $SRC_URL"
-    curl -sf -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
+    curl -sf --max-time 60 -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
 
     if [ ! -s "$SCRIPT_PATH" ]; then
         log "ERROR: downloaded installer is missing or empty - aborting"
@@ -141,13 +163,38 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     # installed_commit is stamped only AFTER the installer has exited 0 (below). Stamping it first made a
     # failed installer look installed: the next scheduled run said "Already up to date" and never retried.
     chmod 700 "$SCRIPT_PATH"
-    log "Running installer..."
-    bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
-    INSTALL_RC=$?
-    if [ "$INSTALL_RC" -ne 0 ]; then
-        log "ERROR: installer exited with status $INSTALL_RC"
+
+    # The installer rewrites the configuration directory (the pin file's directory). Before it runs, that directory is
+    # snapshotted, owners and modes included, to a root-only tarball next to the staged installer (0600, root:root);
+    # if the installer fails, the directory is put back from it (it holds what the dashboard saved, the login and the
+    # access list).
+    CONF_DIR="${PIN_FILE%/*}"
+    SNAPSHOT="$STAGE_DIR/conf-snapshot.tar"
+    rm -f "$SNAPSHOT"
+    if ! ( umask 077; tar -C "$CONF_DIR" --numeric-owner -cpf "$SNAPSHOT" . ) 2>/dev/null; then
+        log "ERROR: cannot snapshot $CONF_DIR - not running the installer"
+        rm -f "$SNAPSHOT"
         exit 1
     fi
+    chown root:root "$SNAPSHOT" && chmod 600 "$SNAPSHOT"
+    log "Snapshot of $CONF_DIR taken (root:root 0600)"
+
+    log "Running installer..."
+    bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1 9>&-
+    INSTALL_RC=$?
+    if [ "$INSTALL_RC" -ne 0 ]; then
+        if tar -C "$CONF_DIR" --same-owner -p --numeric-owner -xf "$SNAPSHOT" 2>/dev/null; then
+            RESTORE_MSG="$CONF_DIR restored from the snapshot taken before the installer ran (extracted over the directory; entries the failed run created are left in place)"
+            rm -f "$SNAPSHOT"
+        else
+            RESTORE_MSG="ERROR: restoring $CONF_DIR from $SNAPSHOT failed - the snapshot is kept"
+        fi
+        log "ERROR: installer exited with status $INSTALL_RC"
+        log "$RESTORE_MSG"
+        exit 1
+    fi
+    rm -f "$SNAPSHOT"
+    log "Installer succeeded - snapshot removed"
     # The installer stamps installed_commit with the moving main HEAD; restore
     # the pinned commit so the next scheduled run does not reinstall.
     sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
