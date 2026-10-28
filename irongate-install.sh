@@ -30,6 +30,15 @@
 # Deploy on any Debian/Raspbian SBC
 #######################################
 
+# ---- installer PATH: begin ----
+# A fixed, absolute PATH. The installer runs as root from sudo, from the updater's systemd unit or from
+# a shell whose PATH may hold "." or an empty or relative entry: `find -execdir` (used on /etc/irongate
+# below) refuses to run at all with such a PATH, and a root script should not pick its tools from
+# whatever directories the caller listed anyway.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# ---- installer PATH: end ----
+
 IRONGATE_REPO="https://github.com/beatboxes/irongate"
 IRONGATE_RAW="https://raw.githubusercontent.com/beatboxes/irongate/main"
 IRONGATE_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
@@ -41,10 +50,27 @@ if [ -n "$API_RESPONSE" ]; then
     IRONGATE_COMMIT=$(echo "$API_RESPONSE" | grep -m1 '"sha"' | cut -d'"' -f4 | cut -c1-7)
 fi
 
+# ---- installer commit id: begin ----
+# IRONGATE_COMMIT is printed, and at the end of the install written into a root `sqlite3` statement. Its
+# fallback below comes from dhcp.db, which the web tier can write, so a value such as
+#   x'); DROP TABLE settings;--
+# would have run as SQL. Only a hex commit id (or the literal "local") is ever used; anything else is treated
+# as unknown: not shown, not stamped (IRONGATE_COMMIT_STAMP=0), and never interpolated into SQL.
+ig_valid_commit() { local LC_ALL=C; [[ "$1" =~ ^[0-9a-f]{7,40}$ ]]; }
+IRONGATE_COMMIT_STAMP=1
+if ! ig_valid_commit "$IRONGATE_COMMIT"; then
+    IRONGATE_COMMIT=""
+fi
+
 if [ -z "$IRONGATE_COMMIT" ]; then
     # Fallback: check if already stored in database
     if [ -f /var/www/irongate/dhcp.db ]; then
         IRONGATE_COMMIT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null)
+    fi
+    if [ -n "$IRONGATE_COMMIT" ] && [ "$IRONGATE_COMMIT" != "local" ] && ! ig_valid_commit "$IRONGATE_COMMIT"; then
+        echo "WARNING: installed_commit in dhcp.db is not a commit id - ignoring it (it is not shown and not rewritten)"
+        IRONGATE_COMMIT=""
+        IRONGATE_COMMIT_STAMP=0
     fi
 fi
 
@@ -52,6 +78,7 @@ if [ -z "$IRONGATE_COMMIT" ]; then
     IRONGATE_COMMIT="local"
 fi
 echo "Commit: $IRONGATE_COMMIT"
+# ---- installer commit id: end ----
 
 set -e
 
@@ -131,6 +158,16 @@ elif ! grep -q '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
 fi
 systemctl restart systemd-journald 2>/dev/null || true
 
+# ---- dnsmasq gate: begin ----
+# dnsmasq runs as root and executes what its configuration names (`dhcp-script=`, `conf-script=` - also under
+# `dnsmasq --test`). So this installer starts it, and lets it parse a configuration, only on a tree that
+# /opt/irongate/dnsmasq-apply --audit accepts: every file dnsmasq reads is root-only and clean. On any other
+# state (an installer that failed before or inside the lockdown, a finding) dnsmasq stays stopped.
+ig_dnsmasq_tree_ok() {
+    [ -x /opt/irongate/dnsmasq-apply ] && /opt/irongate/dnsmasq-apply --audit >/dev/null 2>&1
+}
+# ---- dnsmasq gate: end ----
+
 # Stop services during configuration and kill any zombie processes
 # IMPORTANT: Add trap to restart ALL services if script fails or exits
 cleanup_on_exit() {
@@ -152,8 +189,13 @@ cleanup_on_exit() {
     rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
     ln -sf /etc/nginx/sites-available/irongate /etc/nginx/sites-enabled/irongate
     
-    # Start services in correct order
-    systemctl start dnsmasq 2>/dev/null || true
+    # Start services in correct order (dnsmasq only on a tree the audit accepts: a failed lockdown must not
+    # hand a www-data-owned configuration to a root daemon)
+    if ig_dnsmasq_tree_ok; then
+        systemctl start dnsmasq 2>/dev/null || true
+    else
+        echo -e "${RED}dnsmasq NOT started: /etc/dnsmasq.conf and /etc/dnsmasq.d are not root-only and clean (dnsmasq-apply --audit)${NC}"
+    fi
     [ -n "$TRAP_PHP_VER" ] && systemctl restart php${TRAP_PHP_VER}-fpm 2>/dev/null || true
     systemctl restart nginx 2>/dev/null || true
     systemctl start irongate 2>/dev/null || true
@@ -252,7 +294,11 @@ EOF
 fi
 
 # Create empty reservations file only if it doesn't exist
-if [ ! -f /etc/dnsmasq.d/reservations.conf ]; then
+if [ -L /etc/dnsmasq.d/reservations.conf ]; then
+    # /etc/dnsmasq.d belonged to the web tier until now (O4): never read or write through a link there.
+    # The dnsmasq lockdown further down moves it aside.
+    echo -e "${RED}  ! /etc/dnsmasq.d/reservations.conf is a symbolic link - not touching it${NC}"
+elif [ ! -f /etc/dnsmasq.d/reservations.conf ]; then
     cat > /etc/dnsmasq.d/reservations.conf << EOF
 # Static DHCP Reservations - Managed by Web UI
 EOF
@@ -269,8 +315,8 @@ else
     awk -F, 'BEGIN{OFS=","} /^dhcp-host=/ && NF>=3 {gsub(/ /, "-", $3)} {print}' /etc/dnsmasq.d/reservations.conf > /tmp/reservations.conf.fixed
     if [ -s /tmp/reservations.conf.fixed ]; then
         mv /tmp/reservations.conf.fixed /etc/dnsmasq.d/reservations.conf
-        chown www-data:www-data /etc/dnsmasq.d/reservations.conf
-        chmod 664 /etc/dnsmasq.d/reservations.conf
+        chown root:root /etc/dnsmasq.d/reservations.conf
+        chmod 644 /etc/dnsmasq.d/reservations.conf
         echo -e "${GREEN}  ✓ Hostnames sanitized (spaces → hyphens)${NC}"
     fi
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -547,9 +593,8 @@ CREATE TABLE IF NOT EXISTS device_groups (
 EOSQL
 fi
 
-# Always update the installed commit hash
-sqlite3 /var/www/irongate/dhcp.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '${IRONGATE_COMMIT}');"
-echo -e "${GREEN}  ✓ Commit: ${IRONGATE_COMMIT}${NC}"
+# installed_commit is stamped at the very end of the install ("installer commit stamp" below), not here:
+# a stamp made before the install had succeeded made a failed install look installed.
 
 #######################################
 # Create PHP Backend API
@@ -590,9 +635,9 @@ set_exception_handler(function($e) {
 });
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
-header('Access-Control-Allow-Headers: Content-Type');
+// irongate-audit (V3): no CORS headers. The dashboard (index.php) calls this API
+// with a relative URL, so it is same-origin; a wildcard Access-Control-Allow-Origin
+// only let any web page a LAN browser visited drive this API cross-origin.
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
@@ -619,6 +664,10 @@ function getSetting($db, $key) {
 }
 
 function setSetting($db, $key, $value) {
+    // irongate-audit (O3): backstop for every caller, whatever the endpoint checked before.
+    if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+        return false;
+    }
     $stmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
     $stmt->bindValue(1, $key, SQLITE3_TEXT);
     $stmt->bindValue(2, $value, SQLITE3_TEXT);
@@ -634,13 +683,6 @@ function getAllSettings($db) {
     return $settings;
 }
 
-function cidrToNetmask($cidr) {
-    $cidr = intval($cidr);
-    $bin = str_repeat('1', $cidr) . str_repeat('0', 32 - $cidr);
-    $parts = str_split($bin, 8);
-    return implode('.', array_map('bindec', $parts));
-}
-
 // Safe wrapper for applyIrongateConfig - prevents PHP warnings from corrupting JSON output
 function safeApplyConfig($db) {
     ob_start();
@@ -654,6 +696,51 @@ function safeApplyConfig($db) {
     }
     ob_end_clean();
     return $result;
+}
+
+// irongate-audit (V1): zone/group names and device IPs are interpolated into an
+// nftables ruleset by the root engine, so only strict values may be stored.
+// \z (not $) so a trailing newline cannot slip through. The name becomes the nft
+// set identifier "<name>_devices", which cannot start with a digit or '-'.
+function validZoneName($name) {
+    return is_string($name) && preg_match('/^[A-Za-z_][A-Za-z0-9_-]{0,31}\z/', $name) === 1;
+}
+
+function validDeviceIp($ip) {
+    return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+// irongate-audit (O3): the irongate_* settings are copied into /etc/irongate/config.yaml, which the root
+// engine reads and, in dual-NIC mode, turns into bridge, nft and dnsmasq commands. yamlScalar() keeps a
+// value from breaking the YAML but not from being a hostile string, so every key has a fixed shape here
+// and an unknown irongate_* key is refused. Interface names follow the kernel's rules (1-15 characters,
+// not starting with '-' or '.'); the addresses are IPv4 literals; the empty string means "not set".
+// \z (not $) so a trailing newline cannot slip through.
+function validIrongateSetting($key, $value) {
+    static $flags = ['irongate_enabled', 'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
+                     'irongate_bypass_detection', 'irongate_firewall'];
+    static $addrs = ['irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end'];
+    if (!is_string($key) || !is_string($value)) return false;
+    if (in_array($key, $flags, true)) return $value === 'true' || $value === 'false';
+    if ($key === 'irongate_mode') return $value === 'single' || $value === 'dual';
+    if ($key === 'irongate_isolated_interface') {
+        return $value === '' || preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}\z/', $value) === 1;
+    }
+    if (in_array($key, $addrs, true)) {
+        return $value === '' || filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    }
+    return false;
+}
+
+// The first problem in the irongate_* entries of a settings POST, or null. Checked before anything is stored.
+function irongateSettingsError($data) {
+    if (!is_array($data)) return null;
+    foreach ($data as $key => $value) {
+        if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+            return 'Invalid value or unknown setting: ' . preg_replace('/[^\x20-\x7e]/', '?', substr($key, 0, 40));
+        }
+    }
+    return null;
 }
 
 function cidrToHosts($cidr) {
@@ -701,12 +788,39 @@ function midnightNetworks() {
     ];
 }
 
-// Resolve the effective indexer endpoint: custom URL (validated http/https)
-// overrides the network preset, matching blockchain.py behaviour.
+// irongate-audit (V2, SSRF): a custom indexer URL must be https and its host
+// must be the host of one of the https presets above (same rule as
+// blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
+// cloud-metadata addresses from the web tier.
+// (FILTER_VALIDATE_URL is intentionally not used: it accepts exactly the
+// printable-ASCII set that the first check below already enforces.)
+function validIndexerUrl($url) {
+    if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
+        return false;
+    }
+    $p = parse_url($url);
+    // Exactly "https", no case folding: parse_url() keeps the case and PHP's stream layer does not
+    // fold it either (PHP 8.3 sends the request for an all-upper-case "HTTPS://" in cleartext).
+    if ($p === false || ($p['scheme'] ?? '') !== 'https') return false;
+    if (isset($p['user']) || isset($p['pass'])) return false;
+    if (isset($p['port']) && $p['port'] !== 443) return false;
+    $hosts = [];
+    foreach (midnightNetworks() as $preset) {
+        $pp = parse_url($preset);
+        if (strtolower($pp['scheme'] ?? '') === 'https' && !empty($pp['host'])) {
+            $hosts[] = strtolower($pp['host']);
+        }
+    }
+    return in_array(strtolower($p['host'] ?? ''), $hosts, true);
+}
+
+// Resolve the effective indexer endpoint: custom URL (https, known Midnight
+// indexer host only) overrides the network preset, matching blockchain.py.
 function midnightEndpoint($network, $custom) {
     $custom = trim((string)$custom);
     if ($custom !== '') {
-        if (!filter_var($custom, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $custom)) {
+        // The selected network's own preset (e.g. the local 'undeployed' node) is always fine.
+        if ($custom !== (midnightNetworks()[$network] ?? null) && !validIndexerUrl($custom)) {
             return null;
         }
         return $custom;
@@ -725,6 +839,10 @@ function midnightProbe($endpoint, $timeout) {
             'content' => '{"query":"{__typename}"}',
             'timeout' => $timeout,
             'ignore_errors' => true,
+            // irongate-audit (V2): never follow a redirect. An allowed host must not be
+            // able to bounce the probe to loopback, the LAN or cloud metadata.
+            'follow_location' => 0,
+            'max_redirects' => 0,
         ],
     ]);
     $t0 = microtime(true);
@@ -738,7 +856,8 @@ function midnightProbe($endpoint, $timeout) {
         return ['reachable' => false, 'response_time_ms' => $ms, 'http_code' => 0,
                 'error' => $ms >= ($timeout * 1000 - 100) ? 'connection timeout' : 'connection failed'];
     }
-    $ok = $code >= 200 && $code < 400;
+    // A 3xx is not an answer: redirects are not followed (see above).
+    $ok = $code >= 200 && $code < 300;
     return ['reachable' => $ok, 'response_time_ms' => $ms, 'http_code' => $code,
             'error' => $ok ? null : 'indexer returned HTTP ' . $code];
 }
@@ -819,7 +938,6 @@ function addReservation($db, $mac, $ip, $hostname, $description) {
     $stmt->bindValue(4, $description, SQLITE3_TEXT);
     $result = $stmt->execute();
     if ($result) {
-        syncReservationsToFile($db);
         return true;
     }
     return false;
@@ -829,142 +947,141 @@ function deleteReservation($db, $id) {
     $stmt = $db->prepare('DELETE FROM reservations WHERE id = ?');
     $stmt->bindValue(1, $id, SQLITE3_INTEGER);
     $result = $stmt->execute();
-    syncReservationsToFile($db);
     return $result ? true : false;
 }
 
-function syncReservationsToFile($db) {
+// irongate-audit (O4): the web tier no longer writes /etc/dnsmasq.conf or anything in /etc/dnsmasq.d. dnsmasq runs
+// as root and a `dhcp-script=` line in either would run a program as root, so both belong to root. This API stores
+// the settings and reservations in the database as before; to apply them it stages them as DATA in
+// DNSMASQ_STAGE_DIR (a root-owned directory outside the web root) and runs the one root helper below through sudo
+// with no arguments (/etc/sudoers.d/irongate-dnsmasq-apply). The helper accepts only the keys listed here, checks
+// each value, renders the files from its own template, runs `dnsmasq --test` and restarts dnsmasq.
+const DNSMASQ_HELPER = '/opt/irongate/dnsmasq-apply';
+const DNSMASQ_STAGE_DIR = '/var/lib/irongate/dnsmasq-staged';
+const DNSMASQ_SETTING_KEYS = ['dhcp_enabled', 'interface', 'cidr', 'range_start', 'range_end', 'gateway',
+                              'dns_primary', 'dns_secondary', 'lease_time', 'domain'];
+
+function dnsmasqRequest($db, $action) {
+    $all = getAllSettings($db);
+    $settings = [];
+    foreach (DNSMASQ_SETTING_KEYS as $key) {
+        if (isset($all[$key]) && is_scalar($all[$key])) {
+            // The old generator wrote the values as they were and dnsmasq ignores white space around them, so a gateway
+            // saved with a trailing space worked. The helper strips as well; a value that is not plain is refused there.
+            $settings[$key] = trim((string)$all[$key]);
+        }
+    }
+    // As before: the DHCP options count only while DHCP is on and a range is set, and an empty interface means
+    // "the default route's" (the helper looks that up).
+    $on = ($settings['dhcp_enabled'] ?? '') === 'true' && !empty($settings['range_start'] ?? '') && !empty($settings['range_end'] ?? '');
+    if (!$on) {
+        $settings = array_intersect_key($settings, ['interface' => 1]);
+    }
+    $settings['dhcp_enabled'] = $on ? 'true' : 'false';
+    if (empty($settings['interface'] ?? '')) {
+        unset($settings['interface']);
+    }
+    $reservations = [];
     $results = $db->query('SELECT * FROM reservations');
-    $content = "# Static DHCP Reservations - Auto-generated by Web UI\n";
     while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
-        $line = "dhcp-host=" . $row['mac'] . "," . $row['ip'];
-        $hostname = sanitizeHostname($row['hostname']);
-        if (!empty($hostname)) {
-            $line .= "," . $hostname;
-        }
-        $content .= $line . "\n";
+        $reservations[] = [
+            'mac' => trim((string)$row['mac']),
+            'ip' => trim((string)$row['ip']),
+            'hostname' => sanitizeHostname((string)($row['hostname'] ?? '')),
+        ];
     }
-    file_put_contents('/etc/dnsmasq.d/reservations.conf', $content);
+    return ['version' => 1, 'action' => $action, 'settings' => (object)$settings, 'reservations' => $reservations];
 }
 
-function generateDnsmasqConfig($db) {
-    $settings = getAllSettings($db);
-    
-    $config = "# DHCP Server Configuration\n";
-    $config .= "# Auto-generated by Web UI on " . date('Y-m-d H:i:s') . "\n\n";
-    
-    $interface = $settings['interface'] ?? '';
-    if (empty($interface)) {
-        $interface = trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+// Stage the request and run the helper. Returns ['ok' => bool, 'error' => string, 'resp' => array|null].
+function runDnsmasqHelper($db, $action) {
+    $json = json_encode(dnsmasqRequest($db, $action));
+    if ($json === false) {
+        return ['ok' => false, 'error' => 'the request could not be encoded', 'resp' => null];
     }
-    
-    $config .= "# Interface\n";
-    $config .= "interface=$interface\n";
-    // Use bind-dynamic instead of bind-interfaces - more resilient to interface changes
-    $config .= "bind-dynamic\n\n";
-    
-    $config .= "# Disable DNS (DHCP only)\n";
-    $config .= "port=0\n\n";
-    
-    if ($settings['dhcp_enabled'] === 'true' && !empty($settings['range_start']) && !empty($settings['range_end'])) {
-        $netmask = cidrToNetmask($settings['cidr'] ?? '24');
-        $leaseTime = $settings['lease_time'] ?? '24h';
-        
-        $config .= "# DHCP Range\n";
-        $config .= "dhcp-range={$settings['range_start']},{$settings['range_end']},$netmask,$leaseTime\n\n";
-        
-        if (!empty($settings['gateway'])) {
-            $config .= "# Gateway\n";
-            $config .= "dhcp-option=option:router,{$settings['gateway']}\n\n";
-        }
-        
-        $dns = [];
-        if (!empty($settings['dns_primary'])) $dns[] = $settings['dns_primary'];
-        if (!empty($settings['dns_secondary'])) $dns[] = $settings['dns_secondary'];
-        if (!empty($dns)) {
-            $config .= "# DNS Servers\n";
-            $config .= "dhcp-option=option:dns-server," . implode(',', $dns) . "\n\n";
-        }
-        
-        if (!empty($settings['domain'])) {
-            $config .= "# Domain\n";
-            $config .= "domain={$settings['domain']}\n\n";
-        }
-    } else {
-        $config .= "# DHCP is disabled - configure via Web UI\n\n";
+    $dir = DNSMASQ_STAGE_DIR;
+    $lock = @fopen($dir . '/.lock', 'c');
+    if ($lock === false) {
+        return ['ok' => false, 'error' => 'the staging directory is not writable', 'resp' => null];
     }
-    
-    $config .= "# Lease file\n";
-    $config .= "dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases\n\n";
-    
-    $config .= "# Be authoritative\n";
-    $config .= "dhcp-authoritative\n\n";
-    
-    $config .= "# Logging\n";
-    $config .= "log-dhcp\n";
-    $config .= "log-facility=/var/log/dnsmasq.log\n\n";
-    
-    $config .= "# DHCP grace period notification for IronGate\n";
-    $config .= "dhcp-script=/opt/irongate/dhcp-notify.sh\n\n";
-
-    $config .= "# Static reservations\n";
-    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n";
-
-    return $config;
+    flock($lock, LOCK_EX);
+    // A directory named request.json would make every rename below fail for good; an empty one is ours to remove.
+    if (is_dir($dir . '/request.json') && !is_link($dir . '/request.json')) {
+        @rmdir($dir . '/request.json');
+    }
+    $tmp = @tempnam($dir, '.req-');
+    if ($tmp === false || @file_put_contents($tmp, $json) === false || !@rename($tmp, $dir . '/request.json')) {
+        if ($tmp !== false) {
+            @unlink($tmp);
+        }
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return ['ok' => false, 'error' => 'the request could not be staged', 'resp' => null];
+    }
+    $out = [];
+    exec('sudo -n ' . DNSMASQ_HELPER . ' 2>&1', $out, $rc);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    $resp = null;
+    foreach (array_reverse($out) as $line) {
+        $decoded = json_decode($line, true);
+        if (is_array($decoded) && array_key_exists('success', $decoded)) {
+            $resp = $decoded;
+            break;
+        }
+    }
+    if ($resp === null) {
+        return ['ok' => false, 'error' => 'dnsmasq-apply gave no answer: ' . substr(implode(' ', $out), 0, 300), 'resp' => null];
+    }
+    return ['ok' => true, 'error' => '', 'resp' => $resp];
 }
 
-// Validate dnsmasq config before applying
-function validateConfig($configContent) {
-    // Write to temp file and test
-    $tempFile = '/tmp/dnsmasq-test-' . time() . '.conf';
-    file_put_contents($tempFile, $configContent);
-    
-    exec("dnsmasq --test --conf-file=$tempFile 2>&1", $output, $retval);
-    unlink($tempFile);
-    
+// Validate dnsmasq config before applying (what the settings in the database would render to)
+function validateConfig($db) {
+    $run = runDnsmasqHelper($db, 'validate');
+    $resp = $run['resp'];
+    if (!$run['ok']) {
+        return ['valid' => false, 'output' => $run['error'], 'return_code' => 1];
+    }
+    if (!($resp['success'] ?? false)) {
+        return ['valid' => false, 'output' => (string)($resp['error'] ?? ''), 'return_code' => 2];
+    }
     return [
-        'valid' => ($retval === 0),
-        'output' => implode("\n", $output),
-        'return_code' => $retval
+        'valid' => (bool)($resp['valid'] ?? false),
+        'output' => (string)($resp['output'] ?? ''),
+        'return_code' => (int)($resp['return_code'] ?? 1)
     ];
 }
 
 function applyConfig($db) {
-    $config = generateDnsmasqConfig($db);
-    
-    // Validate config first
-    $validation = validateConfig($config);
-    if (!$validation['valid']) {
+    $run = runDnsmasqHelper($db, 'apply');
+    if (!$run['ok']) {
         return [
             'success' => false,
-            'error' => 'Config validation failed: ' . $validation['output'],
+            'error' => 'Config validation failed: ' . $run['error'],
             'stage' => 'validation'
         ];
     }
-    
-    // Write the config
-    file_put_contents('/etc/dnsmasq.conf', $config);
-    
-    // Stop current service gracefully
-    exec('sudo systemctl stop dnsmasq 2>&1', $stopOutput, $stopRetval);
-    usleep(500000); // Wait 500ms
-    
-    // Start the service
-    exec('sudo systemctl start dnsmasq 2>&1', $startOutput, $startRetval);
-    
-    if ($startRetval !== 0) {
+    $resp = $run['resp'];
+    if ($resp['success'] ?? false) {
+        return ['success' => true];
+    }
+    if (($resp['stage'] ?? '') === 'start') {
         // Get the actual error from journalctl
         exec('journalctl -u dnsmasq -n 20 --no-pager 2>&1', $journalOutput);
         return [
             'success' => false,
             'error' => 'Service start failed',
-            'output' => implode("\n", $startOutput),
+            'output' => (string)($resp['output'] ?? ''),
             'journal' => implode("\n", $journalOutput),
             'stage' => 'start'
         ];
     }
-    
-    return ['success' => true];
+    return [
+        'success' => false,
+        'error' => 'Config validation failed: ' . (string)($resp['error'] ?? ''),
+        'stage' => 'validation'
+    ];
 }
 
 function getServiceStatus() {
@@ -1254,7 +1371,14 @@ switch ($action) {
     case 'settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
-            
+            // This endpoint stores any key, the irongate_* ones included: same rules as irongate_settings.
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
+
             // Validate lease_time format (dnsmasq format: 30m, 24h, 7d, 1w, infinite, or raw seconds)
             if (isset($data['lease_time'])) {
                 $lt = trim($data['lease_time']);
@@ -1363,8 +1487,7 @@ switch ($action) {
         break;
     
     case 'validate':
-        $config = generateDnsmasqConfig($db);
-        $result = validateConfig($config);
+        $result = validateConfig($db);
         echo json_encode(['success' => true, 'data' => $result]);
         break;
     
@@ -1400,6 +1523,12 @@ switch ($action) {
     case 'irongate_settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
             // Layer 8 validation: never persist an enable without a contract
             // address, an unknown network, or a malformed indexer URL.
             if (is_array($data) && (array_key_exists('blockchain_enabled', $data)
@@ -1418,10 +1547,17 @@ switch ($action) {
                     break;
                 }
                 $reqIndexer = trim((string)($data['blockchain_indexer_url'] ?? ''));
-                if ($reqIndexer !== '' && (!filter_var($reqIndexer, FILTER_VALIDATE_URL)
-                    || !preg_match('#^https?://#i', $reqIndexer))) {
-                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+                $reqNetwork = (string)($data['blockchain_network'] ?? (getSetting($db, 'blockchain_network') ?? 'preprod'));
+                if ($reqIndexer !== '' && $reqIndexer !== (midnightNetworks()[$reqNetwork] ?? null)
+                    && !validIndexerUrl($reqIndexer)) {
+                    http_response_code(400);
+                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
+                }
+                // Store exactly what was validated (trimmed), not the raw value: the engine refuses a
+                // URL with surrounding whitespace, so storing the padded text would silently switch Layer 8 off.
+                if (array_key_exists('blockchain_indexer_url', $data)) {
+                    $data['blockchain_indexer_url'] = $reqIndexer;
                 }
             }
             foreach ($data as $key => $value) {
@@ -1528,6 +1664,19 @@ switch ($action) {
                 break;
             }
 
+            // irongate-audit (V1): group names (and the names a group may reach)
+            // become nft set identifiers in the root engine.
+            $accessList = $data['can_access_groups'] ?? [];
+            $accessOk = is_array($accessList);
+            foreach (($accessOk ? $accessList : []) as $g) {
+                if (!validZoneName($g)) { $accessOk = false; }
+            }
+            if (!validZoneName($name) || !$accessOk) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
+                break;
+            }
+
             $stmt = $db->prepare('INSERT OR REPLACE INTO device_groups (name, color, icon, description, lan_access, can_access_groups) VALUES (?, ?, ?, ?, ?, ?)');
             $stmt->bindValue(1, $name, SQLITE3_TEXT);
             $stmt->bindValue(2, $data['color'] ?? '#6c757d', SQLITE3_TEXT);
@@ -1629,11 +1778,20 @@ switch ($action) {
     case 'irongate_devices':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            // irongate-audit (V1): ip and zone end up inside the root engine's nft
+            // ruleset. An empty ip is still allowed (the engine skips such devices).
+            $devIp = $data['ip'] ?? '';
+            $devZone = $data['zone'] ?? 'isolated';
+            if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
+                break;
+            }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
             $stmt->bindValue(1, strtolower($data['mac']), SQLITE3_TEXT);
-            $stmt->bindValue(2, $data['ip'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(2, $devIp, SQLITE3_TEXT);
             $stmt->bindValue(3, $data['hostname'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(4, $data['zone'] ?? 'isolated', SQLITE3_TEXT);
+            $stmt->bindValue(4, $devZone, SQLITE3_TEXT);
             $result = $stmt->execute();
             if ($result) {
                 safeApplyConfig($db);
@@ -1832,7 +1990,8 @@ switch ($action) {
         }
         $endpoint = midnightEndpoint($network, $custom);
         if ($endpoint === null) {
-            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+            http_response_code(400);
+            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
             break;
         }
         $probe = midnightProbe($endpoint, 5);
@@ -4913,22 +5072,1548 @@ header('Location: /login.php');
 exit;
 WEBAUTH_LOGOUTEOF
 
+# ---- dnsmasq root helper: begin ----
+#######################################
+# dnsmasq's configuration belongs to root (irongate-audit O4)
+#######################################
+# dnsmasq runs as root and honours `dhcp-script=` (and conf-script, dhcp-luascript, conf-file, ...) in any
+# file it reads, so whoever can write /etc/dnsmasq.conf or a file in /etc/dnsmasq.d can run a program as
+# root; the web tier (www-data) could, and may restart dnsmasq. From here on the web API only stages a
+# REQUEST in /var/lib/irongate/dnsmasq-staged and runs /opt/irongate/dnsmasq-apply through sudo; the helper
+# validates it, renders both files from its own template and restarts dnsmasq.
+#
+# The helper, its sudoers drop-in and the staging directory are installed HERE, before the permission step
+# below, which (kept as it was: the O1 permission tests pin it) hands /etc/dnsmasq.conf and /etc/dnsmasq.d to
+# www-data for the moment. Only the lockdown (right after that step) is left in the window that opens, so
+# whatever www-data plants in it is scanned, quarantined and never preserved (dnsmasq-apply --lockdown).
+echo -e "${YELLOW}Installing the dnsmasq root helper...${NC}"
+mkdir -p /opt/irongate
+cat > /opt/irongate/dnsmasq-apply << 'DNSMASQAPPLY'
+#!/usr/bin/python3 -I
+"""dnsmasq-apply - the only program that writes /etc/dnsmasq.conf and /etc/dnsmasq.d/reservations.conf.
+
+Why this exists (irongate-audit O4). dnsmasq runs as root and honours `dhcp-script=` (and `conf-script=`,
+`dhcp-luascript=`, `conf-file=`, ...) in any file it reads. While www-data owned /etc/dnsmasq.conf and
+/etc/dnsmasq.d, a compromised web tier could add such a line and get a root program started by the next
+`systemctl restart dnsmasq`, which it is allowed to run. Now:
+
+  * /etc/dnsmasq.conf, /etc/dnsmasq.d and every file in it belong to root (0644 / 0755);
+  * the web API (www-data) writes a REQUEST (settings and reservations, as data) to
+    /var/lib/irongate/dnsmasq-staged/request.json and runs this program through sudo, with no arguments
+    (/etc/sudoers.d/irongate-dnsmasq-apply: `www-data ALL=(root) NOPASSWD: /opt/irongate/dnsmasq-apply ""`);
+  * this program accepts only the keys the dashboard sets, checks every value against a strict shape, and
+    RENDERS the files from the template below (the dhcp-script and conf-dir lines are constants here, not
+    input). A request that carries anything else - an unknown key, a directive name that must never come from
+    the web tier, a newline, a NUL, an "=" - is refused as a whole and nothing is written;
+  * the rendered files go through `dnsmasq --test` before they replace the live ones (temp file + rename in a
+    root-only directory); if dnsmasq will not start on them the previous files are put back.
+
+Output: one JSON object on stdout, {"success": bool, "stage": ..., "error": ..., "output": ...}.
+Exit status: 0 applied/valid, 2 request refused, 3 dnsmasq --test failed, 4 service did not stop or start (the previous files are back),
+5 the environment is not safe (a directory is not root-owned, a tool is missing, --lockdown could not lock every entry),
+1 internal error.
+
+Root-only command line modes (the sudoers rule allows no arguments, so the web tier cannot reach them):
+  --lockdown   make /etc/dnsmasq.conf and /etc/dnsmasq.d root-owned. The directory is taken first; then every
+               file the web tier could have written is READ ONCE, scanned as dnsmasq's own parser would read it
+               (a forbidden directive, quoted or split across dnsmasq's 1024-byte read buffer, anything but plain
+               `name=value` lines) and only what is clean is written back as a new root-owned file, so a
+               descriptor the web tier still holds is useless. A file that is not clean is never re-created: its
+               bytes go to a root-only directory (QUARANTINE_DIR) and, for the two files this program renders,
+               the root-held snapshot of the last good rendering (SNAPSHOT_DIR) or a safe default replaces it.
+               Links, directories and special files are renamed aside (.refused.*, dnsmasq skips dot files), and so
+               is an entry that cannot be processed at all (a read or write error, a name of any length): one entry
+               never stops the others or the main file, and the exit status is 5 if anything could not be locked.
+               What is accepted in a file the web tier could have written is an ALLOWLIST: the main file may hold
+               only what render_main() emits (MAIN_NAMES, the four fixed lines as they are), reservations.conf only
+               dhcp-host, any other file only options dnsmasq has (KNOWN_OPTIONS) that are not FORBIDDEN.
+  --audit      read-only: every entry of /etc/dnsmasq.d (root-owned ones too) and /etc/dnsmasq.conf must be a
+               root-only regular file without a directive the web tier must not set; the programs dnsmasq and
+               sudo run as root must not be writable by anybody else. Exit 1 on any finding.
+
+apply() runs the audit first and refuses (exit 5) to run dnsmasq --test, which executes conf-script, on a tree
+that is not clean.
+"""
+
+import errno
+import fcntl
+import io
+import ipaddress
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+
+try:
+    import syslog
+except ImportError:  # pragma: no cover
+    syslog = None
+
+# ---- paths (tests replace these on the imported module; the installed program never reads them from the environment) ----
+CONF_PATH = '/etc/dnsmasq.conf'
+CONF_DIR = '/etc/dnsmasq.d'
+RES_NAME = 'reservations.conf'
+STATE_DIR = '/var/lib/irongate'
+STAGE_DIR = '/var/lib/irongate/dnsmasq-staged'
+QUARANTINE_DIR = '/var/lib/irongate/dnsmasq-quarantine'
+SNAPSHOT_DIR = '/var/lib/irongate/dnsmasq-good'
+REQUEST_NAME = 'request.json'
+LOCK_PATH = '/run/irongate-dnsmasq-apply.lock'
+DNSMASQ_BIN = ('/usr/sbin/dnsmasq', '/usr/bin/dnsmasq', '/sbin/dnsmasq')
+SYSTEMCTL_BIN = ('/usr/bin/systemctl', '/bin/systemctl')
+IP_BIN = ('/usr/sbin/ip', '/sbin/ip', '/usr/bin/ip', '/bin/ip')
+WEB_USER = 'www-data'
+MAX_REQUEST = 1024 * 1024
+MAX_RESERVATIONS = 2048
+MAX_CONF_FILE = 8 * 1024 * 1024
+MAX_QUARANTINE = 1000
+# dnsmasq reads its configuration with fgets() into a 1025-byte buffer: at most 1024 bytes of a longer line, and the
+# rest comes back as if it were a line of its own (a `#` comment of 1023 characters followed by `conf-file=...` is
+# a comment plus a directive for dnsmasq).
+READ_CHUNK = 1024
+# programs that run as root on the web tier's behalf (sudo) or dnsmasq's (dhcp-script): nobody else may change them
+EXEC_PATHS = ('/opt/irongate/dnsmasq-apply', '/opt/irongate/dhcp-notify.sh')
+TEST_TIMEOUT = 30
+SERVICE_TIMEOUT = 60
+# `systemctl stop dnsmasq` is not quick on the router: irongate.service is bound to dnsmasq (BindsTo/PartOf) and stops FIRST (its ARP restoration
+# takes ~95 s, TimeoutStopSec=180), dnsmasq's own stop (default 90 s) comes after it. The wait must outlast both.
+STOP_TIMEOUT = 300
+
+# ---- what the dashboard may set ----
+SETTING_KEYS = ('dhcp_enabled', 'interface', 'cidr', 'range_start', 'range_end', 'gateway',
+                'dns_primary', 'dns_secondary', 'lease_time', 'domain')
+TOP_KEYS = ('version', 'action', 'settings', 'reservations')
+RESERVATION_KEYS = ('mac', 'ip', 'hostname')
+
+# dnsmasq's long-option table (option.c, `opts[]`) of dnsmasq 2.92: EVERY name a configuration file may use, with the option value (the
+# `val` field) it stands for. Names with the same value are aliases of one option, and not all of them are in `dnsmasq --help`:
+# `dhcp-lease` is the old name of `dhcp-leasefile` (a root dnsmasq creates and rewrites that file just the same), `domain-suffix` is
+# `domain`. tests/test_dnsmasq_apply.py reads the table out of the dnsmasq binary it runs against and requires it to be this one, name
+# for name and value for value (and every name to be a string of the binary).
+_OPTION_TABLE = '''
+    version 118; no-hosts 104; no-poll 110; help 119; no-daemon 100; log-queries 113; user 117; group 103; resolv-file 114
+    servers-file 333; mx-host 109; mx-target 116; cache-size 99; port 112; dhcp-leasefile 108; dhcp-lease 108; dhcp-host 71; dhcp-range 70
+    dhcp-option 79; dhcp-boot 77; domain 115; domain-suffix 115; interface 105; listen-address 97; local-service 335; bogus-priv 98
+    bogus-nxdomain 66; ignore-address 338; selfmx 101; filterwin2k 102; filter-A 369; filter-AAAA 370; filter-rr 381; pid-file 120
+    strict-order 111; server 83; rev-server 332; local 286; address 65; conf-file 67; conf-script 374; no-resolv 82; expand-hosts 69
+    localmx 76; local-ttl 84; no-negcache 78; no-round-robin 378; no-0x20-encode 387; do-0x20-encode 388; cache-rr 380; addn-hosts 72
+    hostsdir 342; query-port 81; except-interface 73; no-dhcp-interface 50; no-dhcpv4-interface 383; no-dhcpv6-interface 382
+    domain-needed 68; dhcp-lease-max 88; bind-interfaces 122; read-ethers 90; alias 86; dhcp-vendorclass 85; dhcp-userclass 106
+    dhcp-ignore 74; edns-packet-max 80; keep-in-foreground 107; dhcp-authoritative 75; srv-host 87; localise-queries 121; txt-record 89
+    caa-record 356; dns-rr 310; enable-dbus 49; enable-ubus 354; bootp-dynamic 51; dhcp-mac 52; no-ping 53; dhcp-script 54; conf-dir 55
+    log-facility 56; leasefile-ro 57; script-on-renewal 360; dns-forward-max 48; clear-on-reload 256; dhcp-ignore-names 257
+    enable-tftp 258; tftp-secure 259; tftp-no-fail 344; tftp-unique-root 274; tftp-root 260; tftp-max 263; tftp-mtu 349
+    tftp-lowercase 309; tftp-single-port 359; ptr-record 261; naptr-record 287; bridge-interface 262; shared-network 357
+    dhcp-option-force 264; dhcp-option-pxe 386; tftp-no-blocksize 265; log-dhcp 266; log-async 267; dhcp-circuitid 268; dhcp-remoteid 269
+    dhcp-subscrid 270; dhcp-pxe-vendor 361; interface-name 271; dhcp-hostsfile 273; dhcp-optsfile 280; dhcp-hostsdir 340; dhcp-optsdir 341
+    dhcp-no-override 275; tftp-port-range 276; stop-dns-rebind 277; rebind-domain-ok 298; all-servers 278; dhcp-match 281
+    dhcp-name-match 355; dhcp-broadcast 282; neg-ttl 283; max-ttl 297; min-cache-ttl 339; max-cache-ttl 312; dhcp-alternate-port 284
+    dhcp-scriptuser 285; min-port 288; max-port 345; dhcp-fqdn 289; cname 290; pxe-prompt 291; pxe-service 292; test 293; tag-if 294
+    dhcp-proxy 295; dhcp-generate-names 296; rebind-localhost-ok 299; add-mac 300; strip-mac 372; add-subnet 325; strip-subnet 371
+    add-cpe-id 346; proxy-dnssec 301; dhcp-sequential-ip 302; conntrack 303; dhcp-client-update 304; dhcp-luascript 305; enable-ra 306
+    dhcp-duid 307; host-record 308; bind-dynamic 311; auth-zone 313; auth-server 314; auth-ttl 315; auth-soa 316; auth-sec-servers 317
+    auth-peer 318; ipset 319; nftset 368; connmark-allowlist-enable 365; connmark-allowlist 366; synth-domain 320; dnssec 329
+    trust-anchor 330; dnssec-debug 331; dnssec-check-unsigned 334; dnssec-no-timecheck 336; dnssec-timestamp 343; dnssec-limits 385
+    dhcp-relay 323; dhcp-split-relay 390; ra-param 324; quiet-dhcp 326; quiet-dhcp6 327; quiet-ra 328; dns-loop-detect 337; script-arp 347
+    dhcp-ttl 348; dhcp-reply-delay 350; dhcp-rapid-commit 351; dumpfile 352; dumpmask 353; dhcp-ignore-clid 358; dynamic-host 362
+    log-debug 363; umbrella 364; quiet-tftp 367; port-limit 375; fast-dns-retry 376; use-stale-cache 377; no-ident 379
+    max-tcp-connections 384; leasequery 389
+'''
+OPTION_VALUES = dict((item.split()[0], int(item.split()[1])) for item in re.split(r'[;\n]', _OPTION_TABLE) if item.strip())
+
+# Directives that read a file, run a program, write a file, change the user or open another config. They may
+# never come from the web tier. Everything not in SETTING_KEYS is refused anyway; this list only makes the
+# refusal say so (and is what the audit looks for). FORBIDDEN is this list plus every ALIAS of one of its options,
+# derived by option VALUE from the table above, so a spelling that only dnsmasq's own table knows is covered too.
+_FORBIDDEN_NAMED = frozenset('''
+    conf-file conf-dir conf-script dhcp-script dhcp-luascript script-arp dhcp-scriptuser dhcp-hostsfile dhcp-optsfile
+    dhcp-hostsdir dhcp-optsdir hostsdir addn-hosts servers-file resolv-file pid-file dhcp-leasefile leasefile-ro
+    log-facility dumpfile dumpmask dnssec-timestamp tftp-root enable-tftp dhcp-boot pxe-service user group read-ethers
+    dhcp-relay dhcp-proxy trust-anchor ipset nftset connmark-allowlist
+'''.split())
+_FORBIDDEN_VALUES = frozenset(OPTION_VALUES[n] for n in _FORBIDDEN_NAMED if n in OPTION_VALUES)
+FORBIDDEN = _FORBIDDEN_NAMED | frozenset(n for n, v in OPTION_VALUES.items() if v in _FORBIDDEN_VALUES)
+# the table's names in the form the scanner compares (lower case: the table also has filter-A and filter-AAAA)
+KNOWN_OPTIONS = frozenset(n.lower() for n in OPTION_VALUES)
+
+# ---- the template ----
+HEADER_FMT = "# DHCP Server Configuration\n# Auto-generated by Web UI on %s\n\n"
+FIXED_LEASEFILE = 'dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases'
+FIXED_LOGFACILITY = 'log-facility=/var/log/dnsmasq.log'
+FIXED_SCRIPT = 'dhcp-script=/opt/irongate/dhcp-notify.sh'
+FIXED_CONFDIR = 'conf-dir=/etc/dnsmasq.d/,*.conf'
+RES_HEADER = "# Static DHCP Reservations - Auto-generated by Web UI\n"
+
+# directive names the rendered main file may contain
+MAIN_NAMES = frozenset(['interface', 'bind-dynamic', 'port', 'dhcp-range', 'dhcp-option', 'domain',
+                        'dhcp-leasefile', 'dhcp-authoritative', 'log-dhcp', 'log-facility', 'dhcp-script', 'conf-dir'])
+
+_IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+_IPV4_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}')
+_MAC_RE = re.compile(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
+_LEASE_RE = re.compile(r'(?:[0-9]{1,10}[smhdw]?|infinite)', re.IGNORECASE)
+_CIDR_RE = re.compile(r'[0-9]{1,2}')
+_HOST_LABEL = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+_HOST_RE = re.compile(r'%s(?:\.%s)*' % (_HOST_LABEL, _HOST_LABEL))
+_DOM_LABEL = r'[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
+_DOMAIN_RE = re.compile(r'%s(?:\.%s)*' % (_DOM_LABEL, _DOM_LABEL))
+
+
+class Reject(Exception):
+    """The request is not acceptable. The message names the field, never the value."""
+
+
+class Failure(Exception):
+    def __init__(self, stage, error, output='', code=1, **extra):
+        Exception.__init__(self, error)
+        self.stage, self.error, self.output, self.code, self.extra = stage, error, output, code, extra
+
+
+# ============================================================ request checking ============================================================
+
+def _no_dupes(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise Reject('duplicate key in request')
+        out[key] = value
+    return out
+
+
+def _bad_constant(_name):
+    raise Reject('non-finite number in request')
+
+
+_KNOWN_NAMES = frozenset(SETTING_KEYS + TOP_KEYS + RESERVATION_KEYS)
+
+
+def _scan_strings(node, path='request', depth=0):
+    """No control character, no non-ASCII character and no '=' in any key or value, anywhere. The refusal names the
+    field (never the value; a key is named only when it is one the dashboard may send)."""
+    if depth > 8:
+        raise Reject('request is nested too deeply')
+    if isinstance(node, dict):
+        for key, value in node.items():
+            _scan_strings(key, path + ' key', depth + 1)
+            _scan_strings(value, '%s.%s' % (path, key if key in _KNOWN_NAMES else '?'), depth + 1)
+    elif isinstance(node, list):
+        for number, item in enumerate(node, 1):
+            _scan_strings(item, '%s[%d]' % (path, number), depth + 1)
+    elif isinstance(node, str):
+        for ch in node:
+            code = ord(ch)
+            if code < 0x20 or code > 0x7e or ch == '=':
+                raise Reject('control character, non-ASCII character or "=" in %s' % path)
+
+
+def _check_key(key, allowed, what):
+    if not isinstance(key, str):
+        raise Reject('%s key is not a string' % what)
+    norm = key.strip().lower().replace('_', '-')
+    head = re.split(r'[=\s,]', norm, maxsplit=1)[0].lstrip('-')
+    if head in FORBIDDEN or norm.lstrip('-') in FORBIDDEN:
+        raise Reject('forbidden directive %r in the request' % head[:40])
+    if key not in allowed:
+        raise Reject('unknown %s key' % what)
+
+
+def _ipv4(value, field):
+    if not isinstance(value, str) or not _IPV4_RE.fullmatch(value):
+        raise Reject('invalid %s' % field)
+    try:
+        canonical = str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise Reject('invalid %s' % field)
+    if canonical != value:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _optional_ipv4(value, field):
+    if value == '':
+        return ''
+    return _ipv4(value, field)
+
+
+def normalize_settings(settings):
+    """Strict, canonical form of the dashboard's settings. Raises Reject."""
+    if not isinstance(settings, dict):
+        raise Reject('settings is not an object')
+    for key in settings:
+        _check_key(key, SETTING_KEYS, 'setting')
+    for key, value in settings.items():
+        if not isinstance(value, str):
+            raise Reject('invalid %s' % key)
+    # The old generator wrote values as they were and dnsmasq ignores white space around them, so a gateway with a
+    # trailing space or a range start with a leading one worked. Only plain spaces can be left here (_scan_strings
+    # has refused every other control character); they are removed and the stripped value is what gets checked
+    # and rendered.
+    settings = dict((key, value.strip(' ')) for key, value in settings.items())
+    out = {}
+    enabled = settings.get('dhcp_enabled', 'false')
+    if enabled not in ('true', 'false'):
+        raise Reject('invalid dhcp_enabled')
+    out['dhcp_enabled'] = enabled == 'true'
+    iface = settings.get('interface', '')
+    if iface != '' and not _IFACE_RE.fullmatch(iface):
+        raise Reject('invalid interface')
+    out['interface'] = iface
+    cidr = settings.get('cidr', '')
+    if cidr == '':
+        cidr = '24'
+    if not _CIDR_RE.fullmatch(cidr) or int(cidr) > 32:
+        raise Reject('invalid cidr')
+    out['cidr'] = int(cidr)
+    for key in ('range_start', 'range_end', 'gateway', 'dns_primary', 'dns_secondary'):
+        out[key] = _optional_ipv4(settings.get(key, ''), key)
+    lease = settings.get('lease_time', '')
+    if lease == '':
+        lease = '24h'
+    if not _LEASE_RE.fullmatch(lease):
+        raise Reject('invalid lease_time')
+    out['lease_time'] = lease.lower()
+    domain = settings.get('domain', '')
+    if domain != '' and (len(domain) > 253 or not _DOMAIN_RE.fullmatch(domain)):
+        raise Reject('invalid domain')
+    out['domain'] = domain
+    return out
+
+
+def normalize_reservations(items):
+    if not isinstance(items, list):
+        raise Reject('reservations is not a list')
+    if len(items) > MAX_RESERVATIONS:
+        raise Reject('too many reservations')
+    out = []
+    for number, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise Reject('reservation %d is not an object' % number)
+        for key in item:
+            _check_key(key, RESERVATION_KEYS, 'reservation')
+        mac, ip, host = item.get('mac'), item.get('ip'), item.get('hostname', '')
+        mac, ip, host = (v.strip(' ') if isinstance(v, str) else v for v in (mac, ip, host))
+        if not isinstance(mac, str) or not _MAC_RE.fullmatch(mac):
+            raise Reject('invalid reservation %d mac' % number)
+        ip = _ipv4(ip, 'reservation %d ip' % number)
+        if not isinstance(host, str) or (host != '' and (len(host) > 253 or not _HOST_RE.fullmatch(host))):
+            raise Reject('invalid reservation %d hostname' % number)
+        out.append((mac, ip, host))
+    return out
+
+
+def parse_request(raw):
+    """bytes -> (action, normalized settings, normalized reservations). Raises Reject."""
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        raise Reject('request is not ASCII')
+    try:
+        obj = json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
+        raise Reject('request is not valid JSON')
+    if not isinstance(obj, dict):
+        raise Reject('request is not an object')
+    for key in obj:
+        _check_key(key, TOP_KEYS, 'request')
+    _scan_strings(obj)
+    if type(obj.get('version')) is not int or obj.get('version') != 1:
+        raise Reject('unsupported request version')
+    action = obj.get('action')
+    if action not in ('apply', 'validate'):
+        raise Reject('invalid action')
+    settings = normalize_settings(obj.get('settings', {}))
+    reservations = normalize_reservations(obj.get('reservations', []))
+    return action, settings, reservations
+
+
+# ============================================================ rendering ============================================================
+
+def _default_interface():
+    """Same as the old generator: `ip route | grep default | awk '{print $5}' | head -n1`."""
+    exe = next((p for p in IP_BIN if os.access(p, os.X_OK)), None)
+    if exe is None:
+        return ''
+    try:
+        proc = subprocess.run([exe, 'route'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10, env=_env())
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    for line in proc.stdout.decode('ascii', 'replace').splitlines():
+        if 'default' in line:
+            fields = line.split()
+            iface = fields[4] if len(fields) >= 5 else ''
+            return iface if _IFACE_RE.fullmatch(iface) else ''
+    return ''
+
+
+def render_main(s, now=None, default_interface=None):
+    """The text of /etc/dnsmasq.conf for normalized settings s. Same bytes as the old PHP generator
+    (apart from the timestamp's timezone, which is the system's here)."""
+    iface = s['interface']
+    if iface == '':
+        iface = default_interface() if default_interface else _default_interface()
+    cfg = HEADER_FMT % time.strftime('%Y-%m-%d %H:%M:%S', now or time.localtime())
+    cfg += "# Interface\ninterface=%s\nbind-dynamic\n\n" % iface
+    cfg += "# Disable DNS (DHCP only)\nport=0\n\n"
+    if s['dhcp_enabled'] and s['range_start'] != '' and s['range_end'] != '':
+        netmask = str(ipaddress.IPv4Network('0.0.0.0/%d' % s['cidr']).netmask)
+        cfg += "# DHCP Range\ndhcp-range=%s,%s,%s,%s\n\n" % (s['range_start'], s['range_end'], netmask, s['lease_time'])
+        if s['gateway'] != '':
+            cfg += "# Gateway\ndhcp-option=option:router,%s\n\n" % s['gateway']
+        dns = [v for v in (s['dns_primary'], s['dns_secondary']) if v != '']
+        if dns:
+            cfg += "# DNS Servers\ndhcp-option=option:dns-server,%s\n\n" % ','.join(dns)
+        if s['domain'] != '':
+            cfg += "# Domain\ndomain=%s\n\n" % s['domain']
+    else:
+        cfg += "# DHCP is disabled - configure via Web UI\n\n"
+    cfg += "# Lease file\n%s\n\n" % FIXED_LEASEFILE
+    cfg += "# Be authoritative\ndhcp-authoritative\n\n"
+    cfg += "# Logging\nlog-dhcp\n%s\n\n" % FIXED_LOGFACILITY
+    cfg += "# DHCP grace period notification for IronGate\n%s\n\n" % FIXED_SCRIPT
+    cfg += "# Static reservations\n%s\n" % FIXED_CONFDIR
+    verify_main(cfg)
+    return cfg
+
+
+def render_reservations(items):
+    out = RES_HEADER
+    for mac, ip, host in items:
+        out += "dhcp-host=%s,%s%s\n" % (mac, ip, (',' + host) if host != '' else '')
+    verify_reservations(out)
+    return out
+
+
+def _directive(line):
+    body = line.strip()
+    if body == '' or body.startswith('#'):
+        return None
+    return re.split(r'[=\s]', body, maxsplit=1)[0]
+
+
+def verify_main(text):
+    """Last line of defence: the rendered file holds only known directives, and the fixed lines exactly once."""
+    seen = {}
+    for line in text.split('\n'):
+        name = _directive(line)
+        if name is None:
+            continue
+        if name not in MAIN_NAMES:
+            raise Reject('rendered config holds an unexpected directive')
+        seen[name] = seen.get(name, 0) + 1
+        if name == 'dhcp-script' and line != FIXED_SCRIPT:
+            raise Reject('rendered config changes dhcp-script')
+        if name == 'conf-dir' and line != FIXED_CONFDIR:
+            raise Reject('rendered config changes conf-dir')
+        if name == 'dhcp-leasefile' and line != FIXED_LEASEFILE:
+            raise Reject('rendered config changes dhcp-leasefile')
+        if name == 'log-facility' and line != FIXED_LOGFACILITY:
+            raise Reject('rendered config changes log-facility')
+    for name in ('dhcp-script', 'conf-dir', 'dhcp-leasefile', 'log-facility', 'interface', 'port'):
+        if seen.get(name) != 1:
+            raise Reject('rendered config does not hold %s exactly once' % name)
+    if '\r' in text or '\x00' in text:
+        raise Reject('rendered config holds a control character')
+
+
+def verify_reservations(text):
+    for line in text.split('\n'):
+        name = _directive(line)
+        if name is not None and name != 'dhcp-host':
+            raise Reject('rendered reservations hold an unexpected directive')
+    if '\r' in text or '\x00' in text:
+        raise Reject('rendered reservations hold a control character')
+
+
+# ============================================================ helpers ============================================================
+
+def _env():
+    return {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
+
+
+def _log(message):
+    if syslog is not None:
+        try:
+            syslog.openlog('irongate-dnsmasq-apply', syslog.LOG_PID, syslog.LOG_AUTH)
+            syslog.syslog(syslog.LOG_NOTICE, message)
+        except Exception:  # logging must never decide the outcome
+            pass
+
+
+def _run(argv, timeout):
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout, env=_env(), close_fds=True)
+    except subprocess.TimeoutExpired:
+        return 124, 'timed out after %d s' % timeout
+    except OSError as exc:
+        return 127, str(exc)
+    return proc.returncode, proc.stdout.decode('utf-8', 'replace').strip()[-4000:]
+
+
+def _tool(candidates, name):
+    for path in candidates:
+        if os.access(path, os.X_OK):
+            return path
+    raise Failure('validation', '%s is not installed' % name, code=5)
+
+
+def _root_only_dir(path):
+    """The directory is a real directory owned by root that nobody else can write."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise Failure('validation', '%s: %s' % (path, exc.strerror), code=5)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Failure('validation', '%s must be a directory owned by root that only root can write '
+                      '(run the installer, or dnsmasq-apply --lockdown)' % path, code=5)
+
+
+def _read_regular(path):
+    """Contents of a regular file, or None if there is none. Never follows a link."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Failure('validation', '%s: %s' % (path, exc.strerror), code=5)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_CONF_FILE:
+            raise Failure('validation', '%s is not a regular file of a sane size' % path, code=5)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _install_file(path, data):
+    """Atomically replace path with data, root:root 0644: temp file next to it, fsync, rename."""
+    directory, name = os.path.split(path)
+    tmp = os.path.join(directory, '.%s.new.%d' % (name, os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o644)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(tmp)
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp, path)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    _fsync_dir(directory)
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(directory):
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _restore(path, old):
+    """Put the previous contents back (or remove the file if there was none)."""
+    try:
+        if old is None:
+            _unlink_quiet(path)
+        else:
+            _install_file(path, old)
+    except OSError as exc:  # keep going: the caller reports the original failure
+        _log('could not restore %s: %s' % (path, exc))
+
+
+def _web_uid():
+    try:
+        return pwd.getpwnam(WEB_USER).pw_uid
+    except KeyError:
+        return None
+
+
+def read_request():
+    """The staged request as bytes. The file is opened without following links relative to the staging
+    directory, must be a lone regular file owned by root or www-data, and is removed after reading."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        dfd = os.open(STAGE_DIR, flags | os.O_DIRECTORY)
+    except OSError as exc:
+        raise Failure('validation', 'staging directory %s: %s' % (STAGE_DIR, exc.strerror), code=5)
+    try:
+        dst = os.fstat(dfd)
+        if dst.st_uid != 0 or dst.st_mode & 0o002:
+            raise Failure('validation', 'staging directory must be owned by root and not world-writable', code=5)
+        try:
+            fd = os.open(REQUEST_NAME, flags | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                _unlink_quiet_at(REQUEST_NAME, dfd)
+                raise Reject('the staged request is a link')
+            raise Reject('no staged request')
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                # unlink(2) cannot remove a directory, so a directory named request.json would stay and block every later
+                # request (api.php renames its file over that name); empty it away, or put it aside under a dot name
+                raise Reject('the staged request is a directory (%s)' % _clear_directory_named_request(dfd))
+            allowed = {0}
+            web = _web_uid()
+            if web is not None:
+                allowed.add(web)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in allowed or st.st_size > MAX_REQUEST:
+                raise Reject('the staged request is not a plain file of an acceptable owner and size')
+            data = b''
+            while len(data) <= MAX_REQUEST:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) > MAX_REQUEST:
+                raise Reject('the staged request is too large')
+            return data
+        finally:
+            os.close(fd)
+            _unlink_quiet_at(REQUEST_NAME, dfd)
+    finally:
+        os.close(dfd)
+
+
+def _unlink_quiet_at(name, dfd):
+    try:
+        os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
+def _clear_directory_named_request(dfd):
+    """request.json is a directory in the staging directory: remove it if it is empty, else rename it aside."""
+    try:
+        os.rmdir(REQUEST_NAME, dir_fd=dfd)
+        return 'removed'
+    except OSError:
+        pass
+    aside = '.refused.%d.%d.%s' % (int(time.time()), os.getpid(), REQUEST_NAME)
+    try:
+        os.rename(REQUEST_NAME, aside, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return 'moved aside as %s' % aside
+    except OSError as exc:
+        return 'could not be moved: %s' % exc.strerror
+
+
+# ============================================================ the apply ============================================================
+
+def apply(action, settings, reservations):
+    dnsmasq = _tool(DNSMASQ_BIN, 'dnsmasq')
+    systemctl = _tool(SYSTEMCTL_BIN, 'systemctl')
+    main_text = render_main(settings)
+    res_text = render_reservations(reservations)
+    for directory in (os.path.dirname(CONF_PATH) or '/', CONF_DIR):
+        _root_only_dir(directory)
+    _require_clean_tree()
+    res_path = os.path.join(CONF_DIR, RES_NAME)
+    old_main = _read_regular(CONF_PATH)
+    old_res = _read_regular(res_path)
+    tmp_main = os.path.join(os.path.dirname(CONF_PATH), '.%s.test.%d' % (os.path.basename(CONF_PATH), os.getpid()))
+
+    def check_candidate():
+        _unlink_quiet(tmp_main)
+        fd = os.open(tmp_main, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, main_text.encode('ascii'))
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        try:
+            return _run([dnsmasq, '--test', '--conf-file=%s' % tmp_main], TEST_TIMEOUT)
+        finally:
+            _unlink_quiet(tmp_main)
+
+    if action == 'validate':
+        # the candidate main file against the reservations that are live now (what the old `validate` did)
+        rc, out = check_candidate()
+        return {'success': True, 'stage': 'validation', 'valid': rc == 0, 'output': out, 'return_code': rc}
+
+    # apply: the new reservations must be in place for dnsmasq --test to read them through conf-dir
+    _install_file(res_path, res_text.encode('ascii'))
+    try:
+        rc, out = check_candidate()
+        if rc != 0:
+            _restore(res_path, old_res)
+            raise Failure('validation', out or 'dnsmasq --test failed', output=out, code=3, return_code=rc)
+        _install_file(CONF_PATH, main_text.encode('ascii'))
+        # The stop is WAITED for and its result counts: a `start` issued while the stop job is still queued cancels it, dnsmasq would go on as
+        # the old process with the old configuration and this would report success. A stop job that finished (rc 0) means dnsmasq is down, so
+        # the start that follows is a real restart on the new files.
+        rc, out = _run([systemctl, 'stop', 'dnsmasq'], STOP_TIMEOUT)
+        what = 'stop'
+        if rc == 0:
+            time.sleep(0.5)
+            rc, out = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+            what = 'start'
+        if rc != 0:
+            _restore(CONF_PATH, old_main)
+            _restore(res_path, old_res)
+            # after a stop that did not finish this `start` is also what cancels the queued stop job (a killed client leaves it behind):
+            # dnsmasq is never left to be stopped later, and runs on the files that are back
+            rc_back, _out_back = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+            if what == 'stop':
+                out = 'systemctl stop dnsmasq: %s (the previous files are back)' % out   # api.php shows `output` under its fixed 'Service start failed'
+            raise Failure('start', 'Service %s failed' % what, output=out, code=4, restored=True, restarted=rc_back == 0)
+    except Failure:
+        raise
+    except BaseException:
+        # whatever went wrong, the previous files are what dnsmasq finds on its next start
+        _restore(CONF_PATH, old_main)
+        _restore(res_path, old_res)
+        raise
+    _save_snapshot({'main': main_text.encode('ascii'), 'res': res_text.encode('ascii')})
+    return {'success': True, 'stage': 'start'}
+
+
+def _take_lock():
+    """The one lock that serialises everything that writes the dnsmasq files: a request, and the lockdown."""
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def run_request():
+    fd = _take_lock()
+    action = '?'
+    try:
+        raw = read_request()
+        action, settings, reservations = parse_request(raw)
+        result = apply(action, settings, reservations)
+        _log('%s ok (%d reservations)' % (action, len(reservations)))
+        return 0, result
+    except Reject as exc:
+        _log('request refused: %s' % exc)
+        return 2, {'success': False, 'stage': 'validation', 'error': 'Request refused: %s' % exc}
+    except Failure as exc:
+        _log('%s failed at %s: %s' % (action, exc.stage, exc.error[:200]))
+        body = {'success': False, 'stage': exc.stage, 'error': exc.error, 'output': exc.output}
+        body.update(exc.extra)
+        return exc.code, body
+    finally:
+        os.close(fd)
+
+
+# ============================================================ what dnsmasq's own parser would read ============================================================
+
+def _chunks(data):
+    """(physical line number, bytes) in the pieces dnsmasq's fgets() loop hands to its option parser."""
+    stream = io.BytesIO(data)
+    number = 1
+    while True:
+        piece = stream.readline(READ_CHUNK)
+        if not piece:
+            return
+        yield number, piece
+        if piece.endswith(b'\n'):
+            number += 1
+
+
+def _squash(piece):
+    """One piece as dnsmasq's first pass leaves it: cut at a NUL (it works on C strings), quotes removed (what they
+    enclose stays), white space folded to one blank, and a `#` that starts a word ends the line."""
+    text = piece.split(b'\x00', 1)[0].decode('latin-1')
+    out = []
+    white = True
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                out.append(text[i])
+                i += 1
+            i += 1
+            continue
+        if ch.isspace():
+            out.append(' ')
+            white = True
+        else:
+            if white and ch == '#':
+                break
+            white = False
+            out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _canonical(name):
+    return name.lower().replace('_', '-').lstrip('-')
+
+
+def directive_name(piece):
+    """The option name dnsmasq finds in a line piece (canonical: lower case, `_` as `-`, no leading dashes, which
+    only widens what is recognised), or None for a blank line or a comment."""
+    body = _squash(piece).strip()
+    if body == '':
+        return None
+    return _canonical(re.split(r'[=\s]', body, maxsplit=1)[0])
+
+
+# The only syntax the files the web tier could write may use: blank lines, `#` comments of printable ASCII, and
+# `name[=value]` with a plain value. No quote, backslash, NUL, CR, byte above 0x7e or line over dnsmasq's read size,
+# so there is no room left for the ways a directive can be spelled so that dnsmasq reads it and a scanner does not.
+_G_COMMENT = re.compile(r'[ \t]*(?:#[\x20-\x7e\t]*)?')
+_G_DIRECTIVE = re.compile(r'[ \t]*[a-z][a-z0-9-]*(?:[ \t]*=[ \t]*[A-Za-z0-9 \t,.:/_@+*!\[\]%=-]*)?')
+
+
+def _syntax_problems(data):
+    problems = []
+    for number, raw in enumerate(data.split(b'\n'), 1):
+        if len(raw) > READ_CHUNK - 1:
+            problems.append((number, 'line-too-long'))
+            continue
+        try:
+            line = raw.decode('ascii')
+        except UnicodeDecodeError:
+            problems.append((number, 'non-ascii-character'))
+            continue
+        if any(ord(c) < 0x20 and c != '\t' or ord(c) == 0x7f for c in line):
+            problems.append((number, 'control-character'))
+            continue
+        if not (_G_COMMENT.fullmatch(line) or _G_DIRECTIVE.fullmatch(line)):
+            problems.append((number, 'unusual-syntax'))
+    return problems
+
+
+def _fixed_main_line(text):
+    return text.strip() in (FIXED_SCRIPT, FIXED_CONFDIR, FIXED_LEASEFILE, FIXED_LOGFACILITY)
+
+
+def scan_config(data, kind, strict):
+    """Findings [(line number, what)] in the bytes of a dnsmasq configuration file; `what` is a name from FORBIDDEN or
+    a fixed tag, never text of the file. kind: 'main' (the four fixed lines of the rendering are allowed as they are),
+    'res' (reservations.conf: nothing but dhcp-host) or 'other'. strict: the web tier could have written the file, so
+    only the plain syntax above is accepted as well, and what is left is an ALLOWLIST, not a list of what to refuse: the
+    main file may hold only the names render_main() emits, any other file only options dnsmasq has (KNOWN_OPTIONS).
+    A name no list has heard of can then not be a spelling of a forbidden option that this program does not know yet."""
+    found = []
+    if strict:
+        found += _syntax_problems(data)
+    for number, piece in _chunks(data):
+        name = directive_name(piece)
+        if name is None:
+            continue
+        if kind == 'main' and _fixed_main_line(piece.decode('latin-1')) and name in FORBIDDEN:
+            continue
+        if name in FORBIDDEN:
+            found.append((number, name))
+        elif kind == 'res' and name != 'dhcp-host':
+            found.append((number, 'not-dhcp-host'))
+        elif strict and kind == 'main' and name not in MAIN_NAMES:
+            found.append((number, 'not-rendered'))
+        elif strict and kind == 'other' and name not in KNOWN_OPTIONS:
+            found.append((number, 'unknown-option'))
+    return sorted(set(found))
+
+
+def _safe(text):
+    return ''.join(c if 0x21 <= ord(c) <= 0x7e else '?' for c in text)
+
+
+# ============================================================ audit (read-only) ============================================================
+
+def _audit_file(path, kind):
+    findings = []
+    label = _safe(path)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return findings
+    if stat.S_ISLNK(st.st_mode):
+        return [(label, 0, 'symlink')]
+    if not stat.S_ISREG(st.st_mode):
+        return [(label, 0, 'not-a-regular-file')]
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        findings.append((label, 0, 'not-root-only'))
+    try:
+        data = _read_regular(path)
+    except Failure:
+        return findings + [(label, 0, 'unreadable-or-too-large')]
+    if data is not None:
+        findings += [(label, number, what) for number, what in scan_config(data, kind, strict=False)]
+    return findings
+
+
+def _audit_exec_paths():
+    """The programs root runs for the web tier (sudo: the helper) and for dnsmasq (dhcp-script): neither the file nor a
+    directory above it may be changed by anybody but root."""
+    findings = []
+    for path in EXEC_PATHS:
+        chain = ['/']
+        cur = ''
+        for part in [p for p in path.split('/') if p][:-1]:
+            cur += '/' + part
+            chain.append(cur)
+        for directory in chain:
+            try:
+                st = os.stat(directory)
+            except OSError:
+                break
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                findings.append((_safe(directory), 0, 'exec-path-not-root-only'))
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            findings.append((_safe(path), 0, 'exec-path-not-root-only'))
+    return sorted(set(findings))
+
+
+def audit():
+    """Read-only. Every file dnsmasq reads - /etc/dnsmasq.conf and EVERY entry of /etc/dnsmasq.d, root-owned ones and
+    operator files included, whatever their names (a Debian dnsmasq reads them all) - must be a regular file that only
+    root can write and must not hold a directive the web tier must not set. Returns the findings (path, line, what)."""
+    findings = []
+    for directory in (os.path.dirname(CONF_PATH) or '/', CONF_DIR):
+        try:
+            st = os.lstat(directory)
+        except OSError:
+            findings.append((_safe(directory), 0, 'missing'))
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            findings.append((_safe(directory), 0, 'directory-not-root-only'))
+    findings += _audit_file(CONF_PATH, 'main')
+    try:
+        names = sorted(os.listdir(CONF_DIR))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(CONF_DIR, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if name.startswith('.refused.') and st.st_uid == 0 and not stat.S_ISREG(st.st_mode):
+            continue  # put aside by --lockdown (a link, directory or special file renamed to a dot name, which dnsmasq skips)
+        findings += _audit_file(path, 'res' if name == RES_NAME else 'other')
+    findings += _audit_exec_paths()
+    return findings
+
+
+def _require_clean_tree():
+    """`dnsmasq --test` (and the daemon) executes conf-script, so it never runs on a tree the audit objects to."""
+    findings = audit()
+    if findings:
+        _log('refusing to run dnsmasq: %d audit finding(s)' % len(findings))
+        raise Failure('validation', 'the dnsmasq configuration is not clean or not root-only (%d finding(s)): '
+                      'run dnsmasq-apply --audit as root' % len(findings), code=5)
+
+
+# ============================================================ root-held state: quarantine and snapshot ============================================================
+
+def _mkdir_root(path, mode):
+    os.mkdir(path, 0o700)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _ensure_state_dirs():
+    """/var/lib/irongate (root, 0755) with the quarantine and snapshot directories (root, 0700) below it."""
+    for path, mode, private in ((STATE_DIR, 0o755, False), (QUARANTINE_DIR, 0o700, True), (SNAPSHOT_DIR, 0o700, True)):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            _mkdir_root(path, mode)
+            st = os.lstat(path)
+        bad = st.st_mode & (0o077 if private else 0o022)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or bad:
+            raise Failure('validation', '%s must be a directory owned by root%s' % (path, ' that nobody else can open' if private else ' that only root can write'), code=5)
+
+
+def _write_new(dfd, name, data, mtime_ns=None, private=False):
+    """Create `name` (a new root:root file, 0644 or 0600 in the private directories) in the directory dfd with `data`,
+    atomically: temp file, fsync, rename. Returns nothing; raises OSError.
+    The temporary name is not made from `name`: an entry of the web tier's directory can have a name of 255 characters
+    and `.<name>.lock.<pid>` is longer than NAME_MAX, which stopped the lockdown half way (O_EXCL on a name somebody
+    else already took stopped it just the same). A name that is taken is not used; the next one is."""
+    mode = 0o600 if private else 0o644
+    base = '.new.%d.%d' % (os.getpid(), time.monotonic_ns())
+    tmp, attempt = base, 0
+    while True:
+        try:
+            nfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+            break
+        except FileExistsError:
+            attempt += 1
+            if attempt > 32:
+                raise
+            tmp = '%s.%d' % (base, attempt)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(nfd, view):]
+        os.fchown(nfd, 0, 0)
+        os.fchmod(nfd, mode)
+        if mtime_ns is not None:
+            os.utime(nfd, ns=mtime_ns)
+        os.fsync(nfd)
+    except BaseException:
+        os.close(nfd)
+        os.unlink(tmp, dir_fd=dfd)
+        raise
+    os.close(nfd)
+    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+SNAPSHOT_NAMES = {'main': 'dnsmasq.conf', 'res': 'reservations.conf'}
+
+
+def _snapshot_ok(kind, data):
+    """What may be kept as, and believed to be, the last good content: plain ASCII that passes the scan the lockdown
+    applies to a file the web tier could have written (no forbidden directive, nothing but plain `name=value` lines)."""
+    try:
+        data.decode('ascii')
+    except UnicodeDecodeError:
+        return False
+    return not scan_config(data, kind, strict=True)
+
+
+def _load_snapshot():
+    """The last good content the root helper kept: {'main': bytes|None, 'res': bytes|None}. A snapshot that is not
+    private to root, or that fails the scan, does not exist."""
+    snap = {'main': None, 'res': None}
+    try:
+        dfd = os.open(SNAPSHOT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return snap
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != 0 or st.st_mode & 0o077:
+            return snap
+        for kind, name in SNAPSHOT_NAMES.items():
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+            except OSError:
+                continue
+            try:
+                s = os.fstat(fd)
+                if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077 or s.st_size > MAX_CONF_FILE:
+                    continue
+                data = os.read(fd, MAX_CONF_FILE + 1)
+            finally:
+                os.close(fd)
+            if _snapshot_ok(kind, data):
+                snap[kind] = data
+    finally:
+        os.close(dfd)
+    return snap
+
+
+def _save_snapshot(items):
+    """Keep what was just verified and installed (a dict kind -> bytes). Never decides the outcome of a run."""
+    try:
+        _ensure_state_dirs()
+        dfd = os.open(SNAPSHOT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for kind, data in items.items():
+                if data is not None and _snapshot_ok(kind, data):
+                    _write_new(dfd, SNAPSHOT_NAMES[kind], data, private=True)
+        finally:
+            os.close(dfd)
+    except (OSError, Failure) as exc:
+        _log('snapshot not saved: %s' % (getattr(exc, 'strerror', None) or getattr(exc, 'error', '') or type(exc).__name__))
+
+
+def _quarantine_copy(label, name, data, why, out):
+    """Keep the bytes of a file that is not re-created in the root-only quarantine directory (never overwriting, never
+    following a link) and say so. Failing to keep a copy does not keep the file in place."""
+    where = '(no copy kept)'
+    try:
+        qfd = os.open(QUARANTINE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if len(os.listdir(qfd)) >= MAX_QUARANTINE:
+                where = '(quarantine full, no copy kept)'
+            else:
+                new = '%s.%d.%s' % (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()), os.getpid(), _safe(name)[:100])
+                suffix = 0
+                while True:
+                    try:
+                        _write_exclusive(qfd, new if suffix == 0 else '%s.%d' % (new, suffix), data[:MAX_CONF_FILE])
+                        break
+                    except FileExistsError:
+                        suffix += 1
+                where = os.path.join(QUARANTINE_DIR, new if suffix == 0 else '%s.%d' % (new, suffix))
+        finally:
+            os.close(qfd)
+    except OSError as exc:
+        where = '(no copy kept: %s)' % exc.strerror
+    _log('quarantined %s: %s' % (label, why))
+    out.append('lockdown: QUARANTINED %s (%s) -> %s' % (label, why, where))
+
+
+def _write_exclusive(dfd, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _why(findings):
+    return ', '.join('%s at line %d' % (what, number) for number, what in findings[:6]) + (' ...' if len(findings) > 6 else '')
+
+
+def _default_main():
+    """What replaces a /etc/dnsmasq.conf that must not be kept and has no snapshot: DHCP off, which the dashboard
+    turns on again with Save & Apply (it renders from the database)."""
+    settings = normalize_settings({'dhcp_enabled': 'false', 'interface': _default_interface() or 'lo'})
+    return render_main(settings).encode('ascii')
+
+
+def _salvage_reservations(data):
+    """The dhcp-host lines of the exact shape this program renders; everything else is dropped."""
+    items = []
+    for line in data.decode('latin-1').split('\n'):
+        m = re.fullmatch(r'dhcp-host=([^,]+),([^,]+)(?:,([^,]+))?', line)
+        if m:
+            try:
+                items += normalize_reservations([{'mac': m.group(1), 'ip': m.group(2), 'hostname': m.group(3) or ''}])
+            except Reject:
+                pass
+    return render_reservations(items).encode('ascii')
+
+
+# ============================================================ lockdown ============================================================
+
+def _refuse(dfd, name, label, out, why):
+    """A link, directory or special file in a root-owned directory (or any entry that could not be processed): renamed to a
+    dot name (dnsmasq skips those, nothing is deleted, a link is never followed) and given to root. The new name is short
+    whatever the old one was; if somebody took it (a directory there, say) the next one is tried."""
+    base = '.refused.%d.%d.%s' % (int(time.time()), os.getpid(), _safe(name)[:100])
+    new, attempt = base, 0
+    while True:
+        try:
+            os.rename(name, new, src_dir_fd=dfd, dst_dir_fd=dfd)
+            break
+        except OSError as exc:
+            attempt += 1
+            if attempt > 32 or exc.errno not in (errno.EISDIR, errno.ENOTDIR, errno.ENOTEMPTY, errno.EEXIST):
+                raise
+            new = '%s.%d' % (base, attempt)
+    try:
+        os.chown(new, 0, 0, dir_fd=dfd, follow_symlinks=False)
+    except OSError:
+        pass
+    # a regular file put aside (an entry that could not be processed) keeps the mode the web tier gave it: no write bit for group and others
+    try:
+        fd = os.open(new, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+        try:
+            mode = os.fstat(fd)
+            if stat.S_ISREG(mode.st_mode) and mode.st_uid == 0:
+                os.fchmod(fd, stat.S_IMODE(mode.st_mode) & ~0o022)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    out.append('lockdown: QUARANTINED %s (%s) -> %s' % (label, why, new))
+
+
+def _read_all(fd, limit):
+    chunks, total = [], 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b''.join(chunks)
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+
+
+def _lock_entry(dfd, name, label, kind, snap, out, final):
+    """One entry of a root-owned directory (kind: 'other', 'res' for reservations.conf, 'main' for dnsmasq.conf)."""
+    label = _safe(label)
+    try:
+        lst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if name.startswith('.refused.') and lst.st_uid == 0 and not stat.S_ISREG(lst.st_mode):
+        return  # put aside by an earlier run
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError as exc:
+        return _refuse(dfd, name, label, out, 'link' if exc.errno == errno.ELOOP else exc.strerror)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            fd = None
+            return _refuse(dfd, name, label, out, 'directory' if stat.S_ISDIR(st.st_mode) else 'special file')
+        if st.st_uid == 0 and not st.st_mode & 0o022:
+            out.append('lockdown: kept %s (root-owned, mode %o)' % (label, stat.S_IMODE(st.st_mode)))
+            if kind != 'other':
+                final[kind] = (_read_all(fd, MAX_CONF_FILE), True)
+            return
+        data = _read_all(fd, MAX_CONF_FILE)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    mtime = (st.st_atime_ns, st.st_mtime_ns)
+    if data is None:
+        os.unlink(name, dir_fd=dfd)
+        _quarantine_copy(label, name, b'', 'larger than %d bytes' % MAX_CONF_FILE, out)
+        return
+    findings = scan_config(data, kind if kind in ('main', 'res') else 'other', strict=True)
+    if kind == 'other':
+        if findings:
+            _quarantine_copy(label, name, data, _why(findings), out)
+            os.unlink(name, dir_fd=dfd)
+        else:
+            _write_new(dfd, name, data, mtime_ns=mtime)
+            out.append('lockdown: re-created %s as root:root 0644 (was uid %d, mode %o)' % (label, st.st_uid, stat.S_IMODE(st.st_mode)))
+        return
+    # The two files this program renders: never trusted from the disk when a root-held snapshot of the last good
+    # rendering exists; without one, what is clean stays and what is not is replaced.
+    snapshot = snap.get(kind)
+    reliable = True
+    if snapshot is not None:
+        content = snapshot
+        if data != snapshot:
+            if findings:
+                _quarantine_copy(label, name, data, _why(findings), out)
+            else:
+                _quarantine_copy(label, name, data, 'differs from the root-held snapshot', out)
+                out[-1] = out[-1].replace('QUARANTINED', 'REPLACED', 1)
+            out.append('lockdown: restored %s from the root-held snapshot' % label)
+            mtime = None
+    elif not findings:
+        content = data
+    else:
+        _quarantine_copy(label, name, data, _why(findings), out)
+        if kind == 'main':
+            content, reliable = _default_main(), False
+            out.append('lockdown: %s is now a safe default (DHCP off): Save & Apply in the dashboard renders it again' % label)
+        else:
+            content = _salvage_reservations(data)
+            out.append('lockdown: %s keeps only its dhcp-host lines of the shape this program renders' % label)
+        mtime = None
+    _write_new(dfd, name, content, mtime_ns=mtime)
+    out.append('lockdown: re-created %s as root:root 0644 (was uid %d, mode %o)' % (label, st.st_uid, stat.S_IMODE(st.st_mode)))
+    final[kind] = (content, reliable)
+
+
+def lockdown():
+    lock = _take_lock()  # a request that is being applied finishes first; none starts while the files are re-created
+    try:
+        return _lockdown()
+    finally:
+        os.close(lock)
+
+
+def _lock_one(dfd, name, label, kind, snap, out, final, failed):
+    """_lock_entry for one entry, with whatever goes wrong with it contained here: a read or write error, an exhausted disk,
+    a name of any length, a bug. The entry is put aside like a link (a name dnsmasq skips) and the lockdown goes on, so one
+    entry can never leave the others - above all the main file, which is the last one - in the web tier's hands. What could
+    not even be put aside is listed in `failed`, and so is a main file that had to be (it is gone)."""
+    try:
+        _lock_entry(dfd, name, label, kind, snap, out, final)
+        return
+    except Exception as exc:  # not BaseException: a signal still ends the run
+        why = getattr(exc, 'strerror', None) or type(exc).__name__
+    shown = _safe(label)
+    try:
+        _refuse(dfd, name, shown, out, 'could not be locked: %s' % why)
+    except FileNotFoundError:
+        return  # gone meanwhile: nothing is left to lock
+    except OSError as exc:
+        out.append('lockdown: FAILED %s (%s; it could not be put aside either: %s)' % (shown, why, exc.strerror))
+        failed.append(shown)
+        return
+    if kind == 'main':
+        failed.append(shown)
+
+
+def _lockdown():
+    out = []
+    final = {}
+    failed = []
+    _ensure_state_dirs()
+    snap = _load_snapshot()
+    st = os.lstat(CONF_DIR) if os.path.lexists(CONF_DIR) else None
+    if st is None:
+        os.mkdir(CONF_DIR, 0o755)
+    elif not stat.S_ISDIR(st.st_mode):
+        raise Failure('validation', '%s is not a directory' % CONF_DIR, code=5)
+    dfd = os.open(CONF_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        # first the directory itself: from here on nobody but root can add, rename or remove entries
+        os.fchown(dfd, 0, 0)
+        os.fchmod(dfd, 0o755)
+        out.append('lockdown: %s is root:root 0755' % CONF_DIR)
+        for name in sorted(os.listdir(dfd)):
+            _lock_one(dfd, name, os.path.join(CONF_DIR, name), 'res' if name == RES_NAME else 'other', snap, out, final, failed)
+    finally:
+        os.close(dfd)
+    parent, name = os.path.split(CONF_PATH)
+    pfd = os.open(parent or '/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.path.islink(CONF_PATH):
+            raise Failure('validation', '%s is a symbolic link: resolve it by hand' % CONF_PATH, output='\n'.join(out), code=5)
+        if os.path.lexists(CONF_PATH):
+            _lock_one(pfd, name, CONF_PATH, 'main', snap, out, final, failed)
+        else:
+            out.append('lockdown: %s does not exist' % CONF_PATH)
+    finally:
+        os.close(pfd)
+    keep = {}
+    for kind, (content, reliable) in final.items():
+        if reliable and content is not None and content != snap.get(kind) and _snapshot_ok(kind, content):
+            keep[kind] = content
+    if keep:
+        _save_snapshot(keep)
+    if failed:
+        # everything else is done (the directory and the main file are root's, the other entries are re-created or put aside);
+        # the report goes out with the failure so that the operator sees what was done and what was not
+        raise Failure('validation', 'could not lock: %s' % ', '.join(failed), output='\n'.join(out), code=5)
+    return out
+
+
+def main(argv):
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        print(json.dumps({'success': False, 'stage': 'validation', 'error': 'must run as root (through sudo)'}))
+        return 5
+    if len(argv) > 1:
+        # --lockdown only makes dnsmasq's files root-owned and --audit only names directives, so neither is dangerous in
+        # other hands; and the installer runs them under `sudo` or from the updater that www-data starts through sudo, so
+        # SUDO_UID cannot be used to tell a legitimate caller from another. The sudoers rule (`""`) is what keeps arguments
+        # away from the web tier.
+        try:
+            if argv[1:] == ['--lockdown']:
+                for line in lockdown():
+                    print(line)
+                return 0
+            if argv[1:] == ['--audit']:
+                findings = audit()
+                for label, number, name in findings:
+                    print('FINDING %s:%d: %s' % (label, number, name))
+                print('audit: %d finding(s)' % len(findings))
+                return 1 if findings else 0
+        except Failure as exc:
+            if exc.output:
+                print(exc.output)  # what the lockdown did before it stopped
+            print('error: %s' % exc.error, file=sys.stderr)
+            return exc.code
+        except OSError as exc:
+            print('error: %s' % exc, file=sys.stderr)
+            return 1
+        print('usage: dnsmasq-apply [--lockdown | --audit]', file=sys.stderr)
+        return 2
+    try:
+        code, body = run_request()
+    except Exception as exc:  # never a traceback to the caller
+        _log('internal error: %s' % type(exc).__name__)
+        code, body = 1, {'success': False, 'stage': 'validation', 'error': 'internal error (%s)' % type(exc).__name__}
+    print(json.dumps(body))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+DNSMASQAPPLY
+chown root:root /opt/irongate/dnsmasq-apply
+chmod 755 /opt/irongate/dnsmasq-apply
+
+mkdir -p /var/lib/irongate
+chown root:root /var/lib/irongate
+chmod 755 /var/lib/irongate
+install -d -o root -g www-data -m 0770 /var/lib/irongate/dnsmasq-staged
+
+# sudo ignores every file of /etc/sudoers.d whose name contains a dot, and a sudoers file with a syntax error
+# makes sudo refuse to work at all: the drop-in is written under a dotted name, checked there with visudo and only
+# then renamed (atomically) to its real name, so a broken drop-in is never live.
+IG_SUDOERS_NEW=/etc/sudoers.d/.irongate-dnsmasq-apply.new
+rm -f "$IG_SUDOERS_NEW"
+cat << 'DNSMASQAPPLY_SUDOEOF' > "$IG_SUDOERS_NEW"
+# Allow the web UI (www-data) to hand a validated dnsmasq request to the root helper.
+# The helper takes NO arguments (the "" below), reads /var/lib/irongate/dnsmasq-staged/request.json, accepts only
+# the settings the dashboard sets, renders /etc/dnsmasq.conf and /etc/dnsmasq.d/reservations.conf itself and
+# restarts dnsmasq. Remove this file to revoke (DHCP settings can then no longer be applied from the web UI).
+www-data ALL=(root) NOPASSWD: /opt/irongate/dnsmasq-apply ""
+DNSMASQAPPLY_SUDOEOF
+chown root:root "$IG_SUDOERS_NEW"
+chmod 440 "$IG_SUDOERS_NEW"
+if visudo -cf "$IG_SUDOERS_NEW"; then
+    mv -T "$IG_SUDOERS_NEW" /etc/sudoers.d/irongate-dnsmasq-apply
+else
+    echo -e "${RED}ERROR: irongate-dnsmasq-apply sudoers failed validation - not installed (DHCP settings cannot be applied from the web UI until it is fixed)${NC}"
+    rm -f "$IG_SUDOERS_NEW"
+fi
+# ---- dnsmasq root helper: end ----
+
 #######################################
 # Set permissions
 #######################################
+# ---- web-tree permission helper: begin ----
+# /var/www/irongate and /etc/dnsmasq.d are handed to www-data (the web UI writes there), so the web tier
+# can create, rename and symlink entries in them at any moment, also while this installer runs as root.
+# `chmod FILE` and `chmod -R` have no no-follow switch (they re-resolve the name after looking at it),
+# so a link planted there made root chmod an arbitrary file (`chmod 666 dhcp.db` on a link to a root-only
+# file made it world-writable). ig_perm_fix opens every entry relative to the directory it already
+# holds with O_NOFOLLOW and changes owner and mode of the OPEN inode (fchown/fchmod), so nothing can
+# be redirected after the type check:
+#   ig_perm_fix tree DIR  OWNER GROUP MODE   DIR itself and every directory and regular file below it
+#                                            (a directory keeps its setuid/setgid bits, like chmod -R)
+#                                            get OWNER:GROUP and MODE; symlinks, FIFOs, sockets and
+#                                            hard-linked files are left alone and listed on stderr
+#   ig_perm_fix file PATH OWNER GROUP MODE   the same for one file; a symlink, any other type or a file
+#                                            with a second hard link is refused (exit 3, nothing changed)
+ig_perm_fix() {
+    python3 -I - "$@" <<'IG_PERM_FIX_PY'
+import errno
+import grp
+import os
+import pwd
+import stat
+import sys
+
+kind, path, owner, group, mode = sys.argv[1:6]
+FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+left = []
+
+
+def fix(fd, st, label, uid, gid, mode):
+    """Give the inode behind fd to uid:gid with mode; False (and noted) unless it is a directory or a lone regular file."""
+    if stat.S_ISDIR(st.st_mode):
+        keep = st.st_mode & 0o6000
+    elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+        keep = 0
+    else:
+        left.append(label)
+        return False
+    os.fchown(fd, uid, gid)
+    os.fchmod(fd, keep | mode)
+    return True
+
+
+def walk(dfd, prefix, depth, uid, gid, mode):
+    for name in sorted(os.listdir(dfd)):
+        label = prefix + "/" + name
+        try:
+            fd = os.open(name, FLAGS, dir_fd=dfd)
+        except OSError:
+            left.append(label)
+            continue
+        try:
+            st = os.fstat(fd)
+            if fix(fd, st, label, uid, gid, mode) and stat.S_ISDIR(st.st_mode):
+                if depth < 32:
+                    walk(fd, label, depth + 1, uid, gid, mode)
+                else:
+                    left.append(label + "/...")
+        finally:
+            os.close(fd)
+
+
+try:
+    uid, gid, mode = pwd.getpwnam(owner).pw_uid, grp.getgrnam(group).gr_gid, int(mode, 8)
+    if kind == "tree":
+        top = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fix(top, os.fstat(top), path, uid, gid, mode)
+        walk(top, path, 0, uid, gid, mode)
+    elif kind == "file":
+        parent, name = os.path.split(path)
+        pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fd = os.open(name, FLAGS, dir_fd=pfd)
+        except OSError as exc:
+            sys.stderr.write("ig_perm_fix: %s %s: refusing to change it\n"
+                             % (path, "is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+            sys.exit(3)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not fix(fd, st, path, uid, gid, mode):
+            sys.stderr.write("ig_perm_fix: %s is not a regular file with a single link: refusing to change it\n" % path)
+            sys.exit(3)
+    else:
+        sys.exit("ig_perm_fix: unknown kind %r" % kind)
+except (KeyError, OSError) as exc:
+    sys.exit("ig_perm_fix: %s: %s" % (path, exc))
+for label in left:
+    sys.stderr.write("ig_perm_fix: left alone (symlink, special file or hard-linked): %r\n" % label)
+IG_PERM_FIX_PY
+}
+# ---- web-tree permission helper: end ----
 echo -e "${YELLOW}Setting permissions...${NC}"
 
-chown -R www-data:www-data /var/www/irongate
-chmod -R 755 /var/www/irongate
-chmod 666 /var/www/irongate/dhcp.db
+# dhcp.db: written by the web API (www-data) and by root's sqlite3 (installer, updater), nothing else
+# reads it, so 0664 is enough; it was 0666, i.e. writable by every local user.
+ig_perm_fix tree /var/www/irongate www-data www-data 755
+ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data 664
 
 # Allow www-data to write dnsmasq config
 chown www-data:www-data /etc/dnsmasq.conf
 chmod 664 /etc/dnsmasq.conf
-chown -R www-data:www-data /etc/dnsmasq.d
-chmod -R 775 /etc/dnsmasq.d
+ig_perm_fix tree /etc/dnsmasq.d www-data www-data 775
 
 # Ensure lease file has proper ownership for dnsmasq to write
+# (the dnsmasq lockdown comes first: it closes the window the three lines above opened, and nothing else is left in it)
+# ---- dnsmasq lockdown: begin ----
+# Every file is read once, scanned the way dnsmasq's own parser reads it and written back as a new root-owned
+# file only if it is clean; a file holding a forbidden directive (or any syntax but plain `name=value`) is never
+# re-created: its bytes go to /var/lib/irongate/dnsmasq-quarantine, and the main file and reservations.conf are
+# restored from the root-held snapshot of the last good rendering. Links and special files are renamed to .refused.*
+# (dnsmasq skips dot files). The audit then reads EVERYTHING dnsmasq reads, root-owned files included; a finding
+# stops the installer, and the EXIT trap leaves dnsmasq stopped (ig_dnsmasq_tree_ok).
+echo -e "${YELLOW}Making /etc/dnsmasq.conf and /etc/dnsmasq.d root-only...${NC}"
+IG_LOCKDOWN_RC=0
+IG_LOCKDOWN_OUT=$(/opt/irongate/dnsmasq-apply --lockdown 2>&1) || IG_LOCKDOWN_RC=$?
+printf '%s\n' "$IG_LOCKDOWN_OUT"
+if [ "$IG_LOCKDOWN_RC" -ne 0 ]; then
+    echo -e "${RED}ERROR: could not make /etc/dnsmasq.conf and /etc/dnsmasq.d root-only - stopping, dnsmasq stays stopped${NC}"
+    exit 1
+fi
+case "$IG_LOCKDOWN_OUT" in
+    *QUARANTINED*) echo -e "${RED}WARNING: files the web tier could write were not clean and were put aside (names above): the web tier may be compromised${NC}" ;;
+esac
+if ! /opt/irongate/dnsmasq-apply --audit; then
+    echo -e "${RED}ERROR: /etc/dnsmasq.conf or /etc/dnsmasq.d still holds what the findings above name - stopping, dnsmasq stays stopped${NC}"
+    exit 1
+fi
+# ---- dnsmasq lockdown: end ----
 chown dnsmasq:nogroup /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || chown nobody:nogroup /var/lib/dnsmasq/dnsmasq.leases
 chmod 644 /var/lib/dnsmasq/dnsmasq.leases
 
@@ -4999,13 +6684,85 @@ mkdir -p /opt/irongate
 mkdir -p /etc/irongate
 mkdir -p /var/log/irongate
 
+# ---- /etc/irongate fixed-file helpers: begin ----
+# /etc/irongate is root:www-data 0775 on purpose (the web UI rewrites config.yaml), so the web tier
+# can create, rename and symlink entries there at any moment, also while this installer runs as
+# root. A root process must therefore never open, chown or chmod a fixed name in it by path:
+# that follows a planted symlink to whatever it points at (`cat >` on a dangling link even creates
+# the target, and on a FIFO it blocks forever). These helpers do the work in a root-only staging
+# directory on the same filesystem and reach the final name only through rename(2) (replaces a
+# symlink, never follows it) or link(2) (links the symlink itself, never its target):
+#   ig_etc_check  NAME       0 = NAME is a regular file, 1 = absent. A symlink, directory, FIFO,
+#                            socket or device is renamed aside (NAME.refused.<time>.<pid>, never
+#                            deleted) and reported, and counts as absent
+#   ig_etc_fix    NAME MODE  root:www-data MODE for an existing regular NAME, without following links
+#   ig_etc_commit NAME MODE  install the file staged as $IG_STAGE/NAME as root:www-data MODE
+#   ig_etc_ensure NAME MODE  NAME exists as a regular root:www-data MODE file (created empty if
+#                            missing, content of an existing file kept)
+IG_ETC=/etc/irongate
+IG_STAGE=/etc/.irongate-stage
+ig_stage() {
+    install -d -m 0700 -o root -g root "$IG_STAGE"
+}
+ig_etc_check() {
+    local p="$IG_ETC/$1" aside
+    if [ -L "$p" ] || { [ -e "$p" ] && [ ! -f "$p" ]; }; then
+        aside="$p.refused.$(date +%s).$$"
+        echo -e "${RED}  ! $p is a symlink or not a regular file: not following it, moving it to $aside${NC}" >&2
+        mv -T -- "$p" "$aside" || true
+        return 1
+    fi
+    [ -f "$p" ]
+}
+ig_etc_fix() {
+    local pin="$IG_STAGE/$1.pin.$$" rc=0
+    ig_stage || return 1
+    # link(2) does not follow a symlink: $pin is a second name for exactly the inode that is at NAME
+    # right now, in a directory the web tier cannot reach, so the check and the chown/chmod below
+    # cannot be redirected by a swap of NAME in between.
+    if ! ln -fP -- "$IG_ETC/$1" "$pin" 2>/dev/null; then
+        echo -e "${RED}  ! cannot pin $IG_ETC/$1 (missing, or no hard links here): owner and mode left as they are${NC}" >&2
+        return 1
+    fi
+    if [ -L "$pin" ] || [ ! -f "$pin" ]; then
+        echo -e "${RED}  ! $IG_ETC/$1 is a symlink or not a regular file: owner and mode left as they are${NC}" >&2
+        rm -f -- "$pin"
+        return 1
+    fi
+    chown root:www-data "$pin" && chmod "$2" "$pin" || rc=1
+    rm -f -- "$pin"
+    return $rc
+}
+ig_etc_commit() {
+    local f="$IG_STAGE/$1"
+    chown root:www-data "$f" && chmod "$2" "$f" && mv -fT -- "$f" "$IG_ETC/$1"
+}
+ig_etc_ensure() {
+    local rc=0
+    if ig_etc_check "$1"; then
+        ig_etc_fix "$1" "$2" || rc=1
+    else
+        { ig_stage && : > "$IG_STAGE/$1" && ig_etc_commit "$1" "$2"; } || rc=1
+    fi
+    rmdir "$IG_STAGE" 2>/dev/null || true
+    return $rc
+}
+# ---- /etc/irongate fixed-file helpers: end ----
+
 # IMPORTANT: www-data needs to write to config.yaml from the web UI
-chown -R root:www-data /etc/irongate
+# Recursive chown of everything in /etc/irongate (links are not followed) EXCEPT the updater's
+# pin file, which is the updater's trust root and stays exactly as the operator left it:
+# a genuine root:root pin keeps its owner and mode, while a file or symlink that the web
+# tier (www-data can write this directory) put there is never promoted to root:root and
+# never chown/chmod'ed through. The updater refuses anything but a regular root:root
+# 0644/0600 pin file.
+# -execdir, not -exec: each chown runs in the directory find is standing in (by file descriptor)
+# on "./name", so a subdirectory the web tier swaps for a symlink after find listed it cannot
+# send root's chown to a file outside /etc/irongate.
+find /etc/irongate ! -path /etc/irongate/updater-pin.conf -execdir chown -h root:www-data {} +
 chmod 775 /etc/irongate
 # Config file will be created later, but set default permissions
-touch /etc/irongate/config.yaml 2>/dev/null || true
-chown root:www-data /etc/irongate/config.yaml 2>/dev/null || true
-chmod 664 /etc/irongate/config.yaml 2>/dev/null || true
+ig_etc_ensure config.yaml 664 || true
 
 # Create Python virtual environment
 python3 -m venv /opt/irongate/venv 2>/dev/null || true
@@ -5033,12 +6790,14 @@ Layer 8 Blockchain (Optional):
 """
 
 import os
+import re
 import sys
 import yaml
 import time
 import signal
 import logging
 import tempfile
+import ipaddress
 import subprocess
 import threading
 from pathlib import Path
@@ -5066,6 +6825,53 @@ except ImportError:
     BLOCKCHAIN_MODULE_AVAILABLE = False
     MIDNIGHT_AVAILABLE = False
     logger.info("Blockchain module not available - Layer 8 disabled")
+
+# irongate-audit (V1): zone/group names and device IPs are interpolated into the
+# nftables ruleset text that is loaded as root. The config is writable by the
+# web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
+# otherwise become nft syntax. Only strict identifiers/addresses may reach it.
+# The name becomes the nft set identifier "<name>_devices", and nft identifiers
+# cannot start with a digit or '-': require a leading letter or underscore.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
+
+
+def _valid_zone_name(name):
+    """True only for a str matching [A-Za-z_][A-Za-z0-9_-]{0,31} (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
+
+
+def _valid_ipv4(value):
+    """Return the canonical IPv4 string for value, or None if it is not an IPv4 address."""
+    if not isinstance(value, str):
+        return None
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return str(addr) if addr.version == 4 else None
+
+
+# irongate-audit (O3): the dual-NIC bridge settings come from the same web-writable config.yaml and used to be
+# pasted into os.system() strings, i.e. into a root shell: a bridge_ip of "10.99.0.1/32 dev lo; touch /tmp/x #"
+# ran `touch` as root. Interface names are limited to what a kernel interface name can be (1-15 characters,
+# not starting with '-' or '.'), addresses must be IPv4 literals, and the commands run as argument lists
+# without a shell.
+_IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+
+
+def _valid_iface(name):
+    """True only for a str of 1-15 characters [A-Za-z0-9_.-] that does not start with '.' or '-' (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _IFACE_RE.fullmatch(name) is not None
+
+
+def _run(argv, quiet=False):
+    """Run argv WITHOUT a shell and return its exit status (127 if the program is missing)."""
+    out = subprocess.DEVNULL if quiet else None
+    try:
+        return subprocess.run(argv, stdout=out, stderr=out).returncode
+    except OSError:
+        return 127
+
 
 def _audit_log(blockchain, mac, ip, action, result):
     """Best-effort Layer 8 audit write.
@@ -5858,6 +7664,17 @@ class Irongate:
         devices = self.config.get('devices') or []
         custom_groups = self.config.get('custom_groups') or []
 
+        # irongate-audit (V1): drop groups whose name is not a safe identifier
+        # before anything is interpolated into the ruleset.
+        safe_groups = []
+        for g in custom_groups:
+            if isinstance(g, dict) and _valid_zone_name(g.get('name', '')):
+                safe_groups.append(g)
+            else:
+                logger.warning("Firewall: skipping custom group with invalid name %r",
+                               g.get('name') if isinstance(g, dict) else g)
+        custom_groups = safe_groups
+
         # Build a dictionary of group name -> group config
         group_configs = {}
         for g in custom_groups:
@@ -5872,9 +7689,15 @@ class Irongate:
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
+                # irongate-audit (V1): validate before interpolating into nft text.
+                safe_ip = _valid_ipv4(ip)
+                if safe_ip is None or not _valid_zone_name(zone):
+                    logger.warning("Firewall: skipping device with invalid ip/zone (ip=%r zone=%r)",
+                                   ip, zone)
+                    continue
                 if zone not in zone_ips:
                     zone_ips[zone] = []
-                zone_ips[zone].append(ip)
+                zone_ips[zone].append(safe_ip)
 
         # Ensure built-in zones exist even if empty
         for builtin in ['isolated', 'servers', 'trusted']:
@@ -5967,7 +7790,7 @@ class Irongate:
 """
                 for target_group in can_access:
                     target_set = f"{target_group}_devices"
-                    if target_group in zone_ips:
+                    if _valid_zone_name(target_group) and target_group in zone_ips:
                         rules_section += f"        ip saddr @{set_name} ip daddr @{target_set} accept\n"
                         rules_section += f"        ip daddr @{set_name} ip saddr @{target_set} accept\n"
 
@@ -6031,43 +7854,63 @@ table inet irongate {{{sets_section}{rules_section}}}
         bridge_name = bridge_cfg.get('bridge_name', 'br-irongate')
         isolated_iface = bridge_cfg.get('isolated_interface', '')
         bridge_ip = bridge_cfg.get('bridge_ip', '10.99.0.1')
+        net = self.config.get('network') or {}
+        uplink = net.get('interface', 'eth0')
+        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
+        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
         
         if not isolated_iface:
             logger.error("No isolated interface configured!")
             return False
+        
+        # irongate-audit (O3): nothing from the config reaches a command, an argument or the dnsmasq
+        # file before it has been checked. An empty uplink only means there is no NAT rule to add
+        # (the old command with an empty name was a broken rule that nft rejected).
+        names = [('bridge_name', bridge_name), ('isolated_interface', isolated_iface)]
+        if uplink:
+            names.append(('network.interface', uplink))
+        for what, value in names:
+            if not _valid_iface(value):
+                logger.error("Dual-NIC: invalid %s %r - not starting the bridge", what, value)
+                return False
+        addrs = {}
+        for what, value in (('bridge_ip', bridge_ip), ('dhcp_start', dhcp_start), ('dhcp_end', dhcp_end)):
+            addrs[what] = _valid_ipv4(value)
+            if addrs[what] is None:
+                logger.error("Dual-NIC: invalid %s %r (an IPv4 address is required) - not starting the bridge", what, value)
+                return False
+        bridge_ip, dhcp_start, dhcp_end = addrs['bridge_ip'], addrs['dhcp_start'], addrs['dhcp_end']
         
         if not os.path.exists(f'/sys/class/net/{isolated_iface}'):
             logger.error(f"Isolated interface {isolated_iface} not found!")
             return False
         
         logger.info(f"Creating bridge {bridge_name}")
-        os.system(f'ip link set {bridge_name} down 2>/dev/null')
-        os.system(f'brctl delbr {bridge_name} 2>/dev/null')
-        os.system(f'brctl addbr {bridge_name}')
-        os.system(f'brctl stp {bridge_name} off')
+        _run(['ip', 'link', 'set', bridge_name, 'down'], quiet=True)
+        _run(['brctl', 'delbr', bridge_name], quiet=True)
+        _run(['brctl', 'addbr', bridge_name])
+        _run(['brctl', 'stp', bridge_name, 'off'])
         
-        os.system(f'ip link set {isolated_iface} down')
-        os.system(f'ip addr flush dev {isolated_iface}')
-        os.system(f'brctl addif {bridge_name} {isolated_iface}')
-        os.system(f'ip link set {isolated_iface} up')
+        _run(['ip', 'link', 'set', isolated_iface, 'down'])
+        _run(['ip', 'addr', 'flush', 'dev', isolated_iface])
+        _run(['brctl', 'addif', bridge_name, isolated_iface])
+        _run(['ip', 'link', 'set', isolated_iface, 'up'])
         
-        os.system(f'ip addr add {bridge_ip}/16 dev {bridge_name}')
-        os.system(f'ip link set {bridge_name} up')
+        _run(['ip', 'addr', 'add', f'{bridge_ip}/16', 'dev', bridge_name])
+        _run(['ip', 'link', 'set', bridge_name, 'up'])
         
-        result = os.system(f'bridge link set dev {isolated_iface} isolated on 2>/dev/null')
+        result = _run(['bridge', 'link', 'set', 'dev', isolated_iface, 'isolated', 'on'], quiet=True)
         if result == 0:
             logger.info("Port isolation enabled")
         else:
-            os.system(f'ebtables -A FORWARD -i {isolated_iface} -o {isolated_iface} -j DROP')
+            _run(['ebtables', '-A', 'FORWARD', '-i', isolated_iface, '-o', isolated_iface, '-j', 'DROP'])
         
-        net = self.config.get('network', {})
-        uplink = net.get('interface', 'eth0')
-        os.system(f'nft add table nat 2>/dev/null')
-        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }} 2>/dev/null')
-        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade 2>/dev/null')
-        
-        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
-        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
+        _run(['nft', 'add', 'table', 'nat'], quiet=True)
+        _run(['nft', 'add', 'chain', 'nat', 'postrouting', '{', 'type', 'nat', 'hook', 'postrouting', 'priority', '100', ';', '}'], quiet=True)
+        if uplink:
+            _run(['nft', 'add', 'rule', 'nat', 'postrouting', 'oifname', uplink, 'masquerade'], quiet=True)
+        else:
+            logger.warning("Dual-NIC: no uplink interface configured - no NAT rule for the bridge")
         
         dnsmasq_conf = f"""
 interface={bridge_name}
@@ -6079,8 +7922,11 @@ dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
         with open('/etc/irongate/bridge-dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        os.system('pkill -f "dnsmasq.*bridge-dnsmasq" 2>/dev/null')
-        os.system('dnsmasq --conf-file=/etc/irongate/bridge-dnsmasq.conf &')
+        _run(['pkill', '-f', 'dnsmasq.*bridge-dnsmasq'], quiet=True)
+        try:
+            subprocess.Popen(['dnsmasq', '--conf-file=/etc/irongate/bridge-dnsmasq.conf'], stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            logger.error("Dual-NIC: cannot start dnsmasq: %s", exc)
         
         logger.info(f"Dual-NIC bridge active: {bridge_name} ({bridge_ip})")
         return True
@@ -6171,9 +8017,11 @@ kept alongside this file as blockchain_algorand.py.<ts>.reference.
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -6203,6 +8051,28 @@ MAX_CACHE_ENTRIES = 4096
 # so an unreachable indexer must never add latency to every packet.
 BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN = 30.0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every HTTP redirect (irongate-audit, V2: SSRF).
+
+    indexer_url is checked against an allowlist, but a redirect would let an
+    allowed (or compromised) host send this root process to any other URL. With
+    redirect_request() returning None urllib raises HTTPError for a 3xx, which
+    _graphql() already treats as an indexer failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# urlopen() below uses this opener. It is installed process-wide on purpose: this
+# module is the only urllib user in the engine process (tests/test_validation.py,
+# OpenerScopeTests, fails if another module starts using urllib), and going through
+# urllib.request.urlopen() keeps the transport replaceable in tests, which a
+# module-local opener's .open() would not. Switch to a module-local opener (and
+# point those test mocks at it) before any other urllib user is added.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
 
 
 class VerificationResult(Enum):
@@ -6274,6 +8144,38 @@ class IrongateBlockchain:
     DEFAULT_NETWORK = 'preprod'
     DEFAULT_TIMEOUT = 5.0
 
+    @classmethod
+    def allowed_indexer_hosts(cls):
+        """Hosts of the https indexer presets in NETWORKS (derived, not hard-coded)."""
+        hosts = set()
+        for preset in cls.NETWORKS.values():
+            parts = urllib.parse.urlsplit(preset['indexer'])
+            if parts.scheme == 'https' and parts.hostname:
+                hosts.add(parts.hostname.lower())
+        return frozenset(hosts)
+
+    @classmethod
+    def validate_indexer_url(cls, url):
+        """Return url if it is an https URL on a known Midnight indexer host, else None.
+
+        irongate-audit (V2, SSRF): indexer_url comes from a config file the web
+        tier can write, and this process runs as root. Without this check a
+        crafted value points the engine at cloud metadata (http://169.254.169.254/),
+        loopback services or file:// URLs.
+        """
+        if not isinstance(url, str) or not re.fullmatch(r'[\x21-\x7e]+', url) or '\\' in url:
+            return None
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+            return None
+        if (parts.hostname or '').lower() not in cls.allowed_indexer_hosts():
+            return None
+        return url
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize blockchain connection.
@@ -6311,11 +8213,25 @@ class IrongateBlockchain:
             )
             self.network = self.DEFAULT_NETWORK
 
-        # An explicit indexer_url overrides the network preset.
-        self.indexer_url = (
-            self.config.get('indexer_url')
-            or self.NETWORKS[self.network]['indexer']
-        )
+        # An explicit indexer_url overrides the network preset, but only if it
+        # is an https URL on a known Midnight indexer host (SSRF guard, V2).
+        # A configured URL that fails the check FAILS CLOSED: indexer_url becomes
+        # None and no query is ever made. It is deliberately NOT replaced by the
+        # network preset, which would send queries to a host the operator did not
+        # configure and hide the misconfiguration.
+        self.indexer_url = self.NETWORKS[self.network]['indexer']
+        custom_indexer = self.config.get('indexer_url')
+        if custom_indexer and custom_indexer != self.indexer_url:
+            if self.validate_indexer_url(custom_indexer):
+                self.indexer_url = custom_indexer
+            else:
+                self.indexer_url = None
+                logger.warning(
+                    "Blockchain Layer 8: indexer_url %r rejected (must be https on a "
+                    "known Midnight indexer host) - no queries will be made until it is "
+                    "fixed or removed (it is not replaced by the '%s' preset)",
+                    custom_indexer, self.network,
+                )
 
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")
@@ -6354,6 +8270,10 @@ class IrongateBlockchain:
         Returns the 'data' object, or None on any transport/protocol failure.
         Never raises - callers treat None as 'chain undecided'.
         """
+        if self.indexer_url is None:
+            # A configured indexer_url was rejected (see __init__): make no request.
+            return None
+
         now = time.time()
         if now < self._breaker_until:
             logger.debug("Midnight indexer circuit breaker open for %.0fs more",
@@ -7524,7 +9444,10 @@ if [ -f /var/www/irongate/dhcp.db ]; then
     fi
 fi
 
-cat > /etc/irongate/config.yaml << EOF
+# Staged in a root-only directory and renamed into place at the end (see the helpers above):
+# nothing below opens, chmods or chowns /etc/irongate/config.yaml by path.
+ig_stage
+cat > /etc/.irongate-stage/config.yaml << EOF
 # Irongate Configuration
 # Generated: $(date)
 
@@ -7554,7 +9477,13 @@ blockchain:
   network: "preprod"
   # Address of the deployed Midnight device-registry contract (required if enabled)
   contract_address: null
-  # Override the indexer endpoint; null uses the preset for the chosen network
+  # Override the indexer endpoint; null uses the preset for the chosen network.
+  # A custom URL must be https on port 443 on one of the Midnight indexer hosts
+  # (indexer.preprod / indexer.preview / indexer.mainnet .midnight.network), with no
+  # credentials; redirects are never followed. The selected network's own preset
+  # (e.g. the local 'undeployed' node) is also accepted. Any other value is refused
+  # by the dashboard (HTTP 400); if it is edited into this file by hand the engine
+  # makes NO Layer 8 queries (it does not fall back to the preset) and logs a warning.
   indexer_url: null
   # Cache TTL in seconds (reduces blockchain queries)
   cache_ttl: 60
@@ -7575,12 +9504,15 @@ EOF
 
 # If no devices, clean up the empty devices section
 if [ -z "$DEVICES_YAML" ]; then
-    sed -i 's/^devices:$/devices: []/' /etc/irongate/config.yaml
+    sed -i 's/^devices:$/devices: []/' /etc/.irongate-stage/config.yaml
 fi
 
-# Set permissions so www-data can update config from web UI
-chown root:www-data /etc/irongate/config.yaml
-chmod 664 /etc/irongate/config.yaml
+# Set permissions so www-data can update config from web UI, then put the file in place.
+# A symlink or special file that was planted at /etc/irongate/config.yaml is moved aside,
+# never followed.
+ig_etc_check config.yaml || true
+ig_etc_commit config.yaml 664
+rmdir "$IG_STAGE" 2>/dev/null || true
 
 chown -R root:root /opt/irongate
 chmod -R 755 /opt/irongate
@@ -7615,13 +9547,21 @@ echo -e "${YELLOW}Creating auto-updater service...${NC}"
 # Create updater script
 cat > /opt/irongate/irongate-updater.sh << 'UPDATER'
 #!/bin/bash
-# Irongate Auto-Updater (commit hash based)
+# Irongate Auto-Updater (pinned commit)
 #
 # Runs as root. The web interface may TRIGGER an update (--force) but never
-# supplies the code: this script fetches and verifies the installer itself.
+# supplies the code: this script installs ONLY the commit named in the
+# root-owned pin file, and only if the downloaded installer's sha256 equals the
+# pin. It never follows the moving main branch.
+#
+# Pin file (operator-maintained, root:root, mode 0644 or 0600):
+#   /etc/irongate/updater-pin.conf
+#     PINNED_COMMIT=<40 hex chars>
+#     PINNED_INSTALLER_SHA256=<64 hex chars>   # sha256 of irongate-install.sh at that commit
+# Update the pin (after reviewing the new commit) to roll out a new version.
 
-GITHUB_API="https://api.github.com/repos/beatboxes/irongate/commits/main"
 REPO_RAW_BASE="https://raw.githubusercontent.com/beatboxes/irongate"
+PIN_FILE="/etc/irongate/updater-pin.conf"
 STAGE_DIR="/opt/irongate/.update"
 MIN_INSTALLER_BYTES=100000
 FORCE=0
@@ -7633,6 +9573,50 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# Load and validate the pin file. Sets PINNED_COMMIT and PINNED_INSTALLER_SHA256,
+# or returns 1 after logging why. The file is opened once and that open file is
+# inspected and read, so a swap between the check and the read cannot matter.
+load_pin() {
+    local LC_ALL=C line pin_stat pin_uid pin_gid pin_mode n=0
+    PINNED_COMMIT=""
+    PINNED_INSTALLER_SHA256=""
+    if [ -L "$PIN_FILE" ] || [ ! -f "$PIN_FILE" ]; then
+        log "ERROR: pin file $PIN_FILE is missing or not a regular file - refusing to update"
+        return 1
+    fi
+    if ! exec 3< "$PIN_FILE"; then
+        log "ERROR: cannot open pin file $PIN_FILE - refusing to update"
+        return 1
+    fi
+    pin_stat=$(stat -L -c '%u:%g:%a' /dev/fd/3 2>/dev/null)
+    IFS=: read -r pin_uid pin_gid pin_mode <<< "$pin_stat"
+    if [ "$pin_uid" != "0" ] || [ "$pin_gid" != "0" ] \
+        || { [ "$pin_mode" != "644" ] && [ "$pin_mode" != "600" ]; }; then
+        log "ERROR: pin file $PIN_FILE must be root:root with mode 0644 or 0600 (found uid:gid:mode ${pin_stat:-unknown}) - refusing to update"
+        exec 3<&-
+        return 1
+    fi
+    while IFS= read -r line <&3 || [ -n "$line" ]; do
+        n=$((n + 1))
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ "$line" =~ ^PINNED_COMMIT=([0-9a-f]{40})$ ]] && [ -z "$PINNED_COMMIT" ]; then
+            PINNED_COMMIT="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^PINNED_INSTALLER_SHA256=([0-9a-f]{64})$ ]] && [ -z "$PINNED_INSTALLER_SHA256" ]; then
+            PINNED_INSTALLER_SHA256="${BASH_REMATCH[1]}"
+        else
+            log "ERROR: pin file $PIN_FILE line $n is not valid - refusing to update"
+            exec 3<&-
+            return 1
+        fi
+    done
+    exec 3<&-
+    if [ -z "$PINNED_COMMIT" ] || [ -z "$PINNED_INSTALLER_SHA256" ]; then
+        log "ERROR: pin file $PIN_FILE must define PINNED_COMMIT (40 hex) and PINNED_INSTALLER_SHA256 (64 hex) - refusing to update"
+        return 1
+    fi
+    return 0
+}
+
 # Check if auto-update is enabled
 AUTO_UPDATE=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='auto_update_enabled';" 2>/dev/null)
 if [ "$AUTO_UPDATE" != "true" ] && [ "$FORCE" -ne 1 ]; then
@@ -7642,31 +9626,25 @@ fi
 
 log "Starting update check..."
 
+# The pin is the only source of truth for what may be installed.
+if ! load_pin; then
+    exit 1
+fi
+TARGET_SHA="$PINNED_COMMIT"
+TARGET_COMMIT=$(printf '%s' "$TARGET_SHA" | cut -c1-7)
+
 # Get current commit from database
 CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';" 2>/dev/null || echo "unknown")
 
-# Get latest commit from GitHub API
-REMOTE_SHA=$(curl -sf -H "User-Agent: Irongate-Updater" "$GITHUB_API" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4)
-REMOTE_COMMIT=$(printf '%s' "$REMOTE_SHA" | cut -c1-7)
-
-if [ -z "$REMOTE_COMMIT" ]; then
-    log "ERROR: Could not fetch remote commit from GitHub API"
-    exit 1
-fi
-
-log "Current: $CURRENT_COMMIT, Remote: $REMOTE_COMMIT"
+log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 
 # Update last check time
 sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
 
 # Compare commits
-if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
+if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURRENT_COMMIT" != "unknown" ] && [ "$CURRENT_COMMIT" != "local" ]; }; then
     log "Update available! Downloading..."
-    
-    # Store the target commit BEFORE running update (in case script fails to set it)
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$REMOTE_COMMIT');" 2>/dev/null
-    log "Set target commit to $REMOTE_COMMIT"
-    
+
     # Download the installer into a root-only directory. /tmp is world-writable,
     # so staging there let any local user swap the file between download and
     # execution - and the web user had a sudo grant to run exactly that path.
@@ -7675,23 +9653,26 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURR
     SCRIPT_PATH="$STAGE_DIR/irongate-install.sh"
     rm -f "$SCRIPT_PATH"
 
-    # Pin to the resolved commit rather than the moving main ref, so the bytes
-    # executed are the bytes that were checked.
-    if [ -n "$REMOTE_SHA" ]; then
-        SRC_URL="$REPO_RAW_BASE/$REMOTE_SHA/irongate-install.sh"
-    else
-        SRC_URL="$REPO_RAW_BASE/main/irongate-install.sh"
-    fi
+    # Fetch the pinned commit, never the moving main ref.
+    SRC_URL="$REPO_RAW_BASE/$TARGET_SHA/irongate-install.sh"
     log "Downloading $SRC_URL"
     curl -sf -H "User-Agent: Irongate-Updater" "$SRC_URL" -o "$SCRIPT_PATH"
 
-    # Integrity gate. None of this is a substitute for a signature, but it does
-    # reject the realistic failures: a truncated download, an HTML error page
-    # served instead of the script, or a corrupted file.
     if [ ! -s "$SCRIPT_PATH" ]; then
         log "ERROR: downloaded installer is missing or empty - aborting"
         exit 1
     fi
+
+    # Authenticity gate: the bytes must be exactly the bytes that were reviewed
+    # and pinned. Checked before the file is made executable or run.
+    ACTUAL_SHA256=$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)
+    if [ "$ACTUAL_SHA256" != "$PINNED_INSTALLER_SHA256" ]; then
+        log "ERROR: installer sha256 ${ACTUAL_SHA256:-unavailable} does not match pin $PINNED_INSTALLER_SHA256 - aborting"
+        rm -f "$SCRIPT_PATH"
+        exit 1
+    fi
+
+    # Sanity gate: reject a truncated download or an unparseable script.
     SCRIPT_SIZE=$(stat -c%s "$SCRIPT_PATH" 2>/dev/null || echo 0)
     if [ "$SCRIPT_SIZE" -lt "$MIN_INSTALLER_BYTES" ]; then
         log "ERROR: installer is only ${SCRIPT_SIZE} bytes, expected >= ${MIN_INSTALLER_BYTES} - aborting"
@@ -7703,12 +9684,26 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$REMOTE_COMMIT" ] && [ "$CURR
         rm -f "$SCRIPT_PATH"
         exit 1
     fi
-    log "Integrity checks passed (${SCRIPT_SIZE} bytes, syntax valid, commit ${REMOTE_COMMIT})"
+    log "Integrity checks passed (${SCRIPT_SIZE} bytes, sha256 matches pin, syntax valid, commit ${TARGET_COMMIT})"
 
+    # installed_commit is stamped only AFTER the installer has exited 0 (below). Stamping it first made a
+    # failed installer look installed: the next scheduled run said "Already up to date" and never retried.
     chmod 700 "$SCRIPT_PATH"
     log "Running installer..."
     bash "$SCRIPT_PATH" >> "$LOG_FILE" 2>&1
+    INSTALL_RC=$?
+    if [ "$INSTALL_RC" -ne 0 ]; then
+        log "ERROR: installer exited with status $INSTALL_RC"
+        exit 1
+    fi
+    # The installer stamps installed_commit with the moving main HEAD; restore
+    # the pinned commit so the next scheduled run does not reinstall.
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
     log "Update complete!"
+    log "Update check finished"
+    # The installer rewrites this very file; bash reads scripts incrementally, so
+    # stop here instead of reading whatever now sits at the old offset.
+    exit 0
 else
     log "Already up to date"
 fi
@@ -7973,14 +9968,16 @@ if ! visudo -cf /etc/sudoers.d/irongate-webauth; then
 fi
 
 # access-control.json — preserved across re-runs
+# (a planted symlink or special file at the name counts as absent: it is moved aside, never followed)
 mkdir -p /etc/irongate
-if [ ! -f /etc/irongate/access-control.json ]; then
+ig_stage
+if ! ig_etc_check access-control.json; then
     WEBAUTH_ADMIN_ALLOW=""
     if [ -n "${ADMIN_LAN_IP:-}" ]; then
         WEBAUTH_ADMIN_ALLOW=",
         \"${ADMIN_LAN_IP}\""
     fi
-    cat > /etc/irongate/access-control.json << WEBAUTH_ACLEOF
+    cat > /etc/.irongate-stage/access-control.json << WEBAUTH_ACLEOF
 {
     "enabled": true,
     "allowed_ips": [
@@ -7990,19 +9987,19 @@ if [ ! -f /etc/irongate/access-control.json ]; then
     "updated_at": "$(date -Iseconds)"
 }
 WEBAUTH_ACLEOF
+    ig_etc_commit access-control.json 660
     echo -e "${GREEN}  ✓ Created access-control.json${NC}"
 else
+    ig_etc_fix access-control.json 660 || { echo -e "${RED}ERROR: cannot set owner/mode of access-control.json safely${NC}"; exit 1; }
     echo -e "${GREEN}  ✓ Existing access-control.json preserved${NC}"
 fi
-chown root:www-data /etc/irongate/access-control.json
-chmod 660 /etc/irongate/access-control.json
 
 # auth.json — preserved across re-runs; random initial password printed at end
 WEBAUTH_INIT_PASSWORD=""
-if [ ! -f /etc/irongate/auth.json ]; then
+if ! ig_etc_check auth.json; then
     WEBAUTH_INIT_PASSWORD=$(php -r "echo bin2hex(random_bytes(10));")
     WEBAUTH_HASH=$(WEBAUTH_PW="$WEBAUTH_INIT_PASSWORD" php -r 'echo password_hash(getenv("WEBAUTH_PW"), PASSWORD_BCRYPT);')
-    cat > /etc/irongate/auth.json << WEBAUTH_AUTHEOF
+    cat > /etc/.irongate-stage/auth.json << WEBAUTH_AUTHEOF
 {
     "username": "admin",
     "password_hash": "${WEBAUTH_HASH}",
@@ -8013,12 +10010,13 @@ if [ ! -f /etc/irongate/auth.json ]; then
     "locked_until": 0
 }
 WEBAUTH_AUTHEOF
+    ig_etc_commit auth.json 660
     echo -e "${GREEN}  ✓ Created auth.json (credentials printed at end)${NC}"
 else
+    ig_etc_fix auth.json 660 || { echo -e "${RED}ERROR: cannot set owner/mode of auth.json safely${NC}"; exit 1; }
     echo -e "${GREEN}  ✓ Existing auth.json preserved (credentials unchanged)${NC}"
 fi
-chown root:www-data /etc/irongate/auth.json
-chmod 660 /etc/irongate/auth.json
+rmdir "$IG_STAGE" 2>/dev/null || true
 
 # Generate the nginx allow-list snippet now; reload failure is tolerated here
 # because the final bulletproof restart below brings nginx up regardless
@@ -8104,6 +10102,10 @@ fi
 
 # Test dnsmasq config before starting
 echo -e "${YELLOW}Validating dnsmasq configuration...${NC}"
+if ! ig_dnsmasq_tree_ok; then
+    echo -e "${RED}  ✗ /etc/dnsmasq.conf and /etc/dnsmasq.d are not root-only and clean (dnsmasq-apply --audit): dnsmasq is neither tested nor started${NC}"
+    exit 1
+fi
 if dnsmasq --test 2>&1; then
     echo -e "${GREEN}Configuration valid, starting dnsmasq...${NC}"
     # Kill any zombie dnsmasq processes first
@@ -8204,6 +10206,24 @@ fi
 # Restart nginx
 systemctl restart nginx
 echo -e "${GREEN}Done.${NC}"
+
+# ---- installer commit stamp: begin ----
+# Reached only when every step above succeeded (set -e). IRONGATE_COMMIT was validated at the top; it is
+# checked again here because this is the one place it reaches SQL.
+ig_stamp_commit() {
+    if [ "${IRONGATE_COMMIT_STAMP:-1}" != "1" ]; then
+        echo -e "${YELLOW}  installed_commit left as it was (no usable commit id)${NC}"
+        return 0
+    fi
+    if ! { ig_valid_commit "$IRONGATE_COMMIT" || [ "$IRONGATE_COMMIT" = "local" ]; }; then
+        echo -e "${YELLOW}  installed_commit left as it was (not a commit id)${NC}"
+        return 0
+    fi
+    sqlite3 /var/www/irongate/dhcp.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '${IRONGATE_COMMIT}');"
+    echo -e "${GREEN}  ✓ Commit: ${IRONGATE_COMMIT}${NC}"
+}
+ig_stamp_commit
+# ---- installer commit stamp: end ----
 
 if [ -n "$WEBAUTH_INIT_PASSWORD" ]; then
     echo ""

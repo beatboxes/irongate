@@ -13,12 +13,14 @@ Layer 8 Blockchain (Optional):
 """
 
 import os
+import re
 import sys
 import yaml
 import time
 import signal
 import logging
 import tempfile
+import ipaddress
 import subprocess
 import threading
 from pathlib import Path
@@ -46,6 +48,53 @@ except ImportError:
     BLOCKCHAIN_MODULE_AVAILABLE = False
     MIDNIGHT_AVAILABLE = False
     logger.info("Blockchain module not available - Layer 8 disabled")
+
+# irongate-audit (V1): zone/group names and device IPs are interpolated into the
+# nftables ruleset text that is loaded as root. The config is writable by the
+# web tier, so a crafted value such as "1.2.3.4 } ; flush ruleset ; {" would
+# otherwise become nft syntax. Only strict identifiers/addresses may reach it.
+# The name becomes the nft set identifier "<name>_devices", and nft identifiers
+# cannot start with a digit or '-': require a leading letter or underscore.
+_ZONE_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
+
+
+def _valid_zone_name(name):
+    """True only for a str matching [A-Za-z_][A-Za-z0-9_-]{0,31} (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _ZONE_NAME_RE.fullmatch(name) is not None
+
+
+def _valid_ipv4(value):
+    """Return the canonical IPv4 string for value, or None if it is not an IPv4 address."""
+    if not isinstance(value, str):
+        return None
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return str(addr) if addr.version == 4 else None
+
+
+# irongate-audit (O3): the dual-NIC bridge settings come from the same web-writable config.yaml and used to be
+# pasted into os.system() strings, i.e. into a root shell: a bridge_ip of "10.99.0.1/32 dev lo; touch /tmp/x #"
+# ran `touch` as root. Interface names are limited to what a kernel interface name can be (1-15 characters,
+# not starting with '-' or '.'), addresses must be IPv4 literals, and the commands run as argument lists
+# without a shell.
+_IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+
+
+def _valid_iface(name):
+    """True only for a str of 1-15 characters [A-Za-z0-9_.-] that does not start with '.' or '-' (fullmatch: no trailing newline)."""
+    return isinstance(name, str) and _IFACE_RE.fullmatch(name) is not None
+
+
+def _run(argv, quiet=False):
+    """Run argv WITHOUT a shell and return its exit status (127 if the program is missing)."""
+    out = subprocess.DEVNULL if quiet else None
+    try:
+        return subprocess.run(argv, stdout=out, stderr=out).returncode
+    except OSError:
+        return 127
+
 
 def _audit_log(blockchain, mac, ip, action, result):
     """Best-effort Layer 8 audit write.
@@ -838,6 +887,17 @@ class Irongate:
         devices = self.config.get('devices') or []
         custom_groups = self.config.get('custom_groups') or []
 
+        # irongate-audit (V1): drop groups whose name is not a safe identifier
+        # before anything is interpolated into the ruleset.
+        safe_groups = []
+        for g in custom_groups:
+            if isinstance(g, dict) and _valid_zone_name(g.get('name', '')):
+                safe_groups.append(g)
+            else:
+                logger.warning("Firewall: skipping custom group with invalid name %r",
+                               g.get('name') if isinstance(g, dict) else g)
+        custom_groups = safe_groups
+
         # Build a dictionary of group name -> group config
         group_configs = {}
         for g in custom_groups:
@@ -852,9 +912,15 @@ class Irongate:
             ip = dev.get('ip', '')
             zone = dev.get('zone', 'isolated')
             if ip:
+                # irongate-audit (V1): validate before interpolating into nft text.
+                safe_ip = _valid_ipv4(ip)
+                if safe_ip is None or not _valid_zone_name(zone):
+                    logger.warning("Firewall: skipping device with invalid ip/zone (ip=%r zone=%r)",
+                                   ip, zone)
+                    continue
                 if zone not in zone_ips:
                     zone_ips[zone] = []
-                zone_ips[zone].append(ip)
+                zone_ips[zone].append(safe_ip)
 
         # Ensure built-in zones exist even if empty
         for builtin in ['isolated', 'servers', 'trusted']:
@@ -947,7 +1013,7 @@ class Irongate:
 """
                 for target_group in can_access:
                     target_set = f"{target_group}_devices"
-                    if target_group in zone_ips:
+                    if _valid_zone_name(target_group) and target_group in zone_ips:
                         rules_section += f"        ip saddr @{set_name} ip daddr @{target_set} accept\n"
                         rules_section += f"        ip daddr @{set_name} ip saddr @{target_set} accept\n"
 
@@ -1011,43 +1077,63 @@ table inet irongate {{{sets_section}{rules_section}}}
         bridge_name = bridge_cfg.get('bridge_name', 'br-irongate')
         isolated_iface = bridge_cfg.get('isolated_interface', '')
         bridge_ip = bridge_cfg.get('bridge_ip', '10.99.0.1')
+        net = self.config.get('network') or {}
+        uplink = net.get('interface', 'eth0')
+        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
+        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
         
         if not isolated_iface:
             logger.error("No isolated interface configured!")
             return False
+        
+        # irongate-audit (O3): nothing from the config reaches a command, an argument or the dnsmasq
+        # file before it has been checked. An empty uplink only means there is no NAT rule to add
+        # (the old command with an empty name was a broken rule that nft rejected).
+        names = [('bridge_name', bridge_name), ('isolated_interface', isolated_iface)]
+        if uplink:
+            names.append(('network.interface', uplink))
+        for what, value in names:
+            if not _valid_iface(value):
+                logger.error("Dual-NIC: invalid %s %r - not starting the bridge", what, value)
+                return False
+        addrs = {}
+        for what, value in (('bridge_ip', bridge_ip), ('dhcp_start', dhcp_start), ('dhcp_end', dhcp_end)):
+            addrs[what] = _valid_ipv4(value)
+            if addrs[what] is None:
+                logger.error("Dual-NIC: invalid %s %r (an IPv4 address is required) - not starting the bridge", what, value)
+                return False
+        bridge_ip, dhcp_start, dhcp_end = addrs['bridge_ip'], addrs['dhcp_start'], addrs['dhcp_end']
         
         if not os.path.exists(f'/sys/class/net/{isolated_iface}'):
             logger.error(f"Isolated interface {isolated_iface} not found!")
             return False
         
         logger.info(f"Creating bridge {bridge_name}")
-        os.system(f'ip link set {bridge_name} down 2>/dev/null')
-        os.system(f'brctl delbr {bridge_name} 2>/dev/null')
-        os.system(f'brctl addbr {bridge_name}')
-        os.system(f'brctl stp {bridge_name} off')
+        _run(['ip', 'link', 'set', bridge_name, 'down'], quiet=True)
+        _run(['brctl', 'delbr', bridge_name], quiet=True)
+        _run(['brctl', 'addbr', bridge_name])
+        _run(['brctl', 'stp', bridge_name, 'off'])
         
-        os.system(f'ip link set {isolated_iface} down')
-        os.system(f'ip addr flush dev {isolated_iface}')
-        os.system(f'brctl addif {bridge_name} {isolated_iface}')
-        os.system(f'ip link set {isolated_iface} up')
+        _run(['ip', 'link', 'set', isolated_iface, 'down'])
+        _run(['ip', 'addr', 'flush', 'dev', isolated_iface])
+        _run(['brctl', 'addif', bridge_name, isolated_iface])
+        _run(['ip', 'link', 'set', isolated_iface, 'up'])
         
-        os.system(f'ip addr add {bridge_ip}/16 dev {bridge_name}')
-        os.system(f'ip link set {bridge_name} up')
+        _run(['ip', 'addr', 'add', f'{bridge_ip}/16', 'dev', bridge_name])
+        _run(['ip', 'link', 'set', bridge_name, 'up'])
         
-        result = os.system(f'bridge link set dev {isolated_iface} isolated on 2>/dev/null')
+        result = _run(['bridge', 'link', 'set', 'dev', isolated_iface, 'isolated', 'on'], quiet=True)
         if result == 0:
             logger.info("Port isolation enabled")
         else:
-            os.system(f'ebtables -A FORWARD -i {isolated_iface} -o {isolated_iface} -j DROP')
+            _run(['ebtables', '-A', 'FORWARD', '-i', isolated_iface, '-o', isolated_iface, '-j', 'DROP'])
         
-        net = self.config.get('network', {})
-        uplink = net.get('interface', 'eth0')
-        os.system(f'nft add table nat 2>/dev/null')
-        os.system(f'nft add chain nat postrouting {{ type nat hook postrouting priority 100 \\; }} 2>/dev/null')
-        os.system(f'nft add rule nat postrouting oifname {uplink} masquerade 2>/dev/null')
-        
-        dhcp_start = bridge_cfg.get('dhcp_start', '10.99.1.1')
-        dhcp_end = bridge_cfg.get('dhcp_end', '10.99.255.254')
+        _run(['nft', 'add', 'table', 'nat'], quiet=True)
+        _run(['nft', 'add', 'chain', 'nat', 'postrouting', '{', 'type', 'nat', 'hook', 'postrouting', 'priority', '100', ';', '}'], quiet=True)
+        if uplink:
+            _run(['nft', 'add', 'rule', 'nat', 'postrouting', 'oifname', uplink, 'masquerade'], quiet=True)
+        else:
+            logger.warning("Dual-NIC: no uplink interface configured - no NAT rule for the bridge")
         
         dnsmasq_conf = f"""
 interface={bridge_name}
@@ -1059,8 +1145,11 @@ dhcp-option=option:dns-server,{bridge_ip},8.8.8.8
         with open('/etc/irongate/bridge-dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        os.system('pkill -f "dnsmasq.*bridge-dnsmasq" 2>/dev/null')
-        os.system('dnsmasq --conf-file=/etc/irongate/bridge-dnsmasq.conf &')
+        _run(['pkill', '-f', 'dnsmasq.*bridge-dnsmasq'], quiet=True)
+        try:
+            subprocess.Popen(['dnsmasq', '--conf-file=/etc/irongate/bridge-dnsmasq.conf'], stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            logger.error("Dual-NIC: cannot start dnsmasq: %s", exc)
         
         logger.info(f"Dual-NIC bridge active: {bridge_name} ({bridge_ip})")
         return True

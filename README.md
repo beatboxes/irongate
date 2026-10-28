@@ -87,6 +87,17 @@ blockchain:
   allow_rogue_devices: false
 ```
 
+**`indexer_url` is restricted.** A custom value must be `https://` on port 443 on one of the public Midnight
+indexer hosts (`indexer.preprod.midnight.network`, `indexer.preview.midnight.network`,
+`indexer.mainnet.midnight.network`), with no credentials, and redirects are never followed; the selected
+network's own preset (for example the local `undeployed` node) is also accepted. Any other value is
+refused by the dashboard (HTTP 400). If one is written into `config.yaml` by hand the engine logs a
+warning and makes **no** Layer 8 queries at all; it does not fall back to the preset, so the misconfiguration
+is visible instead of silently querying another host. With the default `fallback_allow: true` the layer then
+reports *undecided* and enforcement falls through to Layers 1-7; with `fallback_allow: false` it fails closed
+and blocks devices it cannot verify. The scheme is compared exactly (`https`, not `HTTPS`), and the dashboard
+stores the trimmed value it validated.
+
 **The write path is not implemented.** Registering a device on-chain requires a funded wallet and a
 ZK proof server, and the published proof-server image has no confirmed `aarch64` build, so it
 cannot run on a Raspberry Pi. `register_device`, `revoke_device` and `log_access` raise
@@ -228,6 +239,92 @@ and the web dashboard.
 
 **Do not rename `irongate-install.sh`.** The updater and the web UI's update action both fetch it
 from this repository by that exact name.
+
+### Updater pin (required for updates)
+
+The updater (`irongate-updater.sh`, run by the daily timer and by the dashboard's *Update now*)
+installs **only the commit named in a root-owned pin file** and refuses to run if the downloaded
+`irongate-install.sh` does not hash to the pinned value. It never follows `main`. Create
+`/etc/irongate/updater-pin.conf` (owner `root:root`, mode `0644` or `0600`):
+
+```
+PINNED_COMMIT=<40-hex commit sha you reviewed>
+PINNED_INSTALLER_SHA256=<sha256 of irongate-install.sh at that commit>
+```
+
+Compute the hash from the reviewed commit, e.g.
+`git show <commit>:irongate-install.sh | sha256sum`. With no pin file (or a wrong owner, mode or
+hash) the updater logs the reason to `/var/log/irongate-update.log` and exits 1 without installing.
+After merging a new release, review it and update the pin; until then the host stays on the
+previously pinned commit. `auto_update_enabled=false` still disables scheduled runs entirely.
+
+The installer leaves the pin file alone: it is excluded from the recursive `chown` of `/etc/irongate`, so a
+genuine `root:root` pin keeps its owner and mode across re-installs (which the updater itself triggers),
+and a file or symlink that the web tier managed to put in its place (it can write that directory) is never
+promoted to `root:root`; the updater refuses it.
+
+The installer also never follows a link in `/etc/irongate` (the web tier can write that directory, also while
+the installer runs): the recursive `chown -h` runs with `find -execdir`, and `config.yaml`, `access-control.json`
+and `auth.json` are written to a root-only staging directory (`/etc/.irongate-stage`) and renamed into place,
+or have their owner and mode set through a hard-link pin of the existing file. A symlink, directory or other
+non-regular file found at one of those names is renamed to `<name>.refused.<time>.<pid>` (never deleted), reported,
+and treated as absent; a genuine regular file ends up with exactly the owner and mode it had before
+(`root:www-data`, `0664` for `config.yaml`, `0660` for the two JSON files). `find -execdir` refuses to run when
+`PATH` contains `.` or an empty or relative entry, so the installer sets its own fixed absolute `PATH` before it
+does anything else.
+
+The web tree, `/var/www/irongate`, belongs to `www-data` and gets the same care: the installer hands it over
+with a small helper that opens every entry with `O_NOFOLLOW` and changes owner and mode of the open file, never
+of a name, so a link planted there is not followed (a link, FIFO or hard-linked file inside the tree is left
+alone and listed; a link, directory or extra hard link at `dhcp.db` stops the installer). `dhcp.db` is `www-data:www-data 0664` (it was `0666`, writable by every local user); only the web
+API and root's `sqlite3` (installer, updater) use it. A `dhcp.db` that is a symlink (for example to another
+disk) is therefore no longer supported; use a bind mount.
+
+dnsmasq runs as root and honours `dhcp-script=` (and `conf-script=`, `dhcp-luascript=`, `conf-file=`, ...) in any
+file it reads, so `/etc/dnsmasq.conf`, `/etc/dnsmasq.d` and everything in it belong to **root** (`0644`/`0755`), not
+to `www-data`. The web API stores the DHCP settings and reservations in the database as before; to apply them it
+writes a *request* (data, not config) to `/var/lib/irongate/dnsmasq-staged/request.json` and runs
+`sudo /opt/irongate/dnsmasq-apply` with no arguments (`/etc/sudoers.d/irongate-dnsmasq-apply`). The helper accepts
+only the ten settings the dashboard sets (`dhcp_enabled interface cidr range_start range_end gateway dns_primary
+dns_secondary lease_time domain`) and reservations (`mac ip hostname`), checks every value (IPv4 literals, MAC,
+RFC 1123 names, interface name, lease-time format), refuses a request that holds anything else - an unknown key, a
+directive that runs a program or reads or writes a file, a newline, a NUL, an `=` - as a whole, renders both files
+from a template in which the `dhcp-script` and `conf-dir` lines are constants, runs `dnsmasq --test`, replaces the
+live files atomically and restarts dnsmasq, putting the previous files back if it does not start. It runs `dnsmasq
+--test` (which executes `conf-script=`) only after its own audit found nothing, and keeps a root-only snapshot of the last
+good rendering. The installer puts the helper, its sudoers drop-in and the staging directory in place *before* its
+permission step (which, kept as it was for the O1 tests, hands the tree to `www-data` for a moment) and runs
+`dnsmasq-apply --lockdown` right after it: the directory is taken first, every file `www-data` could have written is read
+once and scanned the way dnsmasq's own parser reads it (quotes, a directive hidden behind a 1023-character comment, CR, NUL),
+and only what is clean is written back as a new root-owned file. Anything else is never re-created: its bytes go to
+`/var/lib/irongate/dnsmasq-quarantine` (root only) and the main file and `reservations.conf` come back from the snapshot (or,
+without one, a safe default: DHCP off, until Save & Apply renders it again). Links and special files are renamed to
+`.refused.*`. `dnsmasq-apply --audit` then reads every file in `/etc/dnsmasq.d`, root-owned ones included (a Debian dnsmasq
+reads them all), and a finding stops the installer; the EXIT trap and the installer's tail start or test dnsmasq only when
+that audit passes. A root-owned operator file in `/etc/dnsmasq.d` is kept as it is, and audited like the rest.
+What the lockdown accepts in a file `www-data` could have written is an allowlist, not only a list of refusals: the main
+file may hold only what the helper renders, `reservations.conf` only `dhcp-host`, any other file only options `dnsmasq`
+has. The refused directives are derived from `dnsmasq`'s own option table (embedded in the helper, and compared with the
+`dnsmasq` binary by the tests) by option value, so an alias that `dnsmasq --help` does not list - `dhcp-lease`, the old
+name of `dhcp-leasefile` - is refused with it. An entry the lockdown cannot process (a read or write error, a name of 255
+characters) is put aside like a link and the lockdown goes on with the others and the main file; it exits 5 if anything
+could not be locked.
+
+The updater records `installed_commit` only after the installer exited 0, so a failed update is tried again by
+the next scheduled run instead of being reported as "Already up to date".
+The installer itself stamps `installed_commit` only as its last step, and only with a hex commit id (or `local`): the
+value it falls back to when GitHub cannot be reached is read from `dhcp.db`, which the web tier can write, so
+anything else there is ignored (neither shown nor written back) instead of being pasted into a root `sqlite3` statement.
+
+The web API accepts only well-formed `irongate_*` settings: `true`/`false` for the layer switches, `single` or
+`dual` for the mode, IPv4 addresses for the bridge address and DHCP range, and interface names of 1-15
+characters from `[A-Za-z0-9_.-]` that do not start with `-` or `.` (the empty string means "not set"). Any other
+value, and any unknown `irongate_*` key, is refused with HTTP 400 and nothing of that request is stored. The
+engine checks the same values again before it builds the dual-NIC bridge and runs its commands without a shell.
+
+The dashboard's *Check for updates* (`update_check`) still compares the installed commit with the newest
+commit on `main`, so it reports "update available" whenever `main` is ahead of the pin. *Update now* and the
+timer only ever install the pinned commit, so they change nothing until the pin is advanced.
 
 ## Requirements
 

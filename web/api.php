@@ -31,9 +31,9 @@ set_exception_handler(function($e) {
 });
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, DELETE, PUT');
-header('Access-Control-Allow-Headers: Content-Type');
+// irongate-audit (V3): no CORS headers. The dashboard (index.php) calls this API
+// with a relative URL, so it is same-origin; a wildcard Access-Control-Allow-Origin
+// only let any web page a LAN browser visited drive this API cross-origin.
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
@@ -60,6 +60,10 @@ function getSetting($db, $key) {
 }
 
 function setSetting($db, $key, $value) {
+    // irongate-audit (O3): backstop for every caller, whatever the endpoint checked before.
+    if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+        return false;
+    }
     $stmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
     $stmt->bindValue(1, $key, SQLITE3_TEXT);
     $stmt->bindValue(2, $value, SQLITE3_TEXT);
@@ -75,13 +79,6 @@ function getAllSettings($db) {
     return $settings;
 }
 
-function cidrToNetmask($cidr) {
-    $cidr = intval($cidr);
-    $bin = str_repeat('1', $cidr) . str_repeat('0', 32 - $cidr);
-    $parts = str_split($bin, 8);
-    return implode('.', array_map('bindec', $parts));
-}
-
 // Safe wrapper for applyIrongateConfig - prevents PHP warnings from corrupting JSON output
 function safeApplyConfig($db) {
     ob_start();
@@ -95,6 +92,51 @@ function safeApplyConfig($db) {
     }
     ob_end_clean();
     return $result;
+}
+
+// irongate-audit (V1): zone/group names and device IPs are interpolated into an
+// nftables ruleset by the root engine, so only strict values may be stored.
+// \z (not $) so a trailing newline cannot slip through. The name becomes the nft
+// set identifier "<name>_devices", which cannot start with a digit or '-'.
+function validZoneName($name) {
+    return is_string($name) && preg_match('/^[A-Za-z_][A-Za-z0-9_-]{0,31}\z/', $name) === 1;
+}
+
+function validDeviceIp($ip) {
+    return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+// irongate-audit (O3): the irongate_* settings are copied into /etc/irongate/config.yaml, which the root
+// engine reads and, in dual-NIC mode, turns into bridge, nft and dnsmasq commands. yamlScalar() keeps a
+// value from breaking the YAML but not from being a hostile string, so every key has a fixed shape here
+// and an unknown irongate_* key is refused. Interface names follow the kernel's rules (1-15 characters,
+// not starting with '-' or '.'); the addresses are IPv4 literals; the empty string means "not set".
+// \z (not $) so a trailing newline cannot slip through.
+function validIrongateSetting($key, $value) {
+    static $flags = ['irongate_enabled', 'irongate_arp_defense', 'irongate_ipv6_ra', 'irongate_gateway_takeover',
+                     'irongate_bypass_detection', 'irongate_firewall'];
+    static $addrs = ['irongate_bridge_ip', 'irongate_bridge_dhcp_start', 'irongate_bridge_dhcp_end'];
+    if (!is_string($key) || !is_string($value)) return false;
+    if (in_array($key, $flags, true)) return $value === 'true' || $value === 'false';
+    if ($key === 'irongate_mode') return $value === 'single' || $value === 'dual';
+    if ($key === 'irongate_isolated_interface') {
+        return $value === '' || preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}\z/', $value) === 1;
+    }
+    if (in_array($key, $addrs, true)) {
+        return $value === '' || filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    }
+    return false;
+}
+
+// The first problem in the irongate_* entries of a settings POST, or null. Checked before anything is stored.
+function irongateSettingsError($data) {
+    if (!is_array($data)) return null;
+    foreach ($data as $key => $value) {
+        if (is_string($key) && strpos($key, 'irongate_') === 0 && !validIrongateSetting($key, $value)) {
+            return 'Invalid value or unknown setting: ' . preg_replace('/[^\x20-\x7e]/', '?', substr($key, 0, 40));
+        }
+    }
+    return null;
 }
 
 function cidrToHosts($cidr) {
@@ -142,12 +184,39 @@ function midnightNetworks() {
     ];
 }
 
-// Resolve the effective indexer endpoint: custom URL (validated http/https)
-// overrides the network preset, matching blockchain.py behaviour.
+// irongate-audit (V2, SSRF): a custom indexer URL must be https and its host
+// must be the host of one of the https presets above (same rule as
+// blockchain.py). Otherwise the probe below could be aimed at loopback, LAN or
+// cloud-metadata addresses from the web tier.
+// (FILTER_VALIDATE_URL is intentionally not used: it accepts exactly the
+// printable-ASCII set that the first check below already enforces.)
+function validIndexerUrl($url) {
+    if (!is_string($url) || !preg_match('/^[\x21-\x7e]+\z/', $url) || strpos($url, '\\') !== false) {
+        return false;
+    }
+    $p = parse_url($url);
+    // Exactly "https", no case folding: parse_url() keeps the case and PHP's stream layer does not
+    // fold it either (PHP 8.3 sends the request for an all-upper-case "HTTPS://" in cleartext).
+    if ($p === false || ($p['scheme'] ?? '') !== 'https') return false;
+    if (isset($p['user']) || isset($p['pass'])) return false;
+    if (isset($p['port']) && $p['port'] !== 443) return false;
+    $hosts = [];
+    foreach (midnightNetworks() as $preset) {
+        $pp = parse_url($preset);
+        if (strtolower($pp['scheme'] ?? '') === 'https' && !empty($pp['host'])) {
+            $hosts[] = strtolower($pp['host']);
+        }
+    }
+    return in_array(strtolower($p['host'] ?? ''), $hosts, true);
+}
+
+// Resolve the effective indexer endpoint: custom URL (https, known Midnight
+// indexer host only) overrides the network preset, matching blockchain.py.
 function midnightEndpoint($network, $custom) {
     $custom = trim((string)$custom);
     if ($custom !== '') {
-        if (!filter_var($custom, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $custom)) {
+        // The selected network's own preset (e.g. the local 'undeployed' node) is always fine.
+        if ($custom !== (midnightNetworks()[$network] ?? null) && !validIndexerUrl($custom)) {
             return null;
         }
         return $custom;
@@ -166,6 +235,10 @@ function midnightProbe($endpoint, $timeout) {
             'content' => '{"query":"{__typename}"}',
             'timeout' => $timeout,
             'ignore_errors' => true,
+            // irongate-audit (V2): never follow a redirect. An allowed host must not be
+            // able to bounce the probe to loopback, the LAN or cloud metadata.
+            'follow_location' => 0,
+            'max_redirects' => 0,
         ],
     ]);
     $t0 = microtime(true);
@@ -179,7 +252,8 @@ function midnightProbe($endpoint, $timeout) {
         return ['reachable' => false, 'response_time_ms' => $ms, 'http_code' => 0,
                 'error' => $ms >= ($timeout * 1000 - 100) ? 'connection timeout' : 'connection failed'];
     }
-    $ok = $code >= 200 && $code < 400;
+    // A 3xx is not an answer: redirects are not followed (see above).
+    $ok = $code >= 200 && $code < 300;
     return ['reachable' => $ok, 'response_time_ms' => $ms, 'http_code' => $code,
             'error' => $ok ? null : 'indexer returned HTTP ' . $code];
 }
@@ -260,7 +334,6 @@ function addReservation($db, $mac, $ip, $hostname, $description) {
     $stmt->bindValue(4, $description, SQLITE3_TEXT);
     $result = $stmt->execute();
     if ($result) {
-        syncReservationsToFile($db);
         return true;
     }
     return false;
@@ -270,142 +343,141 @@ function deleteReservation($db, $id) {
     $stmt = $db->prepare('DELETE FROM reservations WHERE id = ?');
     $stmt->bindValue(1, $id, SQLITE3_INTEGER);
     $result = $stmt->execute();
-    syncReservationsToFile($db);
     return $result ? true : false;
 }
 
-function syncReservationsToFile($db) {
+// irongate-audit (O4): the web tier no longer writes /etc/dnsmasq.conf or anything in /etc/dnsmasq.d. dnsmasq runs
+// as root and a `dhcp-script=` line in either would run a program as root, so both belong to root. This API stores
+// the settings and reservations in the database as before; to apply them it stages them as DATA in
+// DNSMASQ_STAGE_DIR (a root-owned directory outside the web root) and runs the one root helper below through sudo
+// with no arguments (/etc/sudoers.d/irongate-dnsmasq-apply). The helper accepts only the keys listed here, checks
+// each value, renders the files from its own template, runs `dnsmasq --test` and restarts dnsmasq.
+const DNSMASQ_HELPER = '/opt/irongate/dnsmasq-apply';
+const DNSMASQ_STAGE_DIR = '/var/lib/irongate/dnsmasq-staged';
+const DNSMASQ_SETTING_KEYS = ['dhcp_enabled', 'interface', 'cidr', 'range_start', 'range_end', 'gateway',
+                              'dns_primary', 'dns_secondary', 'lease_time', 'domain'];
+
+function dnsmasqRequest($db, $action) {
+    $all = getAllSettings($db);
+    $settings = [];
+    foreach (DNSMASQ_SETTING_KEYS as $key) {
+        if (isset($all[$key]) && is_scalar($all[$key])) {
+            // The old generator wrote the values as they were and dnsmasq ignores white space around them, so a gateway
+            // saved with a trailing space worked. The helper strips as well; a value that is not plain is refused there.
+            $settings[$key] = trim((string)$all[$key]);
+        }
+    }
+    // As before: the DHCP options count only while DHCP is on and a range is set, and an empty interface means
+    // "the default route's" (the helper looks that up).
+    $on = ($settings['dhcp_enabled'] ?? '') === 'true' && !empty($settings['range_start'] ?? '') && !empty($settings['range_end'] ?? '');
+    if (!$on) {
+        $settings = array_intersect_key($settings, ['interface' => 1]);
+    }
+    $settings['dhcp_enabled'] = $on ? 'true' : 'false';
+    if (empty($settings['interface'] ?? '')) {
+        unset($settings['interface']);
+    }
+    $reservations = [];
     $results = $db->query('SELECT * FROM reservations');
-    $content = "# Static DHCP Reservations - Auto-generated by Web UI\n";
     while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
-        $line = "dhcp-host=" . $row['mac'] . "," . $row['ip'];
-        $hostname = sanitizeHostname($row['hostname']);
-        if (!empty($hostname)) {
-            $line .= "," . $hostname;
-        }
-        $content .= $line . "\n";
+        $reservations[] = [
+            'mac' => trim((string)$row['mac']),
+            'ip' => trim((string)$row['ip']),
+            'hostname' => sanitizeHostname((string)($row['hostname'] ?? '')),
+        ];
     }
-    file_put_contents('/etc/dnsmasq.d/reservations.conf', $content);
+    return ['version' => 1, 'action' => $action, 'settings' => (object)$settings, 'reservations' => $reservations];
 }
 
-function generateDnsmasqConfig($db) {
-    $settings = getAllSettings($db);
-    
-    $config = "# DHCP Server Configuration\n";
-    $config .= "# Auto-generated by Web UI on " . date('Y-m-d H:i:s') . "\n\n";
-    
-    $interface = $settings['interface'] ?? '';
-    if (empty($interface)) {
-        $interface = trim(shell_exec("ip route | grep default | awk '{print \$5}' | head -n1"));
+// Stage the request and run the helper. Returns ['ok' => bool, 'error' => string, 'resp' => array|null].
+function runDnsmasqHelper($db, $action) {
+    $json = json_encode(dnsmasqRequest($db, $action));
+    if ($json === false) {
+        return ['ok' => false, 'error' => 'the request could not be encoded', 'resp' => null];
     }
-    
-    $config .= "# Interface\n";
-    $config .= "interface=$interface\n";
-    // Use bind-dynamic instead of bind-interfaces - more resilient to interface changes
-    $config .= "bind-dynamic\n\n";
-    
-    $config .= "# Disable DNS (DHCP only)\n";
-    $config .= "port=0\n\n";
-    
-    if ($settings['dhcp_enabled'] === 'true' && !empty($settings['range_start']) && !empty($settings['range_end'])) {
-        $netmask = cidrToNetmask($settings['cidr'] ?? '24');
-        $leaseTime = $settings['lease_time'] ?? '24h';
-        
-        $config .= "# DHCP Range\n";
-        $config .= "dhcp-range={$settings['range_start']},{$settings['range_end']},$netmask,$leaseTime\n\n";
-        
-        if (!empty($settings['gateway'])) {
-            $config .= "# Gateway\n";
-            $config .= "dhcp-option=option:router,{$settings['gateway']}\n\n";
-        }
-        
-        $dns = [];
-        if (!empty($settings['dns_primary'])) $dns[] = $settings['dns_primary'];
-        if (!empty($settings['dns_secondary'])) $dns[] = $settings['dns_secondary'];
-        if (!empty($dns)) {
-            $config .= "# DNS Servers\n";
-            $config .= "dhcp-option=option:dns-server," . implode(',', $dns) . "\n\n";
-        }
-        
-        if (!empty($settings['domain'])) {
-            $config .= "# Domain\n";
-            $config .= "domain={$settings['domain']}\n\n";
-        }
-    } else {
-        $config .= "# DHCP is disabled - configure via Web UI\n\n";
+    $dir = DNSMASQ_STAGE_DIR;
+    $lock = @fopen($dir . '/.lock', 'c');
+    if ($lock === false) {
+        return ['ok' => false, 'error' => 'the staging directory is not writable', 'resp' => null];
     }
-    
-    $config .= "# Lease file\n";
-    $config .= "dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases\n\n";
-    
-    $config .= "# Be authoritative\n";
-    $config .= "dhcp-authoritative\n\n";
-    
-    $config .= "# Logging\n";
-    $config .= "log-dhcp\n";
-    $config .= "log-facility=/var/log/dnsmasq.log\n\n";
-    
-    $config .= "# DHCP grace period notification for IronGate\n";
-    $config .= "dhcp-script=/opt/irongate/dhcp-notify.sh\n\n";
-
-    $config .= "# Static reservations\n";
-    $config .= "conf-dir=/etc/dnsmasq.d/,*.conf\n";
-
-    return $config;
+    flock($lock, LOCK_EX);
+    // A directory named request.json would make every rename below fail for good; an empty one is ours to remove.
+    if (is_dir($dir . '/request.json') && !is_link($dir . '/request.json')) {
+        @rmdir($dir . '/request.json');
+    }
+    $tmp = @tempnam($dir, '.req-');
+    if ($tmp === false || @file_put_contents($tmp, $json) === false || !@rename($tmp, $dir . '/request.json')) {
+        if ($tmp !== false) {
+            @unlink($tmp);
+        }
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return ['ok' => false, 'error' => 'the request could not be staged', 'resp' => null];
+    }
+    $out = [];
+    exec('sudo -n ' . DNSMASQ_HELPER . ' 2>&1', $out, $rc);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    $resp = null;
+    foreach (array_reverse($out) as $line) {
+        $decoded = json_decode($line, true);
+        if (is_array($decoded) && array_key_exists('success', $decoded)) {
+            $resp = $decoded;
+            break;
+        }
+    }
+    if ($resp === null) {
+        return ['ok' => false, 'error' => 'dnsmasq-apply gave no answer: ' . substr(implode(' ', $out), 0, 300), 'resp' => null];
+    }
+    return ['ok' => true, 'error' => '', 'resp' => $resp];
 }
 
-// Validate dnsmasq config before applying
-function validateConfig($configContent) {
-    // Write to temp file and test
-    $tempFile = '/tmp/dnsmasq-test-' . time() . '.conf';
-    file_put_contents($tempFile, $configContent);
-    
-    exec("dnsmasq --test --conf-file=$tempFile 2>&1", $output, $retval);
-    unlink($tempFile);
-    
+// Validate dnsmasq config before applying (what the settings in the database would render to)
+function validateConfig($db) {
+    $run = runDnsmasqHelper($db, 'validate');
+    $resp = $run['resp'];
+    if (!$run['ok']) {
+        return ['valid' => false, 'output' => $run['error'], 'return_code' => 1];
+    }
+    if (!($resp['success'] ?? false)) {
+        return ['valid' => false, 'output' => (string)($resp['error'] ?? ''), 'return_code' => 2];
+    }
     return [
-        'valid' => ($retval === 0),
-        'output' => implode("\n", $output),
-        'return_code' => $retval
+        'valid' => (bool)($resp['valid'] ?? false),
+        'output' => (string)($resp['output'] ?? ''),
+        'return_code' => (int)($resp['return_code'] ?? 1)
     ];
 }
 
 function applyConfig($db) {
-    $config = generateDnsmasqConfig($db);
-    
-    // Validate config first
-    $validation = validateConfig($config);
-    if (!$validation['valid']) {
+    $run = runDnsmasqHelper($db, 'apply');
+    if (!$run['ok']) {
         return [
             'success' => false,
-            'error' => 'Config validation failed: ' . $validation['output'],
+            'error' => 'Config validation failed: ' . $run['error'],
             'stage' => 'validation'
         ];
     }
-    
-    // Write the config
-    file_put_contents('/etc/dnsmasq.conf', $config);
-    
-    // Stop current service gracefully
-    exec('sudo systemctl stop dnsmasq 2>&1', $stopOutput, $stopRetval);
-    usleep(500000); // Wait 500ms
-    
-    // Start the service
-    exec('sudo systemctl start dnsmasq 2>&1', $startOutput, $startRetval);
-    
-    if ($startRetval !== 0) {
+    $resp = $run['resp'];
+    if ($resp['success'] ?? false) {
+        return ['success' => true];
+    }
+    if (($resp['stage'] ?? '') === 'start') {
         // Get the actual error from journalctl
         exec('journalctl -u dnsmasq -n 20 --no-pager 2>&1', $journalOutput);
         return [
             'success' => false,
             'error' => 'Service start failed',
-            'output' => implode("\n", $startOutput),
+            'output' => (string)($resp['output'] ?? ''),
             'journal' => implode("\n", $journalOutput),
             'stage' => 'start'
         ];
     }
-    
-    return ['success' => true];
+    return [
+        'success' => false,
+        'error' => 'Config validation failed: ' . (string)($resp['error'] ?? ''),
+        'stage' => 'validation'
+    ];
 }
 
 function getServiceStatus() {
@@ -695,7 +767,14 @@ switch ($action) {
     case 'settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
-            
+            // This endpoint stores any key, the irongate_* ones included: same rules as irongate_settings.
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
+
             // Validate lease_time format (dnsmasq format: 30m, 24h, 7d, 1w, infinite, or raw seconds)
             if (isset($data['lease_time'])) {
                 $lt = trim($data['lease_time']);
@@ -804,8 +883,7 @@ switch ($action) {
         break;
     
     case 'validate':
-        $config = generateDnsmasqConfig($db);
-        $result = validateConfig($config);
+        $result = validateConfig($db);
         echo json_encode(['success' => true, 'data' => $result]);
         break;
     
@@ -841,6 +919,12 @@ switch ($action) {
     case 'irongate_settings':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            $settingsError = irongateSettingsError($data);
+            if ($settingsError !== null) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $settingsError]);
+                break;
+            }
             // Layer 8 validation: never persist an enable without a contract
             // address, an unknown network, or a malformed indexer URL.
             if (is_array($data) && (array_key_exists('blockchain_enabled', $data)
@@ -859,10 +943,17 @@ switch ($action) {
                     break;
                 }
                 $reqIndexer = trim((string)($data['blockchain_indexer_url'] ?? ''));
-                if ($reqIndexer !== '' && (!filter_var($reqIndexer, FILTER_VALIDATE_URL)
-                    || !preg_match('#^https?://#i', $reqIndexer))) {
-                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+                $reqNetwork = (string)($data['blockchain_network'] ?? (getSetting($db, 'blockchain_network') ?? 'preprod'));
+                if ($reqIndexer !== '' && $reqIndexer !== (midnightNetworks()[$reqNetwork] ?? null)
+                    && !validIndexerUrl($reqIndexer)) {
+                    http_response_code(400);
+                    echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
                     break;
+                }
+                // Store exactly what was validated (trimmed), not the raw value: the engine refuses a
+                // URL with surrounding whitespace, so storing the padded text would silently switch Layer 8 off.
+                if (array_key_exists('blockchain_indexer_url', $data)) {
+                    $data['blockchain_indexer_url'] = $reqIndexer;
                 }
             }
             foreach ($data as $key => $value) {
@@ -969,6 +1060,19 @@ switch ($action) {
                 break;
             }
 
+            // irongate-audit (V1): group names (and the names a group may reach)
+            // become nft set identifiers in the root engine.
+            $accessList = $data['can_access_groups'] ?? [];
+            $accessOk = is_array($accessList);
+            foreach (($accessOk ? $accessList : []) as $g) {
+                if (!validZoneName($g)) { $accessOk = false; }
+            }
+            if (!validZoneName($name) || !$accessOk) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid group name (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
+                break;
+            }
+
             $stmt = $db->prepare('INSERT OR REPLACE INTO device_groups (name, color, icon, description, lan_access, can_access_groups) VALUES (?, ?, ?, ?, ?, ?)');
             $stmt->bindValue(1, $name, SQLITE3_TEXT);
             $stmt->bindValue(2, $data['color'] ?? '#6c757d', SQLITE3_TEXT);
@@ -1070,11 +1174,20 @@ switch ($action) {
     case 'irongate_devices':
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);
+            // irongate-audit (V1): ip and zone end up inside the root engine's nft
+            // ruleset. An empty ip is still allowed (the engine skips such devices).
+            $devIp = $data['ip'] ?? '';
+            $devZone = $data['zone'] ?? 'isolated';
+            if (($devIp !== '' && !validDeviceIp($devIp)) || !validZoneName($devZone)) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => 'Invalid ip (IPv4 address) or zone (letters, digits, _ and -, starting with a letter or _, max 32 characters)']);
+                break;
+            }
             $stmt = $db->prepare('INSERT OR REPLACE INTO irongate_devices (mac, ip, hostname, zone) VALUES (?, ?, ?, ?)');
             $stmt->bindValue(1, strtolower($data['mac']), SQLITE3_TEXT);
-            $stmt->bindValue(2, $data['ip'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(2, $devIp, SQLITE3_TEXT);
             $stmt->bindValue(3, $data['hostname'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(4, $data['zone'] ?? 'isolated', SQLITE3_TEXT);
+            $stmt->bindValue(4, $devZone, SQLITE3_TEXT);
             $result = $stmt->execute();
             if ($result) {
                 safeApplyConfig($db);
@@ -1273,7 +1386,8 @@ switch ($action) {
         }
         $endpoint = midnightEndpoint($network, $custom);
         if ($endpoint === null) {
-            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be http or https)']);
+            http_response_code(400);
+            echo json_encode(['success' => false, 'error' => 'Invalid indexer URL (must be https on a known Midnight indexer host)']);
             break;
         }
         $probe = midnightProbe($endpoint, 5);

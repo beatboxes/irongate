@@ -26,9 +26,11 @@ kept alongside this file as blockchain_algorand.py.<ts>.reference.
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -58,6 +60,28 @@ MAX_CACHE_ENTRIES = 4096
 # so an unreachable indexer must never add latency to every packet.
 BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN = 30.0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every HTTP redirect (irongate-audit, V2: SSRF).
+
+    indexer_url is checked against an allowlist, but a redirect would let an
+    allowed (or compromised) host send this root process to any other URL. With
+    redirect_request() returning None urllib raises HTTPError for a 3xx, which
+    _graphql() already treats as an indexer failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# urlopen() below uses this opener. It is installed process-wide on purpose: this
+# module is the only urllib user in the engine process (tests/test_validation.py,
+# OpenerScopeTests, fails if another module starts using urllib), and going through
+# urllib.request.urlopen() keeps the transport replaceable in tests, which a
+# module-local opener's .open() would not. Switch to a module-local opener (and
+# point those test mocks at it) before any other urllib user is added.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
 
 
 class VerificationResult(Enum):
@@ -129,6 +153,38 @@ class IrongateBlockchain:
     DEFAULT_NETWORK = 'preprod'
     DEFAULT_TIMEOUT = 5.0
 
+    @classmethod
+    def allowed_indexer_hosts(cls):
+        """Hosts of the https indexer presets in NETWORKS (derived, not hard-coded)."""
+        hosts = set()
+        for preset in cls.NETWORKS.values():
+            parts = urllib.parse.urlsplit(preset['indexer'])
+            if parts.scheme == 'https' and parts.hostname:
+                hosts.add(parts.hostname.lower())
+        return frozenset(hosts)
+
+    @classmethod
+    def validate_indexer_url(cls, url):
+        """Return url if it is an https URL on a known Midnight indexer host, else None.
+
+        irongate-audit (V2, SSRF): indexer_url comes from a config file the web
+        tier can write, and this process runs as root. Without this check a
+        crafted value points the engine at cloud metadata (http://169.254.169.254/),
+        loopback services or file:// URLs.
+        """
+        if not isinstance(url, str) or not re.fullmatch(r'[\x21-\x7e]+', url) or '\\' in url:
+            return None
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+            return None
+        if (parts.hostname or '').lower() not in cls.allowed_indexer_hosts():
+            return None
+        return url
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize blockchain connection.
@@ -166,11 +222,25 @@ class IrongateBlockchain:
             )
             self.network = self.DEFAULT_NETWORK
 
-        # An explicit indexer_url overrides the network preset.
-        self.indexer_url = (
-            self.config.get('indexer_url')
-            or self.NETWORKS[self.network]['indexer']
-        )
+        # An explicit indexer_url overrides the network preset, but only if it
+        # is an https URL on a known Midnight indexer host (SSRF guard, V2).
+        # A configured URL that fails the check FAILS CLOSED: indexer_url becomes
+        # None and no query is ever made. It is deliberately NOT replaced by the
+        # network preset, which would send queries to a host the operator did not
+        # configure and hide the misconfiguration.
+        self.indexer_url = self.NETWORKS[self.network]['indexer']
+        custom_indexer = self.config.get('indexer_url')
+        if custom_indexer and custom_indexer != self.indexer_url:
+            if self.validate_indexer_url(custom_indexer):
+                self.indexer_url = custom_indexer
+            else:
+                self.indexer_url = None
+                logger.warning(
+                    "Blockchain Layer 8: indexer_url %r rejected (must be https on a "
+                    "known Midnight indexer host) - no queries will be made until it is "
+                    "fixed or removed (it is not replaced by the '%s' preset)",
+                    custom_indexer, self.network,
+                )
 
         if not self.config.get('enabled', False):
             logger.info("Blockchain Layer 8: Disabled in config")
@@ -209,6 +279,10 @@ class IrongateBlockchain:
         Returns the 'data' object, or None on any transport/protocol failure.
         Never raises - callers treat None as 'chain undecided'.
         """
+        if self.indexer_url is None:
+            # A configured indexer_url was rejected (see __init__): make no request.
+            return None
+
         now = time.time()
         if now < self._breaker_until:
             logger.debug("Midnight indexer circuit breaker open for %.0fs more",

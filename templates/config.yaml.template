@@ -27,7 +27,13 @@ blockchain:
   network: "preprod"
   # Address of the deployed Midnight device-registry contract (required if enabled)
   contract_address: null
-  # Override the indexer endpoint; null uses the preset for the chosen network
+  # Override the indexer endpoint; null uses the preset for the chosen network.
+  # A custom URL must be https on port 443 on one of the Midnight indexer hosts
+  # (indexer.preprod / indexer.preview / indexer.mainnet .midnight.network), with no
+  # credentials; redirects are never followed. The selected network's own preset
+  # (e.g. the local 'undeployed' node) is also accepted. Any other value is refused
+  # by the dashboard (HTTP 400); if it is edited into this file by hand the engine
+  # makes NO Layer 8 queries (it does not fall back to the preset) and logs a warning.
   indexer_url: null
   # Cache TTL in seconds (reduces blockchain queries)
   cache_ttl: 60
