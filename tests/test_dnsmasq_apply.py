@@ -2058,6 +2058,141 @@ class LockdownRobustness(Base):
         self.assertEqual(rc, 0, out + err)
         self.assertNotIn('re-created', out)
 
+# ================================================================ the restart is waited for (live finding on the router, 2026-10-28)
+import time
+
+FAKE_DIR = '/tmp/fake-systemd'
+FAKE_SYSTEMCTL = r'''#!/usr/bin/python3
+# systemd as the router has it. `stop dnsmasq` is a job that waits for irongate.service to stop first (BindsTo/PartOf) and then runs; the
+# job belongs to systemd, so it goes on when its client is killed; a `start` that arrives while it is still queued CANCELS it (MainPID
+# unchanged, nothing restarted); the client of a cancelled or failed job exits non-zero.
+import json, os, sys, time
+D, S = '/tmp/fake-systemd', '/tmp/fake-systemd/state.json'
+def load():
+    s = json.load(open(S))
+    job = s['stop_job']
+    if job and job['due'] is not None and time.time() >= job['due']:
+        s['pid'], s['stop_job'] = 0, None                    # the queued stop runs by itself once it is due
+    return s
+def save(s):
+    json.dump(s, open(S + '.tmp', 'w')); os.replace(S + '.tmp', S)
+cmd = sys.argv[1]
+open(D + '/log', 'a').write(' '.join(sys.argv[1:]) + '\n')
+s = load(); cfg = s['cfg']
+if cmd == 'stop':
+    if cfg['stop_rc']:
+        print('Failed to stop dnsmasq.service: simulated'); sys.exit(cfg['stop_rc'])
+    if s['pid']:
+        s['stop_job'] = {'due': None if cfg['stop_never'] else time.time() + cfg['stop_delay']}; save(s)
+    while load()['stop_job']: time.sleep(0.05)               # the client waits for its job
+    s = load(); save(s)
+    if s['pid']:
+        print('Job for dnsmasq.service canceled.'); sys.exit(1)
+elif cmd == 'start':
+    if cfg['start_rc']:
+        print('Failed to start dnsmasq.service: simulated'); sys.exit(cfg['start_rc'])
+    if s['stop_job']: s['stop_job'] = None                   # cancelled: the old process goes on
+    elif not s['pid']: s['pid'], s['next_pid'] = s['next_pid'], s['next_pid'] + 1
+    save(s)
+elif cmd == 'is-active':
+    save(s); print('active' if s['pid'] else 'inactive'); sys.exit(0 if s['pid'] else 3)
+'''
+
+
+class ServiceRestart(Base):
+    """On the router `systemctl stop dnsmasq` takes ~95 s (irongate.service stops first, BindsTo/PartOf, TimeoutStopSec=180) and the helper
+    waited 60 s, ignored the result and ran `start`, which cancelled the queued stop: success was reported while dnsmasq went on with its old
+    process and its old configuration. Times are scaled here: the old wait of 60 s is 1 s, the stop of 95 s is 3 s, the new wait is 10 s."""
+    PID = 4242
+
+    def setUp(self):
+        Base.setUp(self)
+        self.addCleanup(shutil.rmtree, FAKE_DIR, True)
+
+    def fake(self, stop_delay=0, stop_never=False, stop_rc=0, start_rc=0):
+        shutil.rmtree(FAKE_DIR, ignore_errors=True)
+        os.makedirs(FAKE_DIR)
+        write(FAKE_DIR + '/systemctl', FAKE_SYSTEMCTL, mode=0o755)
+        write(FAKE_DIR + '/state.json', json.dumps({'pid': self.PID, 'next_pid': 5000, 'stop_job': None,
+                                                     'cfg': {'stop_delay': stop_delay, 'stop_never': stop_never, 'stop_rc': stop_rc,
+                                                             'start_rc': start_rc}}))
+
+    def apply(self, wait_start, wait_stop):
+        mod = load_module()
+        mod.SYSTEMCTL_BIN = (FAKE_DIR + '/systemctl',)
+        mod.SERVICE_TIMEOUT, mod.STOP_TIMEOUT = wait_start, wait_stop
+        stage(request())
+        return mod.run_request()
+
+    def state(self):
+        return json.loads(read(FAKE_DIR + '/state.json'))
+
+    def log(self):
+        return read(FAKE_DIR + '/log').decode().splitlines()
+
+    def active(self):
+        return subprocess.run([FAKE_DIR + '/systemctl', 'is-active', 'dnsmasq'], stdout=subprocess.PIPE).stdout.decode().strip()
+
+    def failed_and_back(self, rc, body):
+        self.assertEqual(rc, 4, body)
+        self.assertEqual((body['success'], body['stage'], body['restored'], body['restarted']), (False, 'start', True, True), body)
+        self.untouched()
+
+    def test_control_a_stop_that_is_quick_ends_in_a_new_process(self):
+        self.fake()
+        rc, body = self.apply(1, 10)
+        self.assertEqual((rc, body), (0, {'success': True, 'stage': 'start'}))
+        self.assertNotIn(self.state()['pid'], (0, self.PID))
+        self.assertEqual(self.log(), ['stop dnsmasq', 'start dnsmasq'])
+
+    def test_a_stop_that_takes_longer_than_the_old_wait_still_ends_in_a_restart(self):
+        self.fake(stop_delay=3)
+        rc, body = self.apply(1, 10)
+        self.assertEqual((rc, body), (0, {'success': True, 'stage': 'start'}))
+        state = self.state()
+        self.assertNotIn(state['pid'], (0, self.PID), 'success was reported: dnsmasq must be a NEW process, not the one that was running')
+        self.assertIsNone(state['stop_job'])
+        self.assertEqual(self.log(), ['stop dnsmasq', 'start dnsmasq'])
+        self.assertNotEqual(read(CONF), OLD_MAIN)
+        self.assertEqual(self.active(), 'active')
+
+    def test_a_stop_that_never_finishes_is_a_failure_with_the_old_files_back_and_dnsmasq_running(self):
+        self.fake(stop_never=True)
+        rc, body = self.apply(1, 2)
+        self.failed_and_back(rc, body)
+        self.assertIn('stop', body['error'] + body['output'])
+        self.assertEqual(self.log(), ['stop dnsmasq', 'start dnsmasq'])
+        state = self.state()
+        self.assertEqual((state['pid'], state['stop_job']), (self.PID, None), 'the stop job is cancelled, not left to run later')
+        self.assertEqual(self.active(), 'active')
+
+    def test_a_stop_job_that_outlives_the_wait_never_stops_dnsmasq_later(self):
+        self.fake(stop_delay=3)
+        rc, body = self.apply(1, 1)            # the helper gives up at 1 s; the queued stop would run at 3 s
+        self.failed_and_back(rc, body)
+        time.sleep(3.5)                        # well past the moment it was due
+        self.assertEqual((self.active(), self.state()['pid']), ('active', self.PID))
+
+    def test_a_stop_that_fails_at_once_is_a_failure_and_dnsmasq_stays_up(self):
+        self.fake(stop_rc=1)
+        rc, body = self.apply(1, 2)
+        self.failed_and_back(rc, body)
+        self.assertEqual(self.log(), ['stop dnsmasq', 'start dnsmasq'])
+        self.assertEqual((self.active(), self.state()['pid']), ('active', self.PID))
+
+    def test_when_even_the_start_that_follows_a_failed_stop_fails_the_report_says_so(self):
+        self.fake(stop_never=True, start_rc=5)
+        rc, body = self.apply(1, 2)
+        self.assertEqual(rc, 4, body)
+        self.assertEqual((body['success'], body['restored'], body['restarted']), (False, True, False))
+        self.untouched()
+
+    def test_the_wait_for_the_stop_outlasts_what_the_units_need(self):
+        mod = load_module()
+        self.assertGreaterEqual(getattr(mod, 'STOP_TIMEOUT', 0), 240, 'irongate.service: TimeoutStopSec=180, and it stops before dnsmasq does')
+        self.assertGreater(mod.STOP_TIMEOUT, mod.SERVICE_TIMEOUT)
+
+
 def print_option_table(path):
     """The `_OPTION_TABLE` block of src/dnsmasq-apply for the dnsmasq binary at `path` (what to paste when the table test names a difference)."""
     lines, current = [], '   '

@@ -5109,7 +5109,7 @@ Why this exists (irongate-audit O4). dnsmasq runs as root and honours `dhcp-scri
     root-only directory); if dnsmasq will not start on them the previous files are put back.
 
 Output: one JSON object on stdout, {"success": bool, "stage": ..., "error": ..., "output": ...}.
-Exit status: 0 applied/valid, 2 request refused, 3 dnsmasq --test failed, 4 service did not start,
+Exit status: 0 applied/valid, 2 request refused, 3 dnsmasq --test failed, 4 service did not stop or start (the previous files are back),
 5 the environment is not safe (a directory is not root-owned, a tool is missing, --lockdown could not lock every entry),
 1 internal error.
 
@@ -5179,6 +5179,9 @@ READ_CHUNK = 1024
 EXEC_PATHS = ('/opt/irongate/dnsmasq-apply', '/opt/irongate/dhcp-notify.sh')
 TEST_TIMEOUT = 30
 SERVICE_TIMEOUT = 60
+# `systemctl stop dnsmasq` is not quick on the router: irongate.service is bound to dnsmasq (BindsTo/PartOf) and stops FIRST (its ARP restoration
+# takes ~95 s, TimeoutStopSec=180), dnsmasq's own stop (default 90 s) comes after it. The wait must outlast both.
+STOP_TIMEOUT = 300
 
 # ---- what the dashboard may set ----
 SETTING_KEYS = ('dhcp_enabled', 'interface', 'cidr', 'range_start', 'range_end', 'gateway',
@@ -5767,14 +5770,24 @@ def apply(action, settings, reservations):
             _restore(res_path, old_res)
             raise Failure('validation', out or 'dnsmasq --test failed', output=out, code=3, return_code=rc)
         _install_file(CONF_PATH, main_text.encode('ascii'))
-        _run([systemctl, 'stop', 'dnsmasq'], SERVICE_TIMEOUT)
-        time.sleep(0.5)
-        rc, out = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+        # The stop is WAITED for and its result counts: a `start` issued while the stop job is still queued cancels it, dnsmasq would go on as
+        # the old process with the old configuration and this would report success. A stop job that finished (rc 0) means dnsmasq is down, so
+        # the start that follows is a real restart on the new files.
+        rc, out = _run([systemctl, 'stop', 'dnsmasq'], STOP_TIMEOUT)
+        what = 'stop'
+        if rc == 0:
+            time.sleep(0.5)
+            rc, out = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+            what = 'start'
         if rc != 0:
             _restore(CONF_PATH, old_main)
             _restore(res_path, old_res)
+            # after a stop that did not finish this `start` is also what cancels the queued stop job (a killed client leaves it behind):
+            # dnsmasq is never left to be stopped later, and runs on the files that are back
             rc_back, _out_back = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
-            raise Failure('start', 'Service start failed', output=out, code=4, restored=True, restarted=rc_back == 0)
+            if what == 'stop':
+                out = 'systemctl stop dnsmasq: %s (the previous files are back)' % out   # api.php shows `output` under its fixed 'Service start failed'
+            raise Failure('start', 'Service %s failed' % what, output=out, code=4, restored=True, restarted=rc_back == 0)
     except Failure:
         raise
     except BaseException:
