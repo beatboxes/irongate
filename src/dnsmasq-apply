@@ -1,0 +1,1352 @@
+#!/usr/bin/python3 -I
+"""dnsmasq-apply - the only program that writes /etc/dnsmasq.conf and /etc/dnsmasq.d/reservations.conf.
+
+Why this exists (irongate-audit O4). dnsmasq runs as root and honours `dhcp-script=` (and `conf-script=`,
+`dhcp-luascript=`, `conf-file=`, ...) in any file it reads. While www-data owned /etc/dnsmasq.conf and
+/etc/dnsmasq.d, a compromised web tier could add such a line and get a root program started by the next
+`systemctl restart dnsmasq`, which it is allowed to run. Now:
+
+  * /etc/dnsmasq.conf, /etc/dnsmasq.d and every file in it belong to root (0644 / 0755);
+  * the web API (www-data) writes a REQUEST (settings and reservations, as data) to
+    /var/lib/irongate/dnsmasq-staged/request.json and runs this program through sudo, with no arguments
+    (/etc/sudoers.d/irongate-dnsmasq-apply: `www-data ALL=(root) NOPASSWD: /opt/irongate/dnsmasq-apply ""`);
+  * this program accepts only the keys the dashboard sets, checks every value against a strict shape, and
+    RENDERS the files from the template below (the dhcp-script and conf-dir lines are constants here, not
+    input). A request that carries anything else - an unknown key, a directive name that must never come from
+    the web tier, a newline, a NUL, an "=" - is refused as a whole and nothing is written;
+  * the rendered files go through `dnsmasq --test` before they replace the live ones (temp file + rename in a
+    root-only directory); if dnsmasq will not start on them the previous files are put back.
+
+Output: one JSON object on stdout, {"success": bool, "stage": ..., "error": ..., "output": ...}.
+Exit status: 0 applied/valid, 2 request refused, 3 dnsmasq --test failed, 4 service did not start,
+5 the environment is not safe (a directory is not root-owned, a tool is missing, --lockdown could not lock every entry),
+1 internal error.
+
+Root-only command line modes (the sudoers rule allows no arguments, so the web tier cannot reach them):
+  --lockdown   make /etc/dnsmasq.conf and /etc/dnsmasq.d root-owned. The directory is taken first; then every
+               file the web tier could have written is READ ONCE, scanned as dnsmasq's own parser would read it
+               (a forbidden directive, quoted or split across dnsmasq's 1024-byte read buffer, anything but plain
+               `name=value` lines) and only what is clean is written back as a new root-owned file, so a
+               descriptor the web tier still holds is useless. A file that is not clean is never re-created: its
+               bytes go to a root-only directory (QUARANTINE_DIR) and, for the two files this program renders,
+               the root-held snapshot of the last good rendering (SNAPSHOT_DIR) or a safe default replaces it.
+               Links, directories and special files are renamed aside (.refused.*, dnsmasq skips dot files), and so
+               is an entry that cannot be processed at all (a read or write error, a name of any length): one entry
+               never stops the others or the main file, and the exit status is 5 if anything could not be locked.
+               What is accepted in a file the web tier could have written is an ALLOWLIST: the main file may hold
+               only what render_main() emits (MAIN_NAMES, the four fixed lines as they are), reservations.conf only
+               dhcp-host, any other file only options dnsmasq has (KNOWN_OPTIONS) that are not FORBIDDEN.
+  --audit      read-only: every entry of /etc/dnsmasq.d (root-owned ones too) and /etc/dnsmasq.conf must be a
+               root-only regular file without a directive the web tier must not set; the programs dnsmasq and
+               sudo run as root must not be writable by anybody else. Exit 1 on any finding.
+
+apply() runs the audit first and refuses (exit 5) to run dnsmasq --test, which executes conf-script, on a tree
+that is not clean.
+"""
+
+import errno
+import fcntl
+import io
+import ipaddress
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+
+try:
+    import syslog
+except ImportError:  # pragma: no cover
+    syslog = None
+
+# ---- paths (tests replace these on the imported module; the installed program never reads them from the environment) ----
+CONF_PATH = '/etc/dnsmasq.conf'
+CONF_DIR = '/etc/dnsmasq.d'
+RES_NAME = 'reservations.conf'
+STATE_DIR = '/var/lib/irongate'
+STAGE_DIR = '/var/lib/irongate/dnsmasq-staged'
+QUARANTINE_DIR = '/var/lib/irongate/dnsmasq-quarantine'
+SNAPSHOT_DIR = '/var/lib/irongate/dnsmasq-good'
+REQUEST_NAME = 'request.json'
+LOCK_PATH = '/run/irongate-dnsmasq-apply.lock'
+DNSMASQ_BIN = ('/usr/sbin/dnsmasq', '/usr/bin/dnsmasq', '/sbin/dnsmasq')
+SYSTEMCTL_BIN = ('/usr/bin/systemctl', '/bin/systemctl')
+IP_BIN = ('/usr/sbin/ip', '/sbin/ip', '/usr/bin/ip', '/bin/ip')
+WEB_USER = 'www-data'
+MAX_REQUEST = 1024 * 1024
+MAX_RESERVATIONS = 2048
+MAX_CONF_FILE = 8 * 1024 * 1024
+MAX_QUARANTINE = 1000
+# dnsmasq reads its configuration with fgets() into a 1025-byte buffer: at most 1024 bytes of a longer line, and the
+# rest comes back as if it were a line of its own (a `#` comment of 1023 characters followed by `conf-file=...` is
+# a comment plus a directive for dnsmasq).
+READ_CHUNK = 1024
+# programs that run as root on the web tier's behalf (sudo) or dnsmasq's (dhcp-script): nobody else may change them
+EXEC_PATHS = ('/opt/irongate/dnsmasq-apply', '/opt/irongate/dhcp-notify.sh')
+TEST_TIMEOUT = 30
+SERVICE_TIMEOUT = 60
+
+# ---- what the dashboard may set ----
+SETTING_KEYS = ('dhcp_enabled', 'interface', 'cidr', 'range_start', 'range_end', 'gateway',
+                'dns_primary', 'dns_secondary', 'lease_time', 'domain')
+TOP_KEYS = ('version', 'action', 'settings', 'reservations')
+RESERVATION_KEYS = ('mac', 'ip', 'hostname')
+
+# dnsmasq's long-option table (option.c, `opts[]`) of dnsmasq 2.92: EVERY name a configuration file may use, with the option value (the
+# `val` field) it stands for. Names with the same value are aliases of one option, and not all of them are in `dnsmasq --help`:
+# `dhcp-lease` is the old name of `dhcp-leasefile` (a root dnsmasq creates and rewrites that file just the same), `domain-suffix` is
+# `domain`. tests/test_dnsmasq_apply.py reads the table out of the dnsmasq binary it runs against and requires it to be this one, name
+# for name and value for value (and every name to be a string of the binary).
+_OPTION_TABLE = '''
+    version 118; no-hosts 104; no-poll 110; help 119; no-daemon 100; log-queries 113; user 117; group 103; resolv-file 114
+    servers-file 333; mx-host 109; mx-target 116; cache-size 99; port 112; dhcp-leasefile 108; dhcp-lease 108; dhcp-host 71; dhcp-range 70
+    dhcp-option 79; dhcp-boot 77; domain 115; domain-suffix 115; interface 105; listen-address 97; local-service 335; bogus-priv 98
+    bogus-nxdomain 66; ignore-address 338; selfmx 101; filterwin2k 102; filter-A 369; filter-AAAA 370; filter-rr 381; pid-file 120
+    strict-order 111; server 83; rev-server 332; local 286; address 65; conf-file 67; conf-script 374; no-resolv 82; expand-hosts 69
+    localmx 76; local-ttl 84; no-negcache 78; no-round-robin 378; no-0x20-encode 387; do-0x20-encode 388; cache-rr 380; addn-hosts 72
+    hostsdir 342; query-port 81; except-interface 73; no-dhcp-interface 50; no-dhcpv4-interface 383; no-dhcpv6-interface 382
+    domain-needed 68; dhcp-lease-max 88; bind-interfaces 122; read-ethers 90; alias 86; dhcp-vendorclass 85; dhcp-userclass 106
+    dhcp-ignore 74; edns-packet-max 80; keep-in-foreground 107; dhcp-authoritative 75; srv-host 87; localise-queries 121; txt-record 89
+    caa-record 356; dns-rr 310; enable-dbus 49; enable-ubus 354; bootp-dynamic 51; dhcp-mac 52; no-ping 53; dhcp-script 54; conf-dir 55
+    log-facility 56; leasefile-ro 57; script-on-renewal 360; dns-forward-max 48; clear-on-reload 256; dhcp-ignore-names 257
+    enable-tftp 258; tftp-secure 259; tftp-no-fail 344; tftp-unique-root 274; tftp-root 260; tftp-max 263; tftp-mtu 349
+    tftp-lowercase 309; tftp-single-port 359; ptr-record 261; naptr-record 287; bridge-interface 262; shared-network 357
+    dhcp-option-force 264; dhcp-option-pxe 386; tftp-no-blocksize 265; log-dhcp 266; log-async 267; dhcp-circuitid 268; dhcp-remoteid 269
+    dhcp-subscrid 270; dhcp-pxe-vendor 361; interface-name 271; dhcp-hostsfile 273; dhcp-optsfile 280; dhcp-hostsdir 340; dhcp-optsdir 341
+    dhcp-no-override 275; tftp-port-range 276; stop-dns-rebind 277; rebind-domain-ok 298; all-servers 278; dhcp-match 281
+    dhcp-name-match 355; dhcp-broadcast 282; neg-ttl 283; max-ttl 297; min-cache-ttl 339; max-cache-ttl 312; dhcp-alternate-port 284
+    dhcp-scriptuser 285; min-port 288; max-port 345; dhcp-fqdn 289; cname 290; pxe-prompt 291; pxe-service 292; test 293; tag-if 294
+    dhcp-proxy 295; dhcp-generate-names 296; rebind-localhost-ok 299; add-mac 300; strip-mac 372; add-subnet 325; strip-subnet 371
+    add-cpe-id 346; proxy-dnssec 301; dhcp-sequential-ip 302; conntrack 303; dhcp-client-update 304; dhcp-luascript 305; enable-ra 306
+    dhcp-duid 307; host-record 308; bind-dynamic 311; auth-zone 313; auth-server 314; auth-ttl 315; auth-soa 316; auth-sec-servers 317
+    auth-peer 318; ipset 319; nftset 368; connmark-allowlist-enable 365; connmark-allowlist 366; synth-domain 320; dnssec 329
+    trust-anchor 330; dnssec-debug 331; dnssec-check-unsigned 334; dnssec-no-timecheck 336; dnssec-timestamp 343; dnssec-limits 385
+    dhcp-relay 323; dhcp-split-relay 390; ra-param 324; quiet-dhcp 326; quiet-dhcp6 327; quiet-ra 328; dns-loop-detect 337; script-arp 347
+    dhcp-ttl 348; dhcp-reply-delay 350; dhcp-rapid-commit 351; dumpfile 352; dumpmask 353; dhcp-ignore-clid 358; dynamic-host 362
+    log-debug 363; umbrella 364; quiet-tftp 367; port-limit 375; fast-dns-retry 376; use-stale-cache 377; no-ident 379
+    max-tcp-connections 384; leasequery 389
+'''
+OPTION_VALUES = dict((item.split()[0], int(item.split()[1])) for item in re.split(r'[;\n]', _OPTION_TABLE) if item.strip())
+
+# Directives that read a file, run a program, write a file, change the user or open another config. They may
+# never come from the web tier. Everything not in SETTING_KEYS is refused anyway; this list only makes the
+# refusal say so (and is what the audit looks for). FORBIDDEN is this list plus every ALIAS of one of its options,
+# derived by option VALUE from the table above, so a spelling that only dnsmasq's own table knows is covered too.
+_FORBIDDEN_NAMED = frozenset('''
+    conf-file conf-dir conf-script dhcp-script dhcp-luascript script-arp dhcp-scriptuser dhcp-hostsfile dhcp-optsfile
+    dhcp-hostsdir dhcp-optsdir hostsdir addn-hosts servers-file resolv-file pid-file dhcp-leasefile leasefile-ro
+    log-facility dumpfile dumpmask dnssec-timestamp tftp-root enable-tftp dhcp-boot pxe-service user group read-ethers
+    dhcp-relay dhcp-proxy trust-anchor ipset nftset connmark-allowlist
+'''.split())
+_FORBIDDEN_VALUES = frozenset(OPTION_VALUES[n] for n in _FORBIDDEN_NAMED if n in OPTION_VALUES)
+FORBIDDEN = _FORBIDDEN_NAMED | frozenset(n for n, v in OPTION_VALUES.items() if v in _FORBIDDEN_VALUES)
+# the table's names in the form the scanner compares (lower case: the table also has filter-A and filter-AAAA)
+KNOWN_OPTIONS = frozenset(n.lower() for n in OPTION_VALUES)
+
+# ---- the template ----
+HEADER_FMT = "# DHCP Server Configuration\n# Auto-generated by Web UI on %s\n\n"
+FIXED_LEASEFILE = 'dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases'
+FIXED_LOGFACILITY = 'log-facility=/var/log/dnsmasq.log'
+FIXED_SCRIPT = 'dhcp-script=/opt/irongate/dhcp-notify.sh'
+FIXED_CONFDIR = 'conf-dir=/etc/dnsmasq.d/,*.conf'
+RES_HEADER = "# Static DHCP Reservations - Auto-generated by Web UI\n"
+
+# directive names the rendered main file may contain
+MAIN_NAMES = frozenset(['interface', 'bind-dynamic', 'port', 'dhcp-range', 'dhcp-option', 'domain',
+                        'dhcp-leasefile', 'dhcp-authoritative', 'log-dhcp', 'log-facility', 'dhcp-script', 'conf-dir'])
+
+_IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+_IPV4_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}')
+_MAC_RE = re.compile(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
+_LEASE_RE = re.compile(r'(?:[0-9]{1,10}[smhdw]?|infinite)', re.IGNORECASE)
+_CIDR_RE = re.compile(r'[0-9]{1,2}')
+_HOST_LABEL = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+_HOST_RE = re.compile(r'%s(?:\.%s)*' % (_HOST_LABEL, _HOST_LABEL))
+_DOM_LABEL = r'[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
+_DOMAIN_RE = re.compile(r'%s(?:\.%s)*' % (_DOM_LABEL, _DOM_LABEL))
+
+
+class Reject(Exception):
+    """The request is not acceptable. The message names the field, never the value."""
+
+
+class Failure(Exception):
+    def __init__(self, stage, error, output='', code=1, **extra):
+        Exception.__init__(self, error)
+        self.stage, self.error, self.output, self.code, self.extra = stage, error, output, code, extra
+
+
+# ============================================================ request checking ============================================================
+
+def _no_dupes(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise Reject('duplicate key in request')
+        out[key] = value
+    return out
+
+
+def _bad_constant(_name):
+    raise Reject('non-finite number in request')
+
+
+_KNOWN_NAMES = frozenset(SETTING_KEYS + TOP_KEYS + RESERVATION_KEYS)
+
+
+def _scan_strings(node, path='request', depth=0):
+    """No control character, no non-ASCII character and no '=' in any key or value, anywhere. The refusal names the
+    field (never the value; a key is named only when it is one the dashboard may send)."""
+    if depth > 8:
+        raise Reject('request is nested too deeply')
+    if isinstance(node, dict):
+        for key, value in node.items():
+            _scan_strings(key, path + ' key', depth + 1)
+            _scan_strings(value, '%s.%s' % (path, key if key in _KNOWN_NAMES else '?'), depth + 1)
+    elif isinstance(node, list):
+        for number, item in enumerate(node, 1):
+            _scan_strings(item, '%s[%d]' % (path, number), depth + 1)
+    elif isinstance(node, str):
+        for ch in node:
+            code = ord(ch)
+            if code < 0x20 or code > 0x7e or ch == '=':
+                raise Reject('control character, non-ASCII character or "=" in %s' % path)
+
+
+def _check_key(key, allowed, what):
+    if not isinstance(key, str):
+        raise Reject('%s key is not a string' % what)
+    norm = key.strip().lower().replace('_', '-')
+    head = re.split(r'[=\s,]', norm, maxsplit=1)[0].lstrip('-')
+    if head in FORBIDDEN or norm.lstrip('-') in FORBIDDEN:
+        raise Reject('forbidden directive %r in the request' % head[:40])
+    if key not in allowed:
+        raise Reject('unknown %s key' % what)
+
+
+def _ipv4(value, field):
+    if not isinstance(value, str) or not _IPV4_RE.fullmatch(value):
+        raise Reject('invalid %s' % field)
+    try:
+        canonical = str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise Reject('invalid %s' % field)
+    if canonical != value:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _optional_ipv4(value, field):
+    if value == '':
+        return ''
+    return _ipv4(value, field)
+
+
+def normalize_settings(settings):
+    """Strict, canonical form of the dashboard's settings. Raises Reject."""
+    if not isinstance(settings, dict):
+        raise Reject('settings is not an object')
+    for key in settings:
+        _check_key(key, SETTING_KEYS, 'setting')
+    for key, value in settings.items():
+        if not isinstance(value, str):
+            raise Reject('invalid %s' % key)
+    # The old generator wrote values as they were and dnsmasq ignores white space around them, so a gateway with a
+    # trailing space or a range start with a leading one worked. Only plain spaces can be left here (_scan_strings
+    # has refused every other control character); they are removed and the stripped value is what gets checked
+    # and rendered.
+    settings = dict((key, value.strip(' ')) for key, value in settings.items())
+    out = {}
+    enabled = settings.get('dhcp_enabled', 'false')
+    if enabled not in ('true', 'false'):
+        raise Reject('invalid dhcp_enabled')
+    out['dhcp_enabled'] = enabled == 'true'
+    iface = settings.get('interface', '')
+    if iface != '' and not _IFACE_RE.fullmatch(iface):
+        raise Reject('invalid interface')
+    out['interface'] = iface
+    cidr = settings.get('cidr', '')
+    if cidr == '':
+        cidr = '24'
+    if not _CIDR_RE.fullmatch(cidr) or int(cidr) > 32:
+        raise Reject('invalid cidr')
+    out['cidr'] = int(cidr)
+    for key in ('range_start', 'range_end', 'gateway', 'dns_primary', 'dns_secondary'):
+        out[key] = _optional_ipv4(settings.get(key, ''), key)
+    lease = settings.get('lease_time', '')
+    if lease == '':
+        lease = '24h'
+    if not _LEASE_RE.fullmatch(lease):
+        raise Reject('invalid lease_time')
+    out['lease_time'] = lease.lower()
+    domain = settings.get('domain', '')
+    if domain != '' and (len(domain) > 253 or not _DOMAIN_RE.fullmatch(domain)):
+        raise Reject('invalid domain')
+    out['domain'] = domain
+    return out
+
+
+def normalize_reservations(items):
+    if not isinstance(items, list):
+        raise Reject('reservations is not a list')
+    if len(items) > MAX_RESERVATIONS:
+        raise Reject('too many reservations')
+    out = []
+    for number, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise Reject('reservation %d is not an object' % number)
+        for key in item:
+            _check_key(key, RESERVATION_KEYS, 'reservation')
+        mac, ip, host = item.get('mac'), item.get('ip'), item.get('hostname', '')
+        mac, ip, host = (v.strip(' ') if isinstance(v, str) else v for v in (mac, ip, host))
+        if not isinstance(mac, str) or not _MAC_RE.fullmatch(mac):
+            raise Reject('invalid reservation %d mac' % number)
+        ip = _ipv4(ip, 'reservation %d ip' % number)
+        if not isinstance(host, str) or (host != '' and (len(host) > 253 or not _HOST_RE.fullmatch(host))):
+            raise Reject('invalid reservation %d hostname' % number)
+        out.append((mac, ip, host))
+    return out
+
+
+def parse_request(raw):
+    """bytes -> (action, normalized settings, normalized reservations). Raises Reject."""
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        raise Reject('request is not ASCII')
+    try:
+        obj = json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
+        raise Reject('request is not valid JSON')
+    if not isinstance(obj, dict):
+        raise Reject('request is not an object')
+    for key in obj:
+        _check_key(key, TOP_KEYS, 'request')
+    _scan_strings(obj)
+    if type(obj.get('version')) is not int or obj.get('version') != 1:
+        raise Reject('unsupported request version')
+    action = obj.get('action')
+    if action not in ('apply', 'validate'):
+        raise Reject('invalid action')
+    settings = normalize_settings(obj.get('settings', {}))
+    reservations = normalize_reservations(obj.get('reservations', []))
+    return action, settings, reservations
+
+
+# ============================================================ rendering ============================================================
+
+def _default_interface():
+    """Same as the old generator: `ip route | grep default | awk '{print $5}' | head -n1`."""
+    exe = next((p for p in IP_BIN if os.access(p, os.X_OK)), None)
+    if exe is None:
+        return ''
+    try:
+        proc = subprocess.run([exe, 'route'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10, env=_env())
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    for line in proc.stdout.decode('ascii', 'replace').splitlines():
+        if 'default' in line:
+            fields = line.split()
+            iface = fields[4] if len(fields) >= 5 else ''
+            return iface if _IFACE_RE.fullmatch(iface) else ''
+    return ''
+
+
+def render_main(s, now=None, default_interface=None):
+    """The text of /etc/dnsmasq.conf for normalized settings s. Same bytes as the old PHP generator
+    (apart from the timestamp's timezone, which is the system's here)."""
+    iface = s['interface']
+    if iface == '':
+        iface = default_interface() if default_interface else _default_interface()
+    cfg = HEADER_FMT % time.strftime('%Y-%m-%d %H:%M:%S', now or time.localtime())
+    cfg += "# Interface\ninterface=%s\nbind-dynamic\n\n" % iface
+    cfg += "# Disable DNS (DHCP only)\nport=0\n\n"
+    if s['dhcp_enabled'] and s['range_start'] != '' and s['range_end'] != '':
+        netmask = str(ipaddress.IPv4Network('0.0.0.0/%d' % s['cidr']).netmask)
+        cfg += "# DHCP Range\ndhcp-range=%s,%s,%s,%s\n\n" % (s['range_start'], s['range_end'], netmask, s['lease_time'])
+        if s['gateway'] != '':
+            cfg += "# Gateway\ndhcp-option=option:router,%s\n\n" % s['gateway']
+        dns = [v for v in (s['dns_primary'], s['dns_secondary']) if v != '']
+        if dns:
+            cfg += "# DNS Servers\ndhcp-option=option:dns-server,%s\n\n" % ','.join(dns)
+        if s['domain'] != '':
+            cfg += "# Domain\ndomain=%s\n\n" % s['domain']
+    else:
+        cfg += "# DHCP is disabled - configure via Web UI\n\n"
+    cfg += "# Lease file\n%s\n\n" % FIXED_LEASEFILE
+    cfg += "# Be authoritative\ndhcp-authoritative\n\n"
+    cfg += "# Logging\nlog-dhcp\n%s\n\n" % FIXED_LOGFACILITY
+    cfg += "# DHCP grace period notification for IronGate\n%s\n\n" % FIXED_SCRIPT
+    cfg += "# Static reservations\n%s\n" % FIXED_CONFDIR
+    verify_main(cfg)
+    return cfg
+
+
+def render_reservations(items):
+    out = RES_HEADER
+    for mac, ip, host in items:
+        out += "dhcp-host=%s,%s%s\n" % (mac, ip, (',' + host) if host != '' else '')
+    verify_reservations(out)
+    return out
+
+
+def _directive(line):
+    body = line.strip()
+    if body == '' or body.startswith('#'):
+        return None
+    return re.split(r'[=\s]', body, maxsplit=1)[0]
+
+
+def verify_main(text):
+    """Last line of defence: the rendered file holds only known directives, and the fixed lines exactly once."""
+    seen = {}
+    for line in text.split('\n'):
+        name = _directive(line)
+        if name is None:
+            continue
+        if name not in MAIN_NAMES:
+            raise Reject('rendered config holds an unexpected directive')
+        seen[name] = seen.get(name, 0) + 1
+        if name == 'dhcp-script' and line != FIXED_SCRIPT:
+            raise Reject('rendered config changes dhcp-script')
+        if name == 'conf-dir' and line != FIXED_CONFDIR:
+            raise Reject('rendered config changes conf-dir')
+        if name == 'dhcp-leasefile' and line != FIXED_LEASEFILE:
+            raise Reject('rendered config changes dhcp-leasefile')
+        if name == 'log-facility' and line != FIXED_LOGFACILITY:
+            raise Reject('rendered config changes log-facility')
+    for name in ('dhcp-script', 'conf-dir', 'dhcp-leasefile', 'log-facility', 'interface', 'port'):
+        if seen.get(name) != 1:
+            raise Reject('rendered config does not hold %s exactly once' % name)
+    if '\r' in text or '\x00' in text:
+        raise Reject('rendered config holds a control character')
+
+
+def verify_reservations(text):
+    for line in text.split('\n'):
+        name = _directive(line)
+        if name is not None and name != 'dhcp-host':
+            raise Reject('rendered reservations hold an unexpected directive')
+    if '\r' in text or '\x00' in text:
+        raise Reject('rendered reservations hold a control character')
+
+
+# ============================================================ helpers ============================================================
+
+def _env():
+    return {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
+
+
+def _log(message):
+    if syslog is not None:
+        try:
+            syslog.openlog('irongate-dnsmasq-apply', syslog.LOG_PID, syslog.LOG_AUTH)
+            syslog.syslog(syslog.LOG_NOTICE, message)
+        except Exception:  # logging must never decide the outcome
+            pass
+
+
+def _run(argv, timeout):
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout, env=_env(), close_fds=True)
+    except subprocess.TimeoutExpired:
+        return 124, 'timed out after %d s' % timeout
+    except OSError as exc:
+        return 127, str(exc)
+    return proc.returncode, proc.stdout.decode('utf-8', 'replace').strip()[-4000:]
+
+
+def _tool(candidates, name):
+    for path in candidates:
+        if os.access(path, os.X_OK):
+            return path
+    raise Failure('validation', '%s is not installed' % name, code=5)
+
+
+def _root_only_dir(path):
+    """The directory is a real directory owned by root that nobody else can write."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise Failure('validation', '%s: %s' % (path, exc.strerror), code=5)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Failure('validation', '%s must be a directory owned by root that only root can write '
+                      '(run the installer, or dnsmasq-apply --lockdown)' % path, code=5)
+
+
+def _read_regular(path):
+    """Contents of a regular file, or None if there is none. Never follows a link."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Failure('validation', '%s: %s' % (path, exc.strerror), code=5)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_CONF_FILE:
+            raise Failure('validation', '%s is not a regular file of a sane size' % path, code=5)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _install_file(path, data):
+    """Atomically replace path with data, root:root 0644: temp file next to it, fsync, rename."""
+    directory, name = os.path.split(path)
+    tmp = os.path.join(directory, '.%s.new.%d' % (name, os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o644)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(tmp)
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp, path)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    _fsync_dir(directory)
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(directory):
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _restore(path, old):
+    """Put the previous contents back (or remove the file if there was none)."""
+    try:
+        if old is None:
+            _unlink_quiet(path)
+        else:
+            _install_file(path, old)
+    except OSError as exc:  # keep going: the caller reports the original failure
+        _log('could not restore %s: %s' % (path, exc))
+
+
+def _web_uid():
+    try:
+        return pwd.getpwnam(WEB_USER).pw_uid
+    except KeyError:
+        return None
+
+
+def read_request():
+    """The staged request as bytes. The file is opened without following links relative to the staging
+    directory, must be a lone regular file owned by root or www-data, and is removed after reading."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        dfd = os.open(STAGE_DIR, flags | os.O_DIRECTORY)
+    except OSError as exc:
+        raise Failure('validation', 'staging directory %s: %s' % (STAGE_DIR, exc.strerror), code=5)
+    try:
+        dst = os.fstat(dfd)
+        if dst.st_uid != 0 or dst.st_mode & 0o002:
+            raise Failure('validation', 'staging directory must be owned by root and not world-writable', code=5)
+        try:
+            fd = os.open(REQUEST_NAME, flags | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                _unlink_quiet_at(REQUEST_NAME, dfd)
+                raise Reject('the staged request is a link')
+            raise Reject('no staged request')
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                # unlink(2) cannot remove a directory, so a directory named request.json would stay and block every later
+                # request (api.php renames its file over that name); empty it away, or put it aside under a dot name
+                raise Reject('the staged request is a directory (%s)' % _clear_directory_named_request(dfd))
+            allowed = {0}
+            web = _web_uid()
+            if web is not None:
+                allowed.add(web)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in allowed or st.st_size > MAX_REQUEST:
+                raise Reject('the staged request is not a plain file of an acceptable owner and size')
+            data = b''
+            while len(data) <= MAX_REQUEST:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) > MAX_REQUEST:
+                raise Reject('the staged request is too large')
+            return data
+        finally:
+            os.close(fd)
+            _unlink_quiet_at(REQUEST_NAME, dfd)
+    finally:
+        os.close(dfd)
+
+
+def _unlink_quiet_at(name, dfd):
+    try:
+        os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
+def _clear_directory_named_request(dfd):
+    """request.json is a directory in the staging directory: remove it if it is empty, else rename it aside."""
+    try:
+        os.rmdir(REQUEST_NAME, dir_fd=dfd)
+        return 'removed'
+    except OSError:
+        pass
+    aside = '.refused.%d.%d.%s' % (int(time.time()), os.getpid(), REQUEST_NAME)
+    try:
+        os.rename(REQUEST_NAME, aside, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return 'moved aside as %s' % aside
+    except OSError as exc:
+        return 'could not be moved: %s' % exc.strerror
+
+
+# ============================================================ the apply ============================================================
+
+def apply(action, settings, reservations):
+    dnsmasq = _tool(DNSMASQ_BIN, 'dnsmasq')
+    systemctl = _tool(SYSTEMCTL_BIN, 'systemctl')
+    main_text = render_main(settings)
+    res_text = render_reservations(reservations)
+    for directory in (os.path.dirname(CONF_PATH) or '/', CONF_DIR):
+        _root_only_dir(directory)
+    _require_clean_tree()
+    res_path = os.path.join(CONF_DIR, RES_NAME)
+    old_main = _read_regular(CONF_PATH)
+    old_res = _read_regular(res_path)
+    tmp_main = os.path.join(os.path.dirname(CONF_PATH), '.%s.test.%d' % (os.path.basename(CONF_PATH), os.getpid()))
+
+    def check_candidate():
+        _unlink_quiet(tmp_main)
+        fd = os.open(tmp_main, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, main_text.encode('ascii'))
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        try:
+            return _run([dnsmasq, '--test', '--conf-file=%s' % tmp_main], TEST_TIMEOUT)
+        finally:
+            _unlink_quiet(tmp_main)
+
+    if action == 'validate':
+        # the candidate main file against the reservations that are live now (what the old `validate` did)
+        rc, out = check_candidate()
+        return {'success': True, 'stage': 'validation', 'valid': rc == 0, 'output': out, 'return_code': rc}
+
+    # apply: the new reservations must be in place for dnsmasq --test to read them through conf-dir
+    _install_file(res_path, res_text.encode('ascii'))
+    try:
+        rc, out = check_candidate()
+        if rc != 0:
+            _restore(res_path, old_res)
+            raise Failure('validation', out or 'dnsmasq --test failed', output=out, code=3, return_code=rc)
+        _install_file(CONF_PATH, main_text.encode('ascii'))
+        _run([systemctl, 'stop', 'dnsmasq'], SERVICE_TIMEOUT)
+        time.sleep(0.5)
+        rc, out = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+        if rc != 0:
+            _restore(CONF_PATH, old_main)
+            _restore(res_path, old_res)
+            rc_back, _out_back = _run([systemctl, 'start', 'dnsmasq'], SERVICE_TIMEOUT)
+            raise Failure('start', 'Service start failed', output=out, code=4, restored=True, restarted=rc_back == 0)
+    except Failure:
+        raise
+    except BaseException:
+        # whatever went wrong, the previous files are what dnsmasq finds on its next start
+        _restore(CONF_PATH, old_main)
+        _restore(res_path, old_res)
+        raise
+    _save_snapshot({'main': main_text.encode('ascii'), 'res': res_text.encode('ascii')})
+    return {'success': True, 'stage': 'start'}
+
+
+def _take_lock():
+    """The one lock that serialises everything that writes the dnsmasq files: a request, and the lockdown."""
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def run_request():
+    fd = _take_lock()
+    action = '?'
+    try:
+        raw = read_request()
+        action, settings, reservations = parse_request(raw)
+        result = apply(action, settings, reservations)
+        _log('%s ok (%d reservations)' % (action, len(reservations)))
+        return 0, result
+    except Reject as exc:
+        _log('request refused: %s' % exc)
+        return 2, {'success': False, 'stage': 'validation', 'error': 'Request refused: %s' % exc}
+    except Failure as exc:
+        _log('%s failed at %s: %s' % (action, exc.stage, exc.error[:200]))
+        body = {'success': False, 'stage': exc.stage, 'error': exc.error, 'output': exc.output}
+        body.update(exc.extra)
+        return exc.code, body
+    finally:
+        os.close(fd)
+
+
+# ============================================================ what dnsmasq's own parser would read ============================================================
+
+def _chunks(data):
+    """(physical line number, bytes) in the pieces dnsmasq's fgets() loop hands to its option parser."""
+    stream = io.BytesIO(data)
+    number = 1
+    while True:
+        piece = stream.readline(READ_CHUNK)
+        if not piece:
+            return
+        yield number, piece
+        if piece.endswith(b'\n'):
+            number += 1
+
+
+def _squash(piece):
+    """One piece as dnsmasq's first pass leaves it: cut at a NUL (it works on C strings), quotes removed (what they
+    enclose stays), white space folded to one blank, and a `#` that starts a word ends the line."""
+    text = piece.split(b'\x00', 1)[0].decode('latin-1')
+    out = []
+    white = True
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                out.append(text[i])
+                i += 1
+            i += 1
+            continue
+        if ch.isspace():
+            out.append(' ')
+            white = True
+        else:
+            if white and ch == '#':
+                break
+            white = False
+            out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _canonical(name):
+    return name.lower().replace('_', '-').lstrip('-')
+
+
+def directive_name(piece):
+    """The option name dnsmasq finds in a line piece (canonical: lower case, `_` as `-`, no leading dashes, which
+    only widens what is recognised), or None for a blank line or a comment."""
+    body = _squash(piece).strip()
+    if body == '':
+        return None
+    return _canonical(re.split(r'[=\s]', body, maxsplit=1)[0])
+
+
+# The only syntax the files the web tier could write may use: blank lines, `#` comments of printable ASCII, and
+# `name[=value]` with a plain value. No quote, backslash, NUL, CR, byte above 0x7e or line over dnsmasq's read size,
+# so there is no room left for the ways a directive can be spelled so that dnsmasq reads it and a scanner does not.
+_G_COMMENT = re.compile(r'[ \t]*(?:#[\x20-\x7e\t]*)?')
+_G_DIRECTIVE = re.compile(r'[ \t]*[a-z][a-z0-9-]*(?:[ \t]*=[ \t]*[A-Za-z0-9 \t,.:/_@+*!\[\]%=-]*)?')
+
+
+def _syntax_problems(data):
+    problems = []
+    for number, raw in enumerate(data.split(b'\n'), 1):
+        if len(raw) > READ_CHUNK - 1:
+            problems.append((number, 'line-too-long'))
+            continue
+        try:
+            line = raw.decode('ascii')
+        except UnicodeDecodeError:
+            problems.append((number, 'non-ascii-character'))
+            continue
+        if any(ord(c) < 0x20 and c != '\t' or ord(c) == 0x7f for c in line):
+            problems.append((number, 'control-character'))
+            continue
+        if not (_G_COMMENT.fullmatch(line) or _G_DIRECTIVE.fullmatch(line)):
+            problems.append((number, 'unusual-syntax'))
+    return problems
+
+
+def _fixed_main_line(text):
+    return text.strip() in (FIXED_SCRIPT, FIXED_CONFDIR, FIXED_LEASEFILE, FIXED_LOGFACILITY)
+
+
+def scan_config(data, kind, strict):
+    """Findings [(line number, what)] in the bytes of a dnsmasq configuration file; `what` is a name from FORBIDDEN or
+    a fixed tag, never text of the file. kind: 'main' (the four fixed lines of the rendering are allowed as they are),
+    'res' (reservations.conf: nothing but dhcp-host) or 'other'. strict: the web tier could have written the file, so
+    only the plain syntax above is accepted as well, and what is left is an ALLOWLIST, not a list of what to refuse: the
+    main file may hold only the names render_main() emits, any other file only options dnsmasq has (KNOWN_OPTIONS).
+    A name no list has heard of can then not be a spelling of a forbidden option that this program does not know yet."""
+    found = []
+    if strict:
+        found += _syntax_problems(data)
+    for number, piece in _chunks(data):
+        name = directive_name(piece)
+        if name is None:
+            continue
+        if kind == 'main' and _fixed_main_line(piece.decode('latin-1')) and name in FORBIDDEN:
+            continue
+        if name in FORBIDDEN:
+            found.append((number, name))
+        elif kind == 'res' and name != 'dhcp-host':
+            found.append((number, 'not-dhcp-host'))
+        elif strict and kind == 'main' and name not in MAIN_NAMES:
+            found.append((number, 'not-rendered'))
+        elif strict and kind == 'other' and name not in KNOWN_OPTIONS:
+            found.append((number, 'unknown-option'))
+    return sorted(set(found))
+
+
+def _safe(text):
+    return ''.join(c if 0x21 <= ord(c) <= 0x7e else '?' for c in text)
+
+
+# ============================================================ audit (read-only) ============================================================
+
+def _audit_file(path, kind):
+    findings = []
+    label = _safe(path)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return findings
+    if stat.S_ISLNK(st.st_mode):
+        return [(label, 0, 'symlink')]
+    if not stat.S_ISREG(st.st_mode):
+        return [(label, 0, 'not-a-regular-file')]
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        findings.append((label, 0, 'not-root-only'))
+    try:
+        data = _read_regular(path)
+    except Failure:
+        return findings + [(label, 0, 'unreadable-or-too-large')]
+    if data is not None:
+        findings += [(label, number, what) for number, what in scan_config(data, kind, strict=False)]
+    return findings
+
+
+def _audit_exec_paths():
+    """The programs root runs for the web tier (sudo: the helper) and for dnsmasq (dhcp-script): neither the file nor a
+    directory above it may be changed by anybody but root."""
+    findings = []
+    for path in EXEC_PATHS:
+        chain = ['/']
+        cur = ''
+        for part in [p for p in path.split('/') if p][:-1]:
+            cur += '/' + part
+            chain.append(cur)
+        for directory in chain:
+            try:
+                st = os.stat(directory)
+            except OSError:
+                break
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                findings.append((_safe(directory), 0, 'exec-path-not-root-only'))
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            findings.append((_safe(path), 0, 'exec-path-not-root-only'))
+    return sorted(set(findings))
+
+
+def audit():
+    """Read-only. Every file dnsmasq reads - /etc/dnsmasq.conf and EVERY entry of /etc/dnsmasq.d, root-owned ones and
+    operator files included, whatever their names (a Debian dnsmasq reads them all) - must be a regular file that only
+    root can write and must not hold a directive the web tier must not set. Returns the findings (path, line, what)."""
+    findings = []
+    for directory in (os.path.dirname(CONF_PATH) or '/', CONF_DIR):
+        try:
+            st = os.lstat(directory)
+        except OSError:
+            findings.append((_safe(directory), 0, 'missing'))
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            findings.append((_safe(directory), 0, 'directory-not-root-only'))
+    findings += _audit_file(CONF_PATH, 'main')
+    try:
+        names = sorted(os.listdir(CONF_DIR))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(CONF_DIR, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if name.startswith('.refused.') and st.st_uid == 0 and not stat.S_ISREG(st.st_mode):
+            continue  # put aside by --lockdown (a link, directory or special file renamed to a dot name, which dnsmasq skips)
+        findings += _audit_file(path, 'res' if name == RES_NAME else 'other')
+    findings += _audit_exec_paths()
+    return findings
+
+
+def _require_clean_tree():
+    """`dnsmasq --test` (and the daemon) executes conf-script, so it never runs on a tree the audit objects to."""
+    findings = audit()
+    if findings:
+        _log('refusing to run dnsmasq: %d audit finding(s)' % len(findings))
+        raise Failure('validation', 'the dnsmasq configuration is not clean or not root-only (%d finding(s)): '
+                      'run dnsmasq-apply --audit as root' % len(findings), code=5)
+
+
+# ============================================================ root-held state: quarantine and snapshot ============================================================
+
+def _mkdir_root(path, mode):
+    os.mkdir(path, 0o700)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _ensure_state_dirs():
+    """/var/lib/irongate (root, 0755) with the quarantine and snapshot directories (root, 0700) below it."""
+    for path, mode, private in ((STATE_DIR, 0o755, False), (QUARANTINE_DIR, 0o700, True), (SNAPSHOT_DIR, 0o700, True)):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            _mkdir_root(path, mode)
+            st = os.lstat(path)
+        bad = st.st_mode & (0o077 if private else 0o022)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or bad:
+            raise Failure('validation', '%s must be a directory owned by root%s' % (path, ' that nobody else can open' if private else ' that only root can write'), code=5)
+
+
+def _write_new(dfd, name, data, mtime_ns=None, private=False):
+    """Create `name` (a new root:root file, 0644 or 0600 in the private directories) in the directory dfd with `data`,
+    atomically: temp file, fsync, rename. Returns nothing; raises OSError.
+    The temporary name is not made from `name`: an entry of the web tier's directory can have a name of 255 characters
+    and `.<name>.lock.<pid>` is longer than NAME_MAX, which stopped the lockdown half way (O_EXCL on a name somebody
+    else already took stopped it just the same). A name that is taken is not used; the next one is."""
+    mode = 0o600 if private else 0o644
+    base = '.new.%d.%d' % (os.getpid(), time.monotonic_ns())
+    tmp, attempt = base, 0
+    while True:
+        try:
+            nfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+            break
+        except FileExistsError:
+            attempt += 1
+            if attempt > 32:
+                raise
+            tmp = '%s.%d' % (base, attempt)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(nfd, view):]
+        os.fchown(nfd, 0, 0)
+        os.fchmod(nfd, mode)
+        if mtime_ns is not None:
+            os.utime(nfd, ns=mtime_ns)
+        os.fsync(nfd)
+    except BaseException:
+        os.close(nfd)
+        os.unlink(tmp, dir_fd=dfd)
+        raise
+    os.close(nfd)
+    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+SNAPSHOT_NAMES = {'main': 'dnsmasq.conf', 'res': 'reservations.conf'}
+
+
+def _snapshot_ok(kind, data):
+    """What may be kept as, and believed to be, the last good content: plain ASCII that passes the scan the lockdown
+    applies to a file the web tier could have written (no forbidden directive, nothing but plain `name=value` lines)."""
+    try:
+        data.decode('ascii')
+    except UnicodeDecodeError:
+        return False
+    return not scan_config(data, kind, strict=True)
+
+
+def _load_snapshot():
+    """The last good content the root helper kept: {'main': bytes|None, 'res': bytes|None}. A snapshot that is not
+    private to root, or that fails the scan, does not exist."""
+    snap = {'main': None, 'res': None}
+    try:
+        dfd = os.open(SNAPSHOT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return snap
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != 0 or st.st_mode & 0o077:
+            return snap
+        for kind, name in SNAPSHOT_NAMES.items():
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+            except OSError:
+                continue
+            try:
+                s = os.fstat(fd)
+                if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077 or s.st_size > MAX_CONF_FILE:
+                    continue
+                data = os.read(fd, MAX_CONF_FILE + 1)
+            finally:
+                os.close(fd)
+            if _snapshot_ok(kind, data):
+                snap[kind] = data
+    finally:
+        os.close(dfd)
+    return snap
+
+
+def _save_snapshot(items):
+    """Keep what was just verified and installed (a dict kind -> bytes). Never decides the outcome of a run."""
+    try:
+        _ensure_state_dirs()
+        dfd = os.open(SNAPSHOT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for kind, data in items.items():
+                if data is not None and _snapshot_ok(kind, data):
+                    _write_new(dfd, SNAPSHOT_NAMES[kind], data, private=True)
+        finally:
+            os.close(dfd)
+    except (OSError, Failure) as exc:
+        _log('snapshot not saved: %s' % (getattr(exc, 'strerror', None) or getattr(exc, 'error', '') or type(exc).__name__))
+
+
+def _quarantine_copy(label, name, data, why, out):
+    """Keep the bytes of a file that is not re-created in the root-only quarantine directory (never overwriting, never
+    following a link) and say so. Failing to keep a copy does not keep the file in place."""
+    where = '(no copy kept)'
+    try:
+        qfd = os.open(QUARANTINE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if len(os.listdir(qfd)) >= MAX_QUARANTINE:
+                where = '(quarantine full, no copy kept)'
+            else:
+                new = '%s.%d.%s' % (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()), os.getpid(), _safe(name)[:100])
+                suffix = 0
+                while True:
+                    try:
+                        _write_exclusive(qfd, new if suffix == 0 else '%s.%d' % (new, suffix), data[:MAX_CONF_FILE])
+                        break
+                    except FileExistsError:
+                        suffix += 1
+                where = os.path.join(QUARANTINE_DIR, new if suffix == 0 else '%s.%d' % (new, suffix))
+        finally:
+            os.close(qfd)
+    except OSError as exc:
+        where = '(no copy kept: %s)' % exc.strerror
+    _log('quarantined %s: %s' % (label, why))
+    out.append('lockdown: QUARANTINED %s (%s) -> %s' % (label, why, where))
+
+
+def _write_exclusive(dfd, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _why(findings):
+    return ', '.join('%s at line %d' % (what, number) for number, what in findings[:6]) + (' ...' if len(findings) > 6 else '')
+
+
+def _default_main():
+    """What replaces a /etc/dnsmasq.conf that must not be kept and has no snapshot: DHCP off, which the dashboard
+    turns on again with Save & Apply (it renders from the database)."""
+    settings = normalize_settings({'dhcp_enabled': 'false', 'interface': _default_interface() or 'lo'})
+    return render_main(settings).encode('ascii')
+
+
+def _salvage_reservations(data):
+    """The dhcp-host lines of the exact shape this program renders; everything else is dropped."""
+    items = []
+    for line in data.decode('latin-1').split('\n'):
+        m = re.fullmatch(r'dhcp-host=([^,]+),([^,]+)(?:,([^,]+))?', line)
+        if m:
+            try:
+                items += normalize_reservations([{'mac': m.group(1), 'ip': m.group(2), 'hostname': m.group(3) or ''}])
+            except Reject:
+                pass
+    return render_reservations(items).encode('ascii')
+
+
+# ============================================================ lockdown ============================================================
+
+def _refuse(dfd, name, label, out, why):
+    """A link, directory or special file in a root-owned directory (or any entry that could not be processed): renamed to a
+    dot name (dnsmasq skips those, nothing is deleted, a link is never followed) and given to root. The new name is short
+    whatever the old one was; if somebody took it (a directory there, say) the next one is tried."""
+    base = '.refused.%d.%d.%s' % (int(time.time()), os.getpid(), _safe(name)[:100])
+    new, attempt = base, 0
+    while True:
+        try:
+            os.rename(name, new, src_dir_fd=dfd, dst_dir_fd=dfd)
+            break
+        except OSError as exc:
+            attempt += 1
+            if attempt > 32 or exc.errno not in (errno.EISDIR, errno.ENOTDIR, errno.ENOTEMPTY, errno.EEXIST):
+                raise
+            new = '%s.%d' % (base, attempt)
+    try:
+        os.chown(new, 0, 0, dir_fd=dfd, follow_symlinks=False)
+    except OSError:
+        pass
+    # a regular file put aside (an entry that could not be processed) keeps the mode the web tier gave it: no write bit for group and others
+    try:
+        fd = os.open(new, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+        try:
+            mode = os.fstat(fd)
+            if stat.S_ISREG(mode.st_mode) and mode.st_uid == 0:
+                os.fchmod(fd, stat.S_IMODE(mode.st_mode) & ~0o022)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    out.append('lockdown: QUARANTINED %s (%s) -> %s' % (label, why, new))
+
+
+def _read_all(fd, limit):
+    chunks, total = [], 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b''.join(chunks)
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+
+
+def _lock_entry(dfd, name, label, kind, snap, out, final):
+    """One entry of a root-owned directory (kind: 'other', 'res' for reservations.conf, 'main' for dnsmasq.conf)."""
+    label = _safe(label)
+    try:
+        lst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if name.startswith('.refused.') and lst.st_uid == 0 and not stat.S_ISREG(lst.st_mode):
+        return  # put aside by an earlier run
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError as exc:
+        return _refuse(dfd, name, label, out, 'link' if exc.errno == errno.ELOOP else exc.strerror)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            fd = None
+            return _refuse(dfd, name, label, out, 'directory' if stat.S_ISDIR(st.st_mode) else 'special file')
+        if st.st_uid == 0 and not st.st_mode & 0o022:
+            out.append('lockdown: kept %s (root-owned, mode %o)' % (label, stat.S_IMODE(st.st_mode)))
+            if kind != 'other':
+                final[kind] = (_read_all(fd, MAX_CONF_FILE), True)
+            return
+        data = _read_all(fd, MAX_CONF_FILE)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    mtime = (st.st_atime_ns, st.st_mtime_ns)
+    if data is None:
+        os.unlink(name, dir_fd=dfd)
+        _quarantine_copy(label, name, b'', 'larger than %d bytes' % MAX_CONF_FILE, out)
+        return
+    findings = scan_config(data, kind if kind in ('main', 'res') else 'other', strict=True)
+    if kind == 'other':
+        if findings:
+            _quarantine_copy(label, name, data, _why(findings), out)
+            os.unlink(name, dir_fd=dfd)
+        else:
+            _write_new(dfd, name, data, mtime_ns=mtime)
+            out.append('lockdown: re-created %s as root:root 0644 (was uid %d, mode %o)' % (label, st.st_uid, stat.S_IMODE(st.st_mode)))
+        return
+    # The two files this program renders: never trusted from the disk when a root-held snapshot of the last good
+    # rendering exists; without one, what is clean stays and what is not is replaced.
+    snapshot = snap.get(kind)
+    reliable = True
+    if snapshot is not None:
+        content = snapshot
+        if data != snapshot:
+            if findings:
+                _quarantine_copy(label, name, data, _why(findings), out)
+            else:
+                _quarantine_copy(label, name, data, 'differs from the root-held snapshot', out)
+                out[-1] = out[-1].replace('QUARANTINED', 'REPLACED', 1)
+            out.append('lockdown: restored %s from the root-held snapshot' % label)
+            mtime = None
+    elif not findings:
+        content = data
+    else:
+        _quarantine_copy(label, name, data, _why(findings), out)
+        if kind == 'main':
+            content, reliable = _default_main(), False
+            out.append('lockdown: %s is now a safe default (DHCP off): Save & Apply in the dashboard renders it again' % label)
+        else:
+            content = _salvage_reservations(data)
+            out.append('lockdown: %s keeps only its dhcp-host lines of the shape this program renders' % label)
+        mtime = None
+    _write_new(dfd, name, content, mtime_ns=mtime)
+    out.append('lockdown: re-created %s as root:root 0644 (was uid %d, mode %o)' % (label, st.st_uid, stat.S_IMODE(st.st_mode)))
+    final[kind] = (content, reliable)
+
+
+def lockdown():
+    lock = _take_lock()  # a request that is being applied finishes first; none starts while the files are re-created
+    try:
+        return _lockdown()
+    finally:
+        os.close(lock)
+
+
+def _lock_one(dfd, name, label, kind, snap, out, final, failed):
+    """_lock_entry for one entry, with whatever goes wrong with it contained here: a read or write error, an exhausted disk,
+    a name of any length, a bug. The entry is put aside like a link (a name dnsmasq skips) and the lockdown goes on, so one
+    entry can never leave the others - above all the main file, which is the last one - in the web tier's hands. What could
+    not even be put aside is listed in `failed`, and so is a main file that had to be (it is gone)."""
+    try:
+        _lock_entry(dfd, name, label, kind, snap, out, final)
+        return
+    except Exception as exc:  # not BaseException: a signal still ends the run
+        why = getattr(exc, 'strerror', None) or type(exc).__name__
+    shown = _safe(label)
+    try:
+        _refuse(dfd, name, shown, out, 'could not be locked: %s' % why)
+    except FileNotFoundError:
+        return  # gone meanwhile: nothing is left to lock
+    except OSError as exc:
+        out.append('lockdown: FAILED %s (%s; it could not be put aside either: %s)' % (shown, why, exc.strerror))
+        failed.append(shown)
+        return
+    if kind == 'main':
+        failed.append(shown)
+
+
+def _lockdown():
+    out = []
+    final = {}
+    failed = []
+    _ensure_state_dirs()
+    snap = _load_snapshot()
+    st = os.lstat(CONF_DIR) if os.path.lexists(CONF_DIR) else None
+    if st is None:
+        os.mkdir(CONF_DIR, 0o755)
+    elif not stat.S_ISDIR(st.st_mode):
+        raise Failure('validation', '%s is not a directory' % CONF_DIR, code=5)
+    dfd = os.open(CONF_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        # first the directory itself: from here on nobody but root can add, rename or remove entries
+        os.fchown(dfd, 0, 0)
+        os.fchmod(dfd, 0o755)
+        out.append('lockdown: %s is root:root 0755' % CONF_DIR)
+        for name in sorted(os.listdir(dfd)):
+            _lock_one(dfd, name, os.path.join(CONF_DIR, name), 'res' if name == RES_NAME else 'other', snap, out, final, failed)
+    finally:
+        os.close(dfd)
+    parent, name = os.path.split(CONF_PATH)
+    pfd = os.open(parent or '/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.path.islink(CONF_PATH):
+            raise Failure('validation', '%s is a symbolic link: resolve it by hand' % CONF_PATH, output='\n'.join(out), code=5)
+        if os.path.lexists(CONF_PATH):
+            _lock_one(pfd, name, CONF_PATH, 'main', snap, out, final, failed)
+        else:
+            out.append('lockdown: %s does not exist' % CONF_PATH)
+    finally:
+        os.close(pfd)
+    keep = {}
+    for kind, (content, reliable) in final.items():
+        if reliable and content is not None and content != snap.get(kind) and _snapshot_ok(kind, content):
+            keep[kind] = content
+    if keep:
+        _save_snapshot(keep)
+    if failed:
+        # everything else is done (the directory and the main file are root's, the other entries are re-created or put aside);
+        # the report goes out with the failure so that the operator sees what was done and what was not
+        raise Failure('validation', 'could not lock: %s' % ', '.join(failed), output='\n'.join(out), code=5)
+    return out
+
+
+def main(argv):
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        print(json.dumps({'success': False, 'stage': 'validation', 'error': 'must run as root (through sudo)'}))
+        return 5
+    if len(argv) > 1:
+        # --lockdown only makes dnsmasq's files root-owned and --audit only names directives, so neither is dangerous in
+        # other hands; and the installer runs them under `sudo` or from the updater that www-data starts through sudo, so
+        # SUDO_UID cannot be used to tell a legitimate caller from another. The sudoers rule (`""`) is what keeps arguments
+        # away from the web tier.
+        try:
+            if argv[1:] == ['--lockdown']:
+                for line in lockdown():
+                    print(line)
+                return 0
+            if argv[1:] == ['--audit']:
+                findings = audit()
+                for label, number, name in findings:
+                    print('FINDING %s:%d: %s' % (label, number, name))
+                print('audit: %d finding(s)' % len(findings))
+                return 1 if findings else 0
+        except Failure as exc:
+            if exc.output:
+                print(exc.output)  # what the lockdown did before it stopped
+            print('error: %s' % exc.error, file=sys.stderr)
+            return exc.code
+        except OSError as exc:
+            print('error: %s' % exc, file=sys.stderr)
+            return 1
+        print('usage: dnsmasq-apply [--lockdown | --audit]', file=sys.stderr)
+        return 2
+    try:
+        code, body = run_request()
+    except Exception as exc:  # never a traceback to the caller
+        _log('internal error: %s' % type(exc).__name__)
+        code, body = 1, {'success': False, 'stage': 'validation', 'error': 'internal error (%s)' % type(exc).__name__}
+    print(json.dumps(body))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

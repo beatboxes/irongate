@@ -1,0 +1,5 @@
+# Allow the web UI (www-data) to hand a validated dnsmasq request to the root helper.
+# The helper takes NO arguments (the "" below), reads /var/lib/irongate/dnsmasq-staged/request.json, accepts only
+# the settings the dashboard sets, renders /etc/dnsmasq.conf and /etc/dnsmasq.d/reservations.conf itself and
+# restarts dnsmasq. Remove this file to revoke (DHCP settings can then no longer be applied from the web UI).
+www-data ALL=(root) NOPASSWD: /opt/irongate/dnsmasq-apply ""

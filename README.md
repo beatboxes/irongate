@@ -273,16 +273,48 @@ and treated as absent; a genuine regular file ends up with exactly the owner and
 `PATH` contains `.` or an empty or relative entry, so the installer sets its own fixed absolute `PATH` before it
 does anything else.
 
-The two trees that belong to `www-data`, `/var/www/irongate` and `/etc/dnsmasq.d`, get the same care: the
-installer hands them over with a small helper that opens every entry with `O_NOFOLLOW` and changes owner and
-mode of the open file, never of a name, so a link planted there is not followed (a link, FIFO or hard-linked
-file inside the trees is left alone and listed; a link, directory or extra hard link at `dhcp.db` stops the
-installer). `dhcp.db` is `www-data:www-data 0664` (it was `0666`, writable by every local user); only the web
+The web tree, `/var/www/irongate`, belongs to `www-data` and gets the same care: the installer hands it over
+with a small helper that opens every entry with `O_NOFOLLOW` and changes owner and mode of the open file, never
+of a name, so a link planted there is not followed (a link, FIFO or hard-linked file inside the tree is left
+alone and listed; a link, directory or extra hard link at `dhcp.db` stops the installer). `dhcp.db` is `www-data:www-data 0664` (it was `0666`, writable by every local user); only the web
 API and root's `sqlite3` (installer, updater) use it. A `dhcp.db` that is a symlink (for example to another
 disk) is therefore no longer supported; use a bind mount.
 
+dnsmasq runs as root and honours `dhcp-script=` (and `conf-script=`, `dhcp-luascript=`, `conf-file=`, ...) in any
+file it reads, so `/etc/dnsmasq.conf`, `/etc/dnsmasq.d` and everything in it belong to **root** (`0644`/`0755`), not
+to `www-data`. The web API stores the DHCP settings and reservations in the database as before; to apply them it
+writes a *request* (data, not config) to `/var/lib/irongate/dnsmasq-staged/request.json` and runs
+`sudo /opt/irongate/dnsmasq-apply` with no arguments (`/etc/sudoers.d/irongate-dnsmasq-apply`). The helper accepts
+only the ten settings the dashboard sets (`dhcp_enabled interface cidr range_start range_end gateway dns_primary
+dns_secondary lease_time domain`) and reservations (`mac ip hostname`), checks every value (IPv4 literals, MAC,
+RFC 1123 names, interface name, lease-time format), refuses a request that holds anything else - an unknown key, a
+directive that runs a program or reads or writes a file, a newline, a NUL, an `=` - as a whole, renders both files
+from a template in which the `dhcp-script` and `conf-dir` lines are constants, runs `dnsmasq --test`, replaces the
+live files atomically and restarts dnsmasq, putting the previous files back if it does not start. It runs `dnsmasq
+--test` (which executes `conf-script=`) only after its own audit found nothing, and keeps a root-only snapshot of the last
+good rendering. The installer puts the helper, its sudoers drop-in and the staging directory in place *before* its
+permission step (which, kept as it was for the O1 tests, hands the tree to `www-data` for a moment) and runs
+`dnsmasq-apply --lockdown` right after it: the directory is taken first, every file `www-data` could have written is read
+once and scanned the way dnsmasq's own parser reads it (quotes, a directive hidden behind a 1023-character comment, CR, NUL),
+and only what is clean is written back as a new root-owned file. Anything else is never re-created: its bytes go to
+`/var/lib/irongate/dnsmasq-quarantine` (root only) and the main file and `reservations.conf` come back from the snapshot (or,
+without one, a safe default: DHCP off, until Save & Apply renders it again). Links and special files are renamed to
+`.refused.*`. `dnsmasq-apply --audit` then reads every file in `/etc/dnsmasq.d`, root-owned ones included (a Debian dnsmasq
+reads them all), and a finding stops the installer; the EXIT trap and the installer's tail start or test dnsmasq only when
+that audit passes. A root-owned operator file in `/etc/dnsmasq.d` is kept as it is, and audited like the rest.
+What the lockdown accepts in a file `www-data` could have written is an allowlist, not only a list of refusals: the main
+file may hold only what the helper renders, `reservations.conf` only `dhcp-host`, any other file only options `dnsmasq`
+has. The refused directives are derived from `dnsmasq`'s own option table (embedded in the helper, and compared with the
+`dnsmasq` binary by the tests) by option value, so an alias that `dnsmasq --help` does not list - `dhcp-lease`, the old
+name of `dhcp-leasefile` - is refused with it. An entry the lockdown cannot process (a read or write error, a name of 255
+characters) is put aside like a link and the lockdown goes on with the others and the main file; it exits 5 if anything
+could not be locked.
+
 The updater records `installed_commit` only after the installer exited 0, so a failed update is tried again by
 the next scheduled run instead of being reported as "Already up to date".
+The installer itself stamps `installed_commit` only as its last step, and only with a hex commit id (or `local`): the
+value it falls back to when GitHub cannot be reached is read from `dhcp.db`, which the web tier can write, so
+anything else there is ignored (neither shown nor written back) instead of being pasted into a root `sqlite3` statement.
 
 The web API accepts only well-formed `irongate_*` settings: `true`/`false` for the layer switches, `single` or
 `dual` for the mode, IPv4 addresses for the bridge address and DHCP range, and interface names of 1-15

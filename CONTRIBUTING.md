@@ -71,6 +71,25 @@ docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w 
 docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -v "$PWD":/w:ro -w /w python:3.12-slim bash tests/test_installer_links.sh irongate-install.sh
 ```
 
+The dnsmasq root helper (`src/dnsmasq-apply`, irongate-audit O4) and the installer's commit stamp have three more suites
+(`tests/test_dnsmasq_phpside.php`, `tests/test_dnsmasq_apply.py`, `tests/test_installer_o4.py`). The PHP one writes the
+characterization data (what the web API stages and what the old generator of 18e5177 produced for the same database)
+that the Python one reads; the Python one needs a real `dnsmasq` and `visudo` mounted into the container (the commands
+below mount the workstation's through their own loader). The helper embeds `dnsmasq`'s option table (`OPTION_VALUES`:
+every name a configuration file may use, with its option value, so that aliases of forbidden options are forbidden too)
+and `tests/test_dnsmasq_apply.py` reads the table out of the mounted binary and requires the two to be equal: with another
+`dnsmasq` version the test names the differences, and the table is regenerated from that binary, never edited by hand
+(`python3 tests/test_dnsmasq_apply.py --print-option-table /usr/sbin/dnsmasq` prints the block to paste):
+
+```bash
+mkdir -p /tmp/ig-chars
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -e IG_OUT=/out -v "$PWD":/w:ro -v /tmp/ig-chars:/out -w /w php:8.3-cli php tests/test_dnsmasq_phpside.php web
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -e IRONGATE_DIR=/w/src -e IG_CHAR_DIR=/chars -v "$PWD":/w:ro -v /tmp/ig-chars:/chars:ro \
+    -v /usr/sbin/dnsmasq:/host-dnsmasq:ro -v /lib/x86_64-linux-gnu:/hostlib:ro -w /w python:3.12-slim python -m unittest tests/test_dnsmasq_apply.py
+docker run --rm --network none -e IRONGATE_TEST_SANDBOX=1 -e IG_INSTALLER=/w/irongate-install.sh -e IG_SRC=/w/src -v "$PWD":/w:ro \
+    -v /usr/sbin/visudo:/host-visudo:ro -v /usr/sbin/dnsmasq:/host-dnsmasq:ro -v /lib/x86_64-linux-gnu:/hostlib:ro -v /usr/libexec/sudo:/usr/libexec/sudo:ro -w /w python:3.12-slim python -m unittest tests/test_installer_o4.py
+```
+
 The PHP and shell tests overwrite `/var/www/irongate` or `/etc/irongate`, bind local ports or create
 root-owned files, so they refuse to run unless `IRONGATE_TEST_SANDBOX=1` is set; never run them on a real
 device. `tests/test_blockchain.py` must keep passing both offline and on a host that can reach the real
