@@ -1,0 +1,8 @@
+[Unit]
+Description=Irongate Auto-Updater (web-triggered)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/irongate/irongate-updater.sh --force
+StandardOutput=journal
+StandardError=journal

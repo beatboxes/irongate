@@ -4,6 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="<?php echo htmlspecialchars($_SESSION['csrf_token'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
     <title>Irongate</title>
     <style>
         :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--primary:#e94560;--success:#00bf63;--warning:#ffc107;--danger:#dc3545;--text:#eee;--text-secondary:#aaa;}
@@ -964,7 +965,7 @@
                 if(opts.params)Object.entries(opts.params).forEach(([k,v])=>url+=`&${k}=${v}`);
                 const res=await fetch(url,{
                     method:opts.method||'GET',
-                    headers:opts.body?{'Content-Type':'application/json'}:{},
+                    headers:Object.assign(opts.body?{'Content-Type':'application/json'}:{},{'X-CSRF-Token':(document.querySelector('meta[name="csrf-token"]')||{}).content||''}),
                     body:opts.body?JSON.stringify(opts.body):undefined
                 });
                 if(res.status===401){window.location.href='/login.php';return{success:false,error:'auth_required'};}

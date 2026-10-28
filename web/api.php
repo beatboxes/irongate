@@ -1334,6 +1334,21 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'update_now requires POST']);
             break;
         }
+        // This starts a root process. It needs an authenticated session of its own - the localhost bypass of the
+        // session guard (cli-server only) never applies to it - and the CSRF token of that session in the
+        // X-CSRF-Token header (compared in constant time); a cross-site POST carries the cookie but not the token.
+        if (($_SESSION['authenticated'] ?? false) !== true) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'error' => 'auth_required']);
+            break;
+        }
+        $csrfSent = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+        $csrfWant = $_SESSION['csrf_token'] ?? '';
+        if (!is_string($csrfSent) || !is_string($csrfWant) || $csrfWant === '' || !hash_equals($csrfWant, $csrfSent)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'error' => 'invalid csrf token']);
+            break;
+        }
         // Perform update
         $repoRaw = 'https://raw.githubusercontent.com/beatboxes/irongate/main';
         $githubApi = 'https://api.github.com/repos/beatboxes/irongate/commits/main';
@@ -1358,7 +1373,16 @@ switch ($action) {
         // before running. No attacker-supplied bytes are ever executed from here.
         exec("sudo touch /var/log/irongate-update.log");
         exec("sudo chown www-data /var/log/irongate-update.log");
-        exec("sudo /bin/bash /opt/irongate/irongate-updater.sh --force > /dev/null 2>&1 &");
+        // The update runs as its own systemd unit (own cgroup: it is not a child of php-fpm, which the installer
+        // restarts); the only thing sudo allows www-data to run for it is exactly this command.
+        $out = [];
+        $rc = 1;
+        exec("sudo -n /usr/bin/systemctl start --no-block irongate-updater-now.service", $out, $rc);
+        if ($rc !== 0) {
+            http_response_code(500);
+            echo json_encode(['success' => false, 'error' => 'Could not start the update service']);
+            break;
+        }
         
         echo json_encode([
             'success' => true,

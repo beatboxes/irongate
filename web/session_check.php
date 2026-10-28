@@ -7,7 +7,10 @@
  * - api.php: unauthenticated -> 401 JSON (the SPA fetch() helper handles the
  *   redirect; a 302-to-HTML would corrupt every frontend JSON error path)
  * - Local service bypass: requests from 127.0.0.1/::1 to api.php that carry
- *   no session cookie are exempted (defensive: no current local callers).
+ *   no session cookie are exempted, but ONLY under PHP's built-in web server
+ *   (cli-server, which is how the test suite drives api.php). Under php-fpm
+ *   (fpm-fcgi, the real deployment) the bypass does not exist for any endpoint.
+ * - update_now is never exempted: it also requires a session and its CSRF token.
  */
 
 if (session_status() === PHP_SESSION_NONE) {
@@ -19,10 +22,16 @@ $IRONGATE_SESSION_TIMEOUT = 4 * 60 * 60; // 4 hours of inactivity
 
 $isApi = basename($_SERVER['SCRIPT_NAME'] ?? '') === 'api.php';
 
-// Local service-to-service API bypass (no session cookie presented)
+// Local service-to-service API bypass (no session cookie presented). The decision is a function of the SAPI so
+// that it can be tested for fpm-fcgi: it is true only for the built-in web server (cli-server) on loopback.
+function irongate_local_bypass_allowed(string $sapi, string $addr, bool $hasCookie): bool {
+    return $sapi === 'cli-server'
+        && in_array($addr, ['127.0.0.1', '::1'], true)
+        && !$hasCookie;
+}
+
 if ($isApi
-    && in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
-    && !isset($_COOKIE[session_name()])) {
+    && irongate_local_bypass_allowed(PHP_SAPI, (string)($_SERVER['REMOTE_ADDR'] ?? ''), isset($_COOKIE[session_name()]))) {
     return;
 }
 
@@ -50,3 +59,8 @@ if (!$authed) {
 }
 
 $_SESSION['last_activity'] = time();
+
+// CSRF token of this session: login.php creates it; a session that predates it gets one here.
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
