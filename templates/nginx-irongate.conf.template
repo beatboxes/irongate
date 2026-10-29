@@ -24,6 +24,8 @@ server {
     # Backup files (api.php.bak.<ts>) do not end in .php, so the php location
     # never claims them and \`location /\` returned them as plaintext source.
     # The SQLite device database was likewise downloadable in full.
+    location ~* (^|/)\.(?!well-known/) { deny all; return 404; }
+    location ~* \.(bak|orig|old|save|swp|db|db-journal|sqlite|sqlite3|sql|tar|gz|zip)(\..*)?\$|~\$ { deny all; return 404; }
     location ~* \.(bak|old|orig|swp|save|sql|sqlite|sqlite3|db)(\.[0-9]+)?\$ {
         deny all;
         return 403;

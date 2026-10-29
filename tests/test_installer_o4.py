@@ -72,7 +72,10 @@ S = S_NEW if S_NEW is not None else ('\n'.join(OLD_STAMP_LINE) + '\n' if len(OLD
 
 
 def sh(script, env=None, check=False):
-    e = {'PATH': SHIM + ':/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C'}
+    e = {'PATH': SHIM + ':/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C',
+         # the installer's commit stamp writes the database as www-data through the runuser seam the updater uses;
+         # point it at the shims so the statement under test still reaches the sqlite3 shim above
+         'IG_DB_RUNUSER': SHIM + '/runuser', 'IG_DB_SQLITE3': SHIM + '/sqlite3', 'IG_DB_BUSY_MS': '5000'}
     e.update(env or {})
     proc = subprocess.run(['bash', '-c', script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=e, timeout=180)
     return proc.returncode, proc.stdout.decode('utf-8', 'replace')
@@ -118,11 +121,14 @@ def setUpModule():
         os.symlink(sys.executable, '/usr/bin/python3')
     # curl: the GitHub API is unreachable unless a test says otherwise
     write(SHIM + '/curl', '#!/bin/sh\nif [ -n "$IG_FAKE_API" ]; then printf "%s\\n" "$IG_FAKE_API"; exit 0; fi\nexit 22\n', mode=0o755)
-    # sqlite3: the CLI's behaviour for `sqlite3 DB "SQL"`: every statement of the string runs, until one fails
+    # sqlite3: the CLI's behaviour for `sqlite3 [-cmd CMD] DB "SQL"`: every statement of the string runs, until one fails
     write(SHIM + '/sqlite3', textwrap.dedent('''\
         #!/usr/bin/env python3
         import sqlite3, sys
-        db, sql = sys.argv[1], sys.argv[2]
+        argv = sys.argv[1:]
+        while len(argv) > 2 and argv[0] == '-cmd':   # the commit stamp passes -cmd ".timeout N"
+            del argv[0:2]
+        db, sql = argv[0], argv[1]
         con = sqlite3.connect(db, isolation_level=None)
         rest = sql
         try:
@@ -139,6 +145,9 @@ def setUpModule():
             print('Error: %s' % exc, file=sys.stderr)
             sys.exit(1)
         '''), mode=0o755)
+    # runuser: the installer's commit stamp writes the database as www-data (`runuser -u www-data -- sqlite3 ...`);
+    # the shim drops that prefix and runs the command it was given, so the statement under test is the sqlite3 shim
+    write(SHIM + '/runuser', '#!/bin/sh\n[ "$1" = -u ] && shift 2\n[ "$1" = -- ] && shift\nexec "$@"\n', mode=0o755)
     # visudo: the host's, through its own loader (sudo-rs on the workstation)
     if os.path.exists('/host-visudo'):
         write(SHIM + '/visudo', '#!/bin/sh\nexec /hostlib/ld-linux-x86-64.so.2 --library-path /hostlib /host-visudo "$@"\n', mode=0o755)

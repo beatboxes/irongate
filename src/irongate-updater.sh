@@ -21,8 +21,30 @@ FORCE=0
 DB_PATH="/var/www/irongate/dhcp.db"
 LOG_FILE="/var/log/irongate-update.log"
 
+# The database is www-data-owned and php-fpm writes it on every dashboard save,
+# while root's own write to it fails on the live host. Every write below runs as
+# www-data through runuser; sqlite3 exiting 5 (SQLITE_BUSY) or 6 (SQLITE_LOCKED)
+# means another writer holds it, which is expected and is retried once.
+DB_RUNUSER="${IG_DB_RUNUSER:-/usr/sbin/runuser}"
+DB_SQLITE="${IG_DB_SQLITE3:-/usr/bin/sqlite3}"
+DB_BUSY_MS="${IG_DB_BUSY_MS:-5000}"
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Run exactly one SQL statement against $DB_PATH as www-data and return sqlite3's
+# exit status. A busy or locked database is retried once; every other non-zero
+# status is returned to the caller without a retry.
+ig_sqlite3_write() {
+    local sql="$1" rc
+    "$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql"
+    rc=$?
+    if [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+        "$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql"
+        rc=$?
+    fi
+    return "$rc"
 }
 
 # One update at a time (the daily timer, the dashboard's "Update now" and an operator can all start this script): the
@@ -105,8 +127,13 @@ CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='insta
 
 log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 
-# Update last check time
-sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
+# Update last check time. It must not stop the update when it fails, but it must
+# not be silent either (the old 2>/dev/null hid every failure).
+ig_sqlite3_write "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));"
+DB_RC=$?
+if [ "$DB_RC" -ne 0 ]; then
+    log "ERROR: could not record last_update_check in $DB_PATH (sqlite3 status $DB_RC) - continuing"
+fi
 
 # --force re-runs nothing that is already installed: at the pinned commit it is a logged no-op (nothing is downloaded)
 if [ "$FORCE" -eq 1 ] && [ "$CURRENT_COMMIT" = "$TARGET_COMMIT" ]; then
@@ -196,8 +223,25 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     rm -f "$SNAPSHOT"
     log "Installer succeeded - snapshot removed"
     # The installer stamps installed_commit with the moving main HEAD; restore
-    # the pinned commit so the next scheduled run does not reinstall.
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
+    # the pinned commit so the next scheduled run does not reinstall. A stamp
+    # that does not land leaves installed != pin, so every "Update now" press
+    # would reinstall: it is an error here, never a quiet success.
+    if ! [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{7}$ ]]; then
+        log "ERROR: refusing to record installed_commit '$TARGET_COMMIT' - not a 7-hex commit id"
+        exit 1
+    fi
+    ig_sqlite3_write "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');"
+    DB_RC=$?
+    if [ "$DB_RC" -ne 0 ]; then
+        log "ERROR: could not record installed_commit $TARGET_COMMIT in $DB_PATH (sqlite3 status $DB_RC) - the next run will reinstall"
+        exit 1
+    fi
+    STAMPED_COMMIT=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';")
+    DB_RC=$?
+    if [ "$DB_RC" -ne 0 ] || [ "$STAMPED_COMMIT" != "$TARGET_COMMIT" ]; then
+        log "ERROR: installed_commit read-back failed (sqlite3 status $DB_RC, read '${STAMPED_COMMIT:-}') - expected $TARGET_COMMIT"
+        exit 1
+    fi
     log "Update complete!"
     log "Update check finished"
     # The installer rewrites this very file; bash reads scripts incrementally, so
