@@ -263,10 +263,12 @@ preg_match('/\$IRONGATE_CSRF_ACTIONS = \[(.*?)\];/s', $api, $mm);
 $gateActions = [];
 if (isset($mm[1]) && preg_match_all("/'([a-z_]+)'/", $mm[1], $aa)) { $gateActions = $aa[1]; }
 sort($gateActions);
-$wantActions = ['change_password', 'change_username', 'device_groups', 'irongate_apply', 'irongate_devices',
-                'irongate_settings', 'irongate_toggle', 'settings', 'toggle_access_list', 'update_access_list'];
+$wantActions = ['apply', 'change_password', 'change_username', 'device_groups', 'irongate_apply',
+                'irongate_devices', 'irongate_settings', 'irongate_toggle', 'repair', 'reservations', 'restart',
+                'settings', 'start', 'stop', 'toggle_access_list', 'update_access_list', 'update_check',
+                'update_settings', 'validate'];
 sort($wantActions);
-check('B api.php gates exactly the ten state-changing actions', $gateActions === $wantActions, implode(',', $gateActions));
+check('B api.php gates exactly the nineteen state-changing actions', $gateActions === $wantActions, implode(',', $gateActions));
 
 $tok = bin2hex(random_bytes(32));
 $sid = authed($tok);

@@ -377,7 +377,7 @@ WEB=/var/www/irongate; DNS=/etc/dnsmasq.d
 freshweb() { rm -rf $WEB $DNS /etc/dnsmasq.conf "$V" /tmp/ig-swapped; mkdir -p $WEB $DNS "$V"; : > /etc/dnsmasq.conf; chmod 755 $WEB $DNS; }
 mkweb() {   # what the installer finds: files it wrote as root, the DB, a backup, a subdirectory, dnsmasq fragments
     freshweb
-    for f in api.php index.php login.php; do echo "<?php // $f" > $WEB/$f; done
+    for f in api.php index.php session_check.php login.php logout.php; do echo "<?php // $f" > $WEB/$f; done
     echo db > $WEB/dhcp.db; echo bak > $WEB/dhcp.db.bak.1700000000
     mkdir -p $WEB/sub; echo s > $WEB/sub/x.php
     echo r > $DNS/reservations.conf; echo a > $DNS/extra.conf
@@ -406,10 +406,10 @@ check "O1 the web-tree permission helper is in the installer" $([ "$HAVE_WH" = 1
 mkweb; runw
 check "O1 genuine tree: block W exits 0" $([ $RCW -eq 0 ]; echo $?) "rc=$RCW $(tail -3 $T/runw.out | cut -c1-200)"
 check "O1 dhcp.db becomes www-data:www-data 0664 (it was 0666: writable by every local user)" $([ "$(wst $WEB/dhcp.db)" = "33:33:664" ]; echo $?) "dhcp.db now $(wst $WEB/dhcp.db)"
-check "O1 the web tree: directory, files, backup and subdirectory are www-data:www-data 0755 as before" $([ "$(wst $WEB)" = 33:33:755 ] && [ "$(wst $WEB/api.php)" = 33:33:755 ] && [ "$(wst $WEB/dhcp.db.bak.1700000000)" = 33:33:755 ] && [ "$(wst $WEB/sub)" = 33:33:755 ] && [ "$(wst $WEB/sub/x.php)" = 33:33:755 ]; echo $?) "$(lstw | head -4)"
+check "O1 the web tree: code is root:www-data (dir 1775, the five PHP files 0644), the backup and subdirectory 0755, dhcp.db stays www-data:www-data 0664" $([ "$(wst $WEB)" = 0:33:1775 ] && [ "$(wst $WEB/api.php)" = 0:33:644 ] && [ "$(wst $WEB/index.php)" = 0:33:644 ] && [ "$(wst $WEB/session_check.php)" = 0:33:644 ] && [ "$(wst $WEB/login.php)" = 0:33:644 ] && [ "$(wst $WEB/logout.php)" = 0:33:644 ] && [ "$(wst $WEB/dhcp.db.bak.1700000000)" = 0:33:755 ] && [ "$(wst $WEB/sub)" = 0:33:755 ] && [ "$(wst $WEB/sub/x.php)" = 0:33:755 ]; echo $?) "$(lstw | head -4)"
 check "O1 /etc/dnsmasq.d is www-data:www-data 0775 with its files, /etc/dnsmasq.conf www-data:www-data 0664" $([ "$(wst $DNS)" = 33:33:775 ] && [ "$(wst $DNS/extra.conf)" = 33:33:775 ] && [ "$(wst /etc/dnsmasq.conf)" = 33:33:664 ]; echo $?) "$(wst $DNS) $(wst $DNS/extra.conf) $(wst /etc/dnsmasq.conf)"
 
-# --- same result as the plain recursive chown/chmod it replaces, for odd owners and modes (dhcp.db differs by design)
+# --- same result as the reference pass below, for odd owners and modes (dhcp.db differs by design)
 oddweb() {
     mkweb; chmod 600 $WEB/api.php; chmod 4755 $WEB/index.php; chown 1000:1000 $WEB/login.php; chmod 000 $WEB/sub/x.php
     mkdir -m 2750 $WEB/setgid; echo y > $WEB/setgid/f; chmod 1777 $WEB/setgid/f; mkdir -m 700 $DNS/priv; echo z > $DNS/priv/z; chown 5:5 $DNS/priv/z
@@ -417,11 +417,18 @@ oddweb() {
     chown 7:7 /etc/dnsmasq.conf; chmod 600 /etc/dnsmasq.conf
 }
 oddweb
-chown -R www-data:www-data $WEB; chmod -R 755 $WEB; chown www-data:www-data /etc/dnsmasq.conf; chmod 664 /etc/dnsmasq.conf; chown -R www-data:www-data $DNS; chmod -R 775 $DNS
+# the reference is built from the NEW policy with plain operations that do not reuse the installer's: root:www-data
+# everywhere, 0755 down the tree (like the helper, a directory keeps its setuid/setgid bits under chmod -R), 1775 on
+# the top directory, then 0644 on the five PHP files
+chown -R root:www-data $WEB
+chmod -R 755 $WEB
+chmod 1775 $WEB
+chmod 644 $WEB/api.php $WEB/index.php $WEB/session_check.php $WEB/login.php $WEB/logout.php
+chown www-data:www-data /etc/dnsmasq.conf; chmod 664 /etc/dnsmasq.conf; chown -R www-data:www-data $DNS; chmod -R 775 $DNS
 lstw | grep -v '^/var/www/irongate/dhcp.db ' > "$T/web-ref.lst"
 oddweb; runw
 lstw | grep -v '^/var/www/irongate/dhcp.db ' > "$T/web-new.lst"
-check "O1 every path other than dhcp.db gets exactly what chown -R / chmod -R 755|775 gave it (odd owners, modes, setuid, setgid dir)" $(diff -q "$T/web-ref.lst" "$T/web-new.lst" >/dev/null; echo $?) "$(diff "$T/web-ref.lst" "$T/web-new.lst" | head -6)"
+check "O1 every path other than dhcp.db gets exactly the new policy: root:www-data, 1775 on the webroot, 0755 elsewhere, 0644 on the five PHP files, 0775 in /etc/dnsmasq.d" $(diff -q "$T/web-ref.lst" "$T/web-new.lst" >/dev/null; echo $?) "$(diff "$T/web-ref.lst" "$T/web-new.lst" | head -6)"
 
 # --- a planted symlink at dhcp.db: the reviewer's reproduction (root:root 0600 -> 0666 through chmod 666)
 mkweb; victim; rm $WEB/dhcp.db; ln -s "$V/target" $WEB/dhcp.db; runw
@@ -442,7 +449,7 @@ check "O1 dhcp.db that is a hard link to a root-only file: refused, the file kee
 mkweb; victim; ln -s "$V/target" $WEB/link.php; ln -s "$V/target" $DNS/link.conf; mkdir "$V/dir"; echo k > "$V/dir/f"; chown 77:77 "$V/dir" "$V/dir/f"
 ln -s "$V/dir" $WEB/dirlink; ln -s "$V/dir" $DNS/dirlink; ln -s "$V/dangling" $WEB/dangling; runw
 check "O1 symlinks inside the trees (file, directory and dangling links): targets untouched, nothing created" $([ "$(vstate)" = "$VICTIM_OK" ] && [ "$(st $V/dir)" = "77:77:755:directory" ] && [ "$(st $V/dir/f)" = "77:77:644:regular file" ] && [ ! -e "$V/dangling" ]; echo $?) "victim $(vstate) dir $(st $V/dir) f $(st $V/dir/f)"
-check "O1 ... and the run still succeeds, the other entries are fixed" $([ $RCW -eq 0 ] && [ "$(wst $WEB/api.php)" = 33:33:755 ] && [ "$(wst $DNS/extra.conf)" = 33:33:775 ]; echo $?) "rc=$RCW $(tail -2 $T/runw.out | cut -c1-200)"
+check "O1 ... and the run still succeeds, the other entries are fixed" $([ $RCW -eq 0 ] && [ "$(wst $WEB/api.php)" = 0:33:644 ] && [ "$(wst $DNS/extra.conf)" = 33:33:775 ]; echo $?) "rc=$RCW $(tail -2 $T/runw.out | cut -c1-200)"
 mkweb; mkfifo $WEB/fifo $DNS/fifo; runw
 check "O1 FIFOs inside the trees: no hang, run succeeds" $([ $RCW -eq 0 ]; echo $?) "rc=$RCW"
 
@@ -454,7 +461,7 @@ check "O1 hard-linked files in the trees (here: links to a root-only file) are l
 # --- over-deep tree: bounded, no crash (an attacker can nest directories without limit)
 mkweb; ( cd $WEB && for i in $(seq 1 1100); do mkdir d && cd d || exit 1; done )
 runw
-check "O1 a 1100-level directory nest in the web tree: no crash, normal entries still fixed" $([ $RCW -eq 0 ] && [ "$(wst $WEB/api.php)" = 33:33:755 ]; echo $?) "rc=$RCW $(tail -2 $T/runw.out | cut -c1-200)"
+check "O1 a 1100-level directory nest in the web tree: no crash, normal entries still fixed" $([ $RCW -eq 0 ] && [ "$(wst $WEB/api.php)" = 0:33:644 ]; echo $?) "rc=$RCW $(tail -2 $T/runw.out | cut -c1-200)"
 
 # --- races: the entry is swapped for a symlink to a root-only file right before the helper changes it
 swaprace() {   # $1=dir $2=name $3=AT [$4=what the entry is swapped for, default the root-only file]; runs block W under the hook
@@ -465,7 +472,7 @@ swaprace() {   # $1=dir $2=name $3=AT [$4=what the entry is swapped for, default
 mkweb; victim; swaprace $WEB dhcp.db chown
 check "O1 race (tree pass): dhcp.db swapped for a symlink right before the chown/chmod (hook fired)" $([ -e /tmp/ig-swapped ]; echo $?) "hook did not fire (rc=$RCW) $(tail -2 $T/runw.out | cut -c1-160)"
 check "O1 race (tree pass): dhcp.db - the target of the swapped-in link is untouched" $([ "$(vstate)" = "$VICTIM_OK" ]; echo $?) "victim now $(vstate)"
-check "O1 race (tree pass): the inode that was checked (now dhcp.db.orig) got the tree's www-data 0755, and the dhcp.db pass then refuses the link" $([ "$(wst $WEB/dhcp.db.orig)" = 33:33:755 ] && [ $RCW -ne 0 ] && [ $RCW -ne 124 ]; echo $?) "dhcp.db.orig $(wst $WEB/dhcp.db.orig) rc=$RCW"
+check "O1 race (tree pass): the inode that was checked (now dhcp.db.orig) got the tree's root:www-data 0755, and the dhcp.db pass then refuses the link" $([ "$(wst $WEB/dhcp.db.orig)" = 0:33:755 ] && [ $RCW -ne 0 ] && [ $RCW -ne 124 ]; echo $?) "dhcp.db.orig $(wst $WEB/dhcp.db.orig) rc=$RCW"
 mkweb; victim; export IG_HOOK_SWAP_DIR=$WEB IG_HOOK_SWAP_NAME=dhcp.db IG_HOOK_SWAP_TO="$V/target" IG_HOOK_SWAP_AT=chown
 runh "ig_perm_fix file $WEB/dhcp.db www-data www-data 664"; unset IG_HOOK_SWAP_DIR IG_HOOK_SWAP_NAME IG_HOOK_SWAP_TO IG_HOOK_SWAP_AT
 check "O1 race (file pass): dhcp.db swapped for a symlink right before the chown/chmod (hook fired)" $([ -e /tmp/ig-swapped ]; echo $?) "hook did not fire (rc=$RCW) $(tail -2 $T/runw.out | cut -c1-160)"
@@ -476,7 +483,7 @@ check "O1 race: dhcp.db swapped for a symlink right before the helper opens it (
 check "O1 race: dhcp.db - O_NOFOLLOW refuses the link: target untouched, block exits non-zero" $([ "$(vstate)" = "$VICTIM_OK" ] && [ $RCW -ne 0 ] && [ $RCW -ne 124 ]; echo $?) "rc=$RCW victim now $(vstate)"
 mkweb; victim; swaprace $WEB api.php chown
 check "O1 race: web tree entry swapped for a symlink right before the chown/chmod (hook fired)" $([ -e /tmp/ig-swapped ]; echo $?) "hook did not fire (rc=$RCW)"
-check "O1 race: web tree entry - target untouched, the checked inode got www-data 0755" $([ "$(vstate)" = "$VICTIM_OK" ] && [ "$(wst $WEB/api.php.orig)" = 33:33:755 ]; echo $?) "victim $(vstate) api.php.orig $(wst $WEB/api.php.orig)"
+check "O1 race: web tree entry - target untouched, the checked inode got the tree's root:www-data 0755" $([ "$(vstate)" = "$VICTIM_OK" ] && [ "$(wst $WEB/api.php.orig)" = 0:33:755 ]; echo $?) "victim $(vstate) api.php.orig $(wst $WEB/api.php.orig)"
 mkweb; victim; swaprace $DNS extra.conf chown
 check "O1 race: /etc/dnsmasq.d entry swapped right before the chown/chmod (hook fired)" $([ -e /tmp/ig-swapped ]; echo $?) "hook did not fire (rc=$RCW)"
 check "O1 race: /etc/dnsmasq.d entry - target untouched, the checked inode got www-data 0775" $([ "$(vstate)" = "$VICTIM_OK" ] && [ "$(wst $DNS/extra.conf.orig)" = 33:33:775 ]; echo $?) "victim $(vstate) extra.conf.orig $(wst $DNS/extra.conf.orig)"

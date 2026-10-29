@@ -50,15 +50,18 @@ $db = new SQLite3('/var/www/irongate/dhcp.db');
 $db->busyTimeout(5000);
 $action = $_GET['action'] ?? '';
 
-// CSRF gate (operator ruling): every action that changes the configuration, the credentials or the access
-// list needs this session's X-CSRF-Token. The gate is skipped only by irongate_csrf_not_required() - the one
-// cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use. update_now keeps its own check below.
+// CSRF gate (operator ruling): every action that changes the configuration, the credentials, the access list,
+// the DHCP service or the update settings needs this session's X-CSRF-Token, on any method. The gate is skipped
+// only by irongate_csrf_not_required() - the one cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use.
+// update_now keeps its own check below.
 $IRONGATE_CSRF_ACTIONS = ['settings', 'irongate_settings', 'irongate_toggle', 'irongate_apply', 'device_groups',
                           'irongate_devices', 'change_password', 'change_username', 'update_access_list',
-                          'toggle_access_list'];
-// These three also serve a read-only GET; only their writes need the token. Every other listed action changes
-// state on any method and is gated unconditionally.
-$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices'];
+                          'toggle_access_list', 'apply', 'reservations', 'start', 'stop', 'restart', 'repair',
+                          'validate', 'update_check', 'update_settings'];
+// These five also serve a read-only GET; only their writes need the token. Every other listed action runs on any
+// method (apply, validate, update_check, start, stop, restart, repair) and is gated unconditionally, GET included.
+$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices', 'reservations',
+                               'update_settings'];
 if (in_array($action, $IRONGATE_CSRF_ACTIONS, true)
     && !($_SERVER['REQUEST_METHOD'] === 'GET' && in_array($action, $IRONGATE_CSRF_READ_ACTIONS, true))) {
     irongate_require_csrf();
