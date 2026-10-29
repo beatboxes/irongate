@@ -711,6 +711,20 @@ $db = new SQLite3('/var/www/irongate/dhcp.db');
 $db->busyTimeout(5000);
 $action = $_GET['action'] ?? '';
 
+// CSRF gate (operator ruling): every action that changes the configuration, the credentials or the access
+// list needs this session's X-CSRF-Token. The gate is skipped only by irongate_csrf_not_required() - the one
+// cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use. update_now keeps its own check below.
+$IRONGATE_CSRF_ACTIONS = ['settings', 'irongate_settings', 'irongate_toggle', 'irongate_apply', 'device_groups',
+                          'irongate_devices', 'change_password', 'change_username', 'update_access_list',
+                          'toggle_access_list'];
+// These three also serve a read-only GET; only their writes need the token. Every other listed action changes
+// state on any method and is gated unconditionally.
+$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices'];
+if (in_array($action, $IRONGATE_CSRF_ACTIONS, true)
+    && !($_SERVER['REQUEST_METHOD'] === 'GET' && in_array($action, $IRONGATE_CSRF_READ_ACTIONS, true))) {
+    irongate_require_csrf();
+}
+
 // Helper functions
 function getSetting($db, $key) {
     $stmt = $db->prepare('SELECT value FROM settings WHERE key = ?');
@@ -753,6 +767,28 @@ function safeApplyConfig($db) {
     }
     ob_end_clean();
     return $result;
+}
+
+// Hand a request to the root helper (the only writer of config.yaml and auth.json). The verb is one of the
+// three the installer's sudoers rule allows; the payload is JSON on stdin, never a path or an argument.
+function irongateWriteViaHelper($verb, array $payload) {
+    $spec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = @proc_open(['sudo', '-n', '/usr/local/sbin/irongate-webwrite', $verb], $spec, $pipes);
+    if (!is_resource($proc)) {
+        return ['success' => false, 'error' => 'helper unavailable'];
+    }
+    @fwrite($pipes[0], json_encode($payload));
+    @fclose($pipes[0]);
+    $out = (string)stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $rc = proc_close($proc);
+    $body = json_decode(trim($out), true);
+    if ($rc !== 0 || !is_array($body) || ($body['success'] ?? false) !== true) {
+        return ['success' => false, 'error' => is_array($body) && is_string($body['error'] ?? null)
+            ? $body['error'] : 'helper failed'];
+    }
+    return ['success' => true, 'changed' => (bool)($body['changed'] ?? false)];
 }
 
 // irongate-audit (V1): zone/group names and device IPs are interpolated into an
@@ -2149,12 +2185,23 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'New passwords do not match']);
             break;
         }
-        $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
-        $auth['updated_at'] = date('c');
-        if (@file_put_contents('/etc/irongate/auth.json',
-                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
-            break;
+        if (irongate_test_sandbox()) {
+            // PHP suites (built-in server + IRONGATE_TEST_SANDBOX=1): the old direct write. Dead under php-fpm.
+            $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
+            $auth['updated_at'] = date('c');
+            if (@file_put_contents('/etc/irongate/auth.json',
+                    json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
+        } else {
+            // Only the new hash reaches the root helper; the plaintext never leaves this process.
+            $result = irongateWriteViaHelper('auth-set-credentials',
+                ['password_hash' => password_hash($new, PASSWORD_BCRYPT)]);
+            if (!$result['success']) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
         }
         echo json_encode(['success' => true, 'message' => 'Password changed']);
         break;
@@ -2176,12 +2223,21 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'Username must be 1-32 characters: letters, digits, dot, dash, underscore']);
             break;
         }
-        $auth['username'] = $newUser;
-        $auth['updated_at'] = date('c');
-        if (@file_put_contents('/etc/irongate/auth.json',
-                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
-            break;
+        if (irongate_test_sandbox()) {
+            // PHP suites (built-in server + IRONGATE_TEST_SANDBOX=1): the old direct write. Dead under php-fpm.
+            $auth['username'] = $newUser;
+            $auth['updated_at'] = date('c');
+            if (@file_put_contents('/etc/irongate/auth.json',
+                    json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
+        } else {
+            $result = irongateWriteViaHelper('auth-set-username', ['username' => $newUser]);
+            if (!$result['success']) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
         }
         $_SESSION['username'] = $newUser;
         echo json_encode(['success' => true, 'message' => 'Username changed']);
@@ -2297,7 +2353,88 @@ function applyIrongateConfig($db) {
         $gatewayMac = trim(shell_exec("ip neigh show | grep " . escapeshellarg($gateway . ' ') . " | awk '{print \$5}' | head -n1"));
     }
     
-    // Generate YAML config
+    // The same values, as data, for the root helper (it validates and renders them; the web tier never
+    // supplies YAML text). irongateWriteViaHelper() runs only outside the PHP-suites' cli-server seam.
+    $groupResults = $db->query('SELECT * FROM device_groups ORDER BY name');
+    $customGroups = [];
+    while ($row = $groupResults->fetchArray(SQLITE3_ASSOC)) {
+        $customGroups[] = $row;
+    }
+    $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
+    $devices = [];
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $devices[] = $row;
+    }
+
+    $blockchainNetwork = $settings['blockchain_network'] ?? 'preprod';
+    if (!in_array($blockchainNetwork, ['preprod', 'preview', 'mainnet', 'undeployed'], true)) {
+        $blockchainNetwork = 'preprod';
+    }
+    $contract = $settings['blockchain_contract_address'] ?? '';
+    $contract = (!empty($contract) && $contract !== 'null') ? $contract : null;
+    $indexer = $settings['blockchain_indexer_url'] ?? '';
+    $indexer = (!empty($indexer) && $indexer !== 'null') ? $indexer : null;
+
+    $payload = ['settings' => [
+        'network' => [
+            'interface' => $interface,
+            'local_ip' => $localIp,
+            'local_mac' => $localMac,
+            'gateway_ip' => $gateway,
+            'gateway_mac' => $gatewayMac,
+        ],
+        'mode' => $mode,
+        'layers' => [
+            'arp_defense' => (($settings['irongate_arp_defense'] ?? 'true') === 'true'),
+            'ipv6_ra' => (($settings['irongate_ipv6_ra'] ?? 'true') === 'true'),
+            'gateway_takeover' => (($settings['irongate_gateway_takeover'] ?? 'true') === 'true'),
+            'bypass_detection' => (($settings['irongate_bypass_detection'] ?? 'true') === 'true'),
+            'firewall' => (($settings['irongate_firewall'] ?? 'true') === 'true'),
+        ],
+        'blockchain' => [
+            'enabled' => (($settings['blockchain_enabled'] ?? 'false') === 'true'),
+            'network' => $blockchainNetwork,
+            'contract_address' => $contract,
+            'indexer_url' => $indexer,
+            'cache_ttl' => intval($settings['blockchain_cache_ttl'] ?? 60),
+            'fallback_allow' => (($settings['blockchain_fallback_allow'] ?? 'true') === 'true'),
+            'audit_logging' => (($settings['blockchain_audit_logging'] ?? 'false') === 'true'),
+            'allow_rogue_devices' => (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true'),
+        ],
+        'custom_groups' => array_map(function($group) {
+            return [
+                'name' => (string)$group['name'],
+                'color' => (string)($group['color'] ?? ''),
+                'icon' => (string)($group['icon'] ?? ''),
+                'description' => (string)($group['description'] ?? ''),
+                'lan_access' => (string)($group['lan_access'] ?? 'none'),
+                'can_access_groups' => json_decode($group['can_access_groups'] ?? '[]', true) ?: [],
+            ];
+        }, $customGroups),
+        'devices' => array_map(function($dev) {
+            return [
+                'mac' => (string)$dev['mac'],
+                'ip' => (string)($dev['ip'] ?? ''),
+                'zone' => (string)($dev['zone'] ?? ''),
+            ];
+        }, $devices),
+    ]];
+    if ($mode === 'dual') {
+        $payload['settings']['bridge'] = [
+            'enabled' => true,
+            'isolated_interface' => (string)($settings['irongate_isolated_interface'] ?? ''),
+            'bridge_name' => 'br-irongate',
+            'bridge_ip' => (string)($settings['irongate_bridge_ip'] ?? '10.99.0.1'),
+            'bridge_netmask' => '255.255.0.0',
+            'dhcp_start' => (string)($settings['irongate_bridge_dhcp_start'] ?? '10.99.1.1'),
+            'dhcp_end' => (string)($settings['irongate_bridge_dhcp_end'] ?? '10.99.255.254'),
+            'port_isolation' => true,
+        ];
+    }
+
+    if (irongate_test_sandbox()) {
+    // The PHP suites drive api.php under the built-in server (IRONGATE_TEST_SANDBOX=1): keep their old
+    // direct write so they stay green. Dead under php-fpm - there the helper above is always used.
     $config = "# Irongate Configuration\n";
     $config .= "# Generated: " . date('Y-m-d H:i:s') . "\n\n";
     $config .= "network:\n";
@@ -2359,13 +2496,6 @@ function applyIrongateConfig($db) {
     $config .= "  audit_logging: " . (($settings['blockchain_audit_logging'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
     $config .= "  allow_rogue_devices: " . (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true' ? 'true' : 'false') . "\n\n";
     
-    // Get custom device groups from database
-    $groupResults = $db->query('SELECT * FROM device_groups ORDER BY name');
-    $customGroups = [];
-    while ($row = $groupResults->fetchArray(SQLITE3_ASSOC)) {
-        $customGroups[] = $row;
-    }
-
     $config .= "# Custom Device Groups\n";
     $config .= "custom_groups:\n";
     if (!empty($customGroups)) {
@@ -2383,13 +2513,6 @@ function applyIrongateConfig($db) {
     }
     $config .= "\n";
 
-    // Get protected devices from database
-    $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
-    $devices = [];
-    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
-        $devices[] = $row;
-    }
-
     $config .= "devices:\n";
     if (!empty($devices)) {
         foreach ($devices as $dev) {
@@ -2401,26 +2524,29 @@ function applyIrongateConfig($db) {
         $config .= "  []\n";
     }
 
-    // Write config
-    @mkdir('/etc/irongate', 0775, true);
+    // Write config. The directory is created 0750 only when absent and never chmodded/chowned afterwards:
+    // outside this seam the installer creates it and the root helper does the writing.
+    @mkdir('/etc/irongate', 0750, true);
     $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
     if ($writeResult === false) {
-        // Try to fix permissions and retry
-        @chmod('/etc/irongate', 0775);
-        @chown('/etc/irongate', 'root');
-        @chgrp('/etc/irongate', 'www-data');
-        $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
-        if ($writeResult === false) {
-            return [
-                'success' => false,
-                'error' => 'Failed to write config file - check /etc/irongate permissions'
-            ];
-        }
+        return [
+            'success' => false,
+            'error' => 'Failed to write config file - check /etc/irongate permissions'
+        ];
     }
-    
-    // Restart service in background - don't wait for it
-    exec('sudo systemctl restart irongate >/dev/null 2>&1 &');
-    
+
+    return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
+    }
+
+    // Root helper: it writes atomically and restarts irongate only when the bytes changed.
+    $result = irongateWriteViaHelper('config-apply', $payload);
+    if (!$result['success']) {
+        return [
+            'success' => false,
+            'error' => 'Failed to write config file - check /etc/irongate permissions'
+        ];
+    }
+
     return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
 }
 EOPHP
@@ -4951,6 +5077,36 @@ $IRONGATE_SESSION_TIMEOUT = 4 * 60 * 60; // 4 hours of inactivity
 
 $isApi = basename($_SERVER['SCRIPT_NAME'] ?? '') === 'api.php';
 
+// The ONE test/development exception: PHP's built-in server together with IRONGATE_TEST_SANDBOX=1. The PHP
+// suites drive api.php this way, so they keep the old direct writes and skip the CSRF gate. Dead under
+// php-fpm: the SAPI there is fpm-fcgi, never cli-server. (php_sapi_name() is used instead of the SAPI
+// constant so that this file keeps exactly one literal occurrence of it, which tests/test_item_e_api.php
+// relies on to rewrite the guard for its fpm-fcgi cases.)
+function irongate_test_sandbox(): bool {
+    return php_sapi_name() === 'cli-server' && getenv('IRONGATE_TEST_SANDBOX') === '1';
+}
+
+// CSRF token gate for the state-changing API actions. True here means the token is NOT required.
+function irongate_csrf_not_required(): bool {
+    return irongate_test_sandbox();
+}
+
+// Enforce X-CSRF-Token against this session's token, in constant time. A request without a session
+// (the cli-server loopback bypass) has no token and is refused too.
+function irongate_require_csrf(): void {
+    if (irongate_csrf_not_required()) {
+        return;
+    }
+    $sent = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    $want = $_SESSION['csrf_token'] ?? '';
+    if (!is_string($sent) || !is_string($want) || $want === '' || !hash_equals($want, $sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'error' => 'invalid csrf token']);
+        exit;
+    }
+}
+
 // Local service-to-service API bypass (no session cookie presented). The decision is a function of the SAPI so
 // that it can be tested for fpm-fcgi: it is true only for the built-in web server (cli-server) on loopback.
 function irongate_local_bypass_allowed(string $sapi, string $addr, bool $hasCookie): bool {
@@ -5006,6 +5162,9 @@ session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, '
 session_start();
 
 $AUTH_FILE = '/etc/irongate/auth.json';
+// Login lockout counters: a www-data-owned state file, not auth.json (which is root:www-data 0640 and is
+// only READ on this path now). One GLOBAL counter, as before: 5 failures in 15 minutes -> 15 minute lockout.
+$LOCKOUT_FILE = '/var/lib/irongate/lockout/lockout.json';
 $MAX_ATTEMPTS = 5;
 $WINDOW_SECONDS = 15 * 60;
 $LOCKOUT_SECONDS = 15 * 60;
@@ -5024,8 +5183,78 @@ function loadAuth($file) {
     return is_array($auth) ? $auth : null;
 }
 
-function saveAuth($file, $auth) {
-    return @file_put_contents($file, json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) !== false;
+// The lockout state is read and written under an exclusive flock on the counter file itself. The write
+// renames a new file over it, so after locking, the descriptor is checked against the path: a lock on the
+// replaced inode would not serialise the next writer, and the caller retries on the current file.
+function lockoutOpen($file) {
+    for ($i = 0; $i < 20; $i++) {
+        $fh = @fopen($file, 'c+');
+        if ($fh === false) {
+            return false;
+        }
+        if (!flock($fh, LOCK_EX)) {
+            fclose($fh);
+            return false;
+        }
+        clearstatcache(true, $file);
+        $a = fstat($fh);
+        $b = @stat($file);
+        if ($a !== false && $b !== false && $a['dev'] === $b['dev'] && $a['ino'] === $b['ino']) {
+            return $fh;
+        }
+        flock($fh, LOCK_UN);
+        fclose($fh);
+    }
+    return false;
+}
+
+function lockoutZero() {
+    return ['version' => 1, 'failed_attempts' => 0, 'first_failed_at' => 0, 'locked_until' => 0];
+}
+
+function lockoutRead($fh) {
+    rewind($fh);
+    $raw = stream_get_contents($fh);
+    $data = json_decode((string)$raw, true);
+    if (!is_array($data)) {
+        // Missing or unparsable: zero counters, logged, and rewritten clean on the next write.
+        error_log('Irongate login: lockout state is missing or unreadable; counters reset');
+        return lockoutZero();
+    }
+    return [
+        'version' => 1,
+        'failed_attempts' => intval($data['failed_attempts'] ?? 0),
+        'first_failed_at' => intval($data['first_failed_at'] ?? 0),
+        'locked_until' => intval($data['locked_until'] ?? 0),
+    ];
+}
+
+function lockoutWrite($fh, $file, $state) {
+    $dir = dirname($file);
+    $tmp = $dir . '/.lockout.json.new.' . getmypid();
+    @unlink($tmp);
+    $out = @fopen($tmp, 'x');
+    if ($out === false) {
+        error_log('Irongate login: cannot create the lockout temporary file');
+        return false;
+    }
+    $data = json_encode($state, JSON_PRETTY_PRINT) . "\n";
+    $ok = (@fwrite($out, $data) === strlen($data)) && @fflush($out) && @fsync($out);
+    @fclose($out);
+    @chmod($tmp, 0600);
+    if (!$ok || !@rename($tmp, $file)) {
+        @unlink($tmp);
+        error_log('Irongate login: cannot write the lockout state');
+        return false;
+    }
+    return true;
+}
+
+function lockoutClose($fh) {
+    if (is_resource($fh)) {
+        flock($fh, LOCK_UN);
+        fclose($fh);
+    }
 }
 
 function safeRedirectTarget() {
@@ -5053,18 +5282,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Authentication is not configured correctly.';
         } else {
             $now = time();
-            $lockedUntil = intval($auth['locked_until'] ?? 0);
+            $lock = lockoutOpen($LOCKOUT_FILE);
+            if ($lock === false) {
+                error_log('Irongate login: cannot open the lockout state; counters are not persisted');
+            }
+            $counters = $lock !== false ? lockoutRead($lock) : lockoutZero();
+            $lockedUntil = $counters['locked_until'];
             if ($lockedUntil > $now) {
                 $mins = (int)ceil(($lockedUntil - $now) / 60);
                 $error = 'Too many failed attempts. Try again in ' . $mins . ' minute' . ($mins === 1 ? '' : 's') . '.';
+                lockoutClose($lock);
             } else {
                 $user = (string)($_POST['username'] ?? '');
                 $pass = (string)($_POST['password'] ?? '');
                 if ($user === $auth['username'] && password_verify($pass, $auth['password_hash'])) {
-                    $auth['failed_attempts'] = 0;
-                    $auth['first_failed_at'] = 0;
-                    $auth['locked_until'] = 0;
-                    saveAuth($AUTH_FILE, $auth);
+                    $counters = lockoutZero();
+                    if ($lock !== false) {
+                        lockoutWrite($lock, $LOCKOUT_FILE, $counters);
+                    }
+                    lockoutClose($lock);
                     session_regenerate_id(true);
                     $_SESSION['authenticated'] = true;
                     $_SESSION['username'] = $auth['username'];
@@ -5073,23 +5309,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     header('Location: ' . safeRedirectTarget());
                     exit;
                 }
-                // Failed attempt — rolling window
-                $first = intval($auth['first_failed_at'] ?? 0);
+                // Failed attempt - rolling window (same thresholds as before)
+                $first = $counters['first_failed_at'];
                 if ($first === 0 || ($now - $first) > $WINDOW_SECONDS) {
-                    $auth['failed_attempts'] = 1;
-                    $auth['first_failed_at'] = $now;
+                    $counters['failed_attempts'] = 1;
+                    $counters['first_failed_at'] = $now;
                 } else {
-                    $auth['failed_attempts'] = intval($auth['failed_attempts'] ?? 0) + 1;
+                    $counters['failed_attempts'] = $counters['failed_attempts'] + 1;
                 }
-                if (intval($auth['failed_attempts']) >= $MAX_ATTEMPTS) {
-                    $auth['locked_until'] = $now + $LOCKOUT_SECONDS;
-                    $auth['failed_attempts'] = 0;
-                    $auth['first_failed_at'] = 0;
+                if ($counters['failed_attempts'] >= $MAX_ATTEMPTS) {
+                    $counters['locked_until'] = $now + $LOCKOUT_SECONDS;
+                    $counters['failed_attempts'] = 0;
+                    $counters['first_failed_at'] = 0;
                     $error = 'Too many failed attempts. Locked for 15 minutes.';
                 } else {
                     $error = 'Invalid username or password.';
                 }
-                saveAuth($AUTH_FILE, $auth);
+                if ($lock !== false) {
+                    lockoutWrite($lock, $LOCKOUT_FILE, $counters);
+                }
+                lockoutClose($lock);
             }
         }
     }
@@ -6554,10 +6793,804 @@ DNSMASQAPPLY
 chown root:root /opt/irongate/dnsmasq-apply
 chmod 755 /opt/irongate/dnsmasq-apply
 
+# ---- web root helper: begin ----
+# The only writer of /etc/irongate/config.yaml and /etc/irongate/auth.json (see the file for why).
+IG_WEBWRITE_NEW=/usr/local/sbin/.irongate-webwrite.new
+rm -f "$IG_WEBWRITE_NEW"
+cat > "$IG_WEBWRITE_NEW" << 'IRONGATE_WEBWRITE'
+#!/usr/bin/python3 -I
+"""irongate-webwrite - the only program that writes /etc/irongate/config.yaml and /etc/irongate/auth.json.
+
+Why this exists. The web tier (www-data) used to write both files itself, so it owned them or had to widen
+/etc/irongate every time a save failed. Those files are read by the root engine and by nothing else that needs
+write access, so the web tier now hands this program a REQUEST as data and runs it through sudo:
+
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite config-apply
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-credentials
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-username
+
+The program accepts exactly one verb and no other argument, reads a JSON object on stdin (ASCII, at most 64 KiB,
+no duplicate keys, at most four levels of nesting), checks every value against the shape the dashboard and the
+engine use, renders the YAML itself (the web tier never supplies YAML text) and replaces the file atomically as
+root:www-data 0640. It never widens or re-owns /etc/irongate.
+
+For config-apply the rendered bytes are compared with the file that is already there (the `# Generated:` line
+ignored); when nothing changed it writes nothing and does not restart irongate.
+
+Output: one JSON object on stdout, {"success": bool, "error": str, "changed": bool}.
+Exit status: 0 applied/unchanged, 2 request refused, 3 write failed, 4 service restart failed, 1 internal error.
+"""
+
+import datetime
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+
+try:
+    import syslog
+except ImportError:  # pragma: no cover
+    syslog = None
+
+# ---- paths (the tests import this file and may point these at a scratch tree) ----
+CONFIG_PATH = '/etc/irongate/config.yaml'
+AUTH_PATH = '/etc/irongate/auth.json'
+LOCK_PATH = '/run/irongate-webwrite.lock'
+SYSTEMCTL_BIN = ('/usr/bin/systemctl', '/bin/systemctl')
+WEB_GID = 33
+MAX_INPUT = 65536
+MAX_STRING = 253
+SERVICE_TIMEOUT = 20
+
+VERBS = ('config-apply', 'auth-set-credentials', 'auth-set-username')
+
+# The Midnight presets and their indexer URLs (mirror web/api.php midnightNetworks() and src/blockchain.py
+# NETWORKS). Only these hosts may appear in a custom blockchain.indexer_url; the chosen network's own preset
+# (byte for byte, including the loopback 'undeployed' one) is always accepted.
+NETWORK_PRESETS = {
+    'preprod': 'https://indexer.preprod.midnight.network/api/v4/graphql',
+    'preview': 'https://indexer.preview.midnight.network/api/v4/graphql',
+    'mainnet': 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+    'undeployed': 'http://127.0.0.1:8088/api/v4/graphql',
+}
+NETWORKS = tuple(NETWORK_PRESETS)
+INDEXER_HOSTS = frozenset((
+    'indexer.preprod.midnight.network',
+    'indexer.preview.midnight.network',
+    'indexer.mainnet.midnight.network',
+))
+
+# Engine/dashboard shapes (mirror src/irongate.py _valid_iface/_valid_zone_name and src/dnsmasq-apply _MAC_RE).
+IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+ZONE_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
+MAC_RE = re.compile(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
+CONTRACT_RE = re.compile(r'0x[0-9A-Fa-f]{64}')
+HASH_RE = re.compile(r'\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}')
+USERNAME_RE = re.compile(r'[A-Za-z0-9._-]{1,32}')
+
+# ---- the exact key sets of a config-apply request ----
+NETWORK_KEYS = ('interface', 'local_ip', 'local_mac', 'gateway_ip', 'gateway_mac')
+BRIDGE_KEYS = ('enabled', 'isolated_interface', 'bridge_name', 'bridge_ip', 'bridge_netmask',
+               'dhcp_start', 'dhcp_end', 'port_isolation')
+LAYER_KEYS = ('arp_defense', 'ipv6_ra', 'gateway_takeover', 'bypass_detection', 'firewall')
+BLOCKCHAIN_KEYS = ('enabled', 'network', 'contract_address', 'indexer_url', 'cache_ttl',
+                   'fallback_allow', 'audit_logging', 'allow_rogue_devices')
+GROUP_KEYS = ('name', 'color', 'icon', 'description', 'lan_access', 'can_access_groups')
+DEVICE_KEYS = ('mac', 'ip', 'zone')
+SETTINGS_BASE_KEYS = ('network', 'mode', 'layers', 'blockchain', 'custom_groups', 'devices')
+
+
+class Reject(Exception):
+    """The request is not acceptable; nothing is written (exit 2)."""
+
+
+class Failure(Exception):
+    """A step that is not the request's fault failed. code is the exit status."""
+
+    def __init__(self, error, code):
+        Exception.__init__(self, error)
+        self.error = error
+        self.code = code
+
+
+# ============================================================ parsing ============================================================
+
+def _no_dupes(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise Reject('duplicate key in request')
+        out[key] = value
+    return out
+
+
+def _bad_constant(_name):
+    raise Reject('non-finite number in request')
+
+
+def _check_depth(node, depth):
+    """A container deeper than four levels below the request object is refused (the deepest legitimate one is
+    custom_groups[].can_access_groups)."""
+    if isinstance(node, dict) or isinstance(node, list):
+        if depth > 4:
+            raise Reject('request is nested too deeply')
+        values = node.values() if isinstance(node, dict) else node
+        for value in values:
+            _check_depth(value, depth + 1)
+
+
+def parse_request(raw):
+    """bytes -> dict. Raises Reject."""
+    if len(raw) > MAX_INPUT:
+        raise Reject('request is too large')
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        raise Reject('request is not ASCII')
+    try:
+        obj = json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
+        raise Reject('request is not valid JSON')
+    if not isinstance(obj, dict):
+        raise Reject('request is not an object')
+    _check_depth(obj, 0)
+    return obj
+
+
+def _exact_keys(obj, keys, what):
+    if not isinstance(obj, dict):
+        raise Reject('%s is not an object' % what)
+    if set(obj) != set(keys):
+        raise Reject('%s has an unknown or missing key' % what)
+
+
+# ============================================================ value shapes ============================================================
+
+def _printable(value):
+    """True when the string has no control or line-separator character. The raw request is ASCII (PHP's
+    json_encode() escapes everything else); a decoded value may still carry printable Unicode, as a group
+    icon does, and it is rendered exactly as the PHP generator rendered it."""
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or 0x7f <= code <= 0x9f or 0xd800 <= code <= 0xdfff or code in (0x2028, 0x2029):
+            return False
+    return True
+
+
+def _string(value, field, allow_empty=True):
+    if not isinstance(value, str) or len(value) > MAX_STRING or not _printable(value):
+        raise Reject('invalid %s' % field)
+    if not allow_empty and value == '':
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _iface(value, field):
+    """An empty string or a kernel interface name, as src/irongate.py _valid_iface() and web/api.php:158-161."""
+    value = _string(value, field)
+    if value != '' and IFACE_RE.fullmatch(value) is None:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _ipv4(value, field, allow_empty=True):
+    if value == '':
+        if allow_empty:
+            return ''
+        raise Reject('invalid %s' % field)
+    if not isinstance(value, str):
+        raise Reject('invalid %s' % field)
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        raise Reject('invalid %s' % field)
+    if addr.version != 4 or str(addr) != value:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _mac(value, field, allow_empty):
+    if value == '' and allow_empty:
+        return ''
+    if not isinstance(value, str):
+        raise Reject('invalid %s' % field)
+    if MAC_RE.fullmatch(value) is None:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _bool(value, field):
+    if value is not True and value is not False:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _indexer_url(value, network):
+    """None/'' means "use the network default". The chosen network's own preset URL is accepted byte for
+    byte (that is the loopback http preset for 'undeployed'); anything else must pass the same rule as
+    web/api.php validIndexerUrl() and src/blockchain.py validate_indexer_url()."""
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str) or len(value) > MAX_STRING:
+        raise Reject('invalid indexer_url')
+    if value == NETWORK_PRESETS[network]:
+        return value
+    if re.fullmatch(r'[\x21-\x7e]+', value) is None or '\\' in value:
+        raise Reject('invalid indexer_url')
+    # urlsplit() lower-cases the scheme; PHP's parse_url() does not, and an all-upper-case
+    # scheme is not the "https" this file and the engine require.
+    if value.split(':', 1)[0] != 'https':
+        raise Reject('invalid indexer_url')
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError:
+        raise Reject('invalid indexer_url')
+    if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+        raise Reject('invalid indexer_url')
+    if (parts.hostname or '').lower() not in INDEXER_HOSTS:
+        raise Reject('invalid indexer_url')
+    return value
+
+
+def _contract_address(value):
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str) or len(value) > 66 or CONTRACT_RE.fullmatch(value) is None:
+        raise Reject('invalid contract_address')
+    return value
+
+
+def normalize_settings(settings):
+    """Strict, canonical form of the settings the dashboard's generator writes. Raises Reject."""
+    if not isinstance(settings, dict):
+        raise Reject('settings is not an object')
+    for key in settings:
+        if key not in SETTINGS_BASE_KEYS and key != 'bridge':
+            raise Reject('unknown settings key')
+    mode = settings.get('mode')
+    if mode not in ('single', 'dual'):
+        raise Reject('invalid mode')
+    required = set(SETTINGS_BASE_KEYS) | ({'bridge'} if mode == 'dual' else set())
+    if set(settings) != required:
+        raise Reject('settings has an unknown or missing key')
+
+    network_in = settings['network']
+    _exact_keys(network_in, NETWORK_KEYS, 'network')
+    iface = _string(network_in['interface'], 'interface')
+    if iface != '' and IFACE_RE.fullmatch(iface) is None:
+        raise Reject('invalid interface')
+    network = {
+        'interface': iface,
+        'local_ip': _ipv4(network_in['local_ip'], 'local_ip'),
+        'local_mac': _mac(network_in['local_mac'], 'local_mac', True),
+        'gateway_ip': _ipv4(network_in['gateway_ip'], 'gateway_ip'),
+        'gateway_mac': _mac(network_in['gateway_mac'], 'gateway_mac', True),
+    }
+
+    out = {'network': network, 'mode': mode}
+
+    if mode == 'dual':
+        bridge_in = settings['bridge']
+        _exact_keys(bridge_in, BRIDGE_KEYS, 'bridge')
+        bridge_name = _string(bridge_in['bridge_name'], 'bridge_name', allow_empty=False)
+        if IFACE_RE.fullmatch(bridge_name) is None:
+            raise Reject('invalid bridge_name')
+        bridge = {
+            'enabled': _bool(bridge_in['enabled'], 'bridge.enabled'),
+            'isolated_interface': _iface(bridge_in['isolated_interface'], 'isolated_interface'),
+            'bridge_name': bridge_name,
+            'bridge_ip': _ipv4(bridge_in['bridge_ip'], 'bridge_ip'),
+            'bridge_netmask': _ipv4(bridge_in['bridge_netmask'], 'bridge_netmask', allow_empty=False),
+            'dhcp_start': _ipv4(bridge_in['dhcp_start'], 'dhcp_start'),
+            'dhcp_end': _ipv4(bridge_in['dhcp_end'], 'dhcp_end'),
+            'port_isolation': _bool(bridge_in['port_isolation'], 'bridge.port_isolation'),
+        }
+        # The generator writes these two as constants; anything else would not be the same file.
+        if bridge['enabled'] is not True or bridge['port_isolation'] is not True:
+            raise Reject('invalid bridge enabled/port_isolation')
+        out['bridge'] = bridge
+
+    layers_in = settings['layers']
+    _exact_keys(layers_in, LAYER_KEYS, 'layers')
+    out['layers'] = dict((key, _bool(layers_in[key], 'layers.' + key)) for key in LAYER_KEYS)
+
+    blockchain_in = settings['blockchain']
+    _exact_keys(blockchain_in, BLOCKCHAIN_KEYS, 'blockchain')
+    network_name = blockchain_in['network']
+    if network_name not in NETWORKS:
+        raise Reject('unknown blockchain network')
+    cache_ttl = blockchain_in['cache_ttl']
+    if isinstance(cache_ttl, bool) or not isinstance(cache_ttl, int) or cache_ttl < 0 or cache_ttl > 2147483647:
+        raise Reject('invalid cache_ttl')
+    out['blockchain'] = {
+        'enabled': _bool(blockchain_in['enabled'], 'blockchain.enabled'),
+        'network': network_name,
+        'contract_address': _contract_address(blockchain_in['contract_address']),
+        'indexer_url': _indexer_url(blockchain_in['indexer_url'], network_name),
+        'cache_ttl': cache_ttl,
+        'fallback_allow': _bool(blockchain_in['fallback_allow'], 'blockchain.fallback_allow'),
+        'audit_logging': _bool(blockchain_in['audit_logging'], 'blockchain.audit_logging'),
+        'allow_rogue_devices': _bool(blockchain_in['allow_rogue_devices'], 'blockchain.allow_rogue_devices'),
+    }
+
+    groups_in = settings['custom_groups']
+    if not isinstance(groups_in, list):
+        raise Reject('custom_groups is not a list')
+    groups = []
+    for number, item in enumerate(groups_in, 1):
+        _exact_keys(item, GROUP_KEYS, 'custom group %d' % number)
+        name = item['name']
+        if not isinstance(name, str) or ZONE_RE.fullmatch(name) is None:
+            raise Reject('invalid custom group %d name' % number)
+        access = item['can_access_groups']
+        if not isinstance(access, list):
+            raise Reject('invalid custom group %d can_access_groups' % number)
+        checked_access = []
+        for entry in access:
+            if not isinstance(entry, str) or ZONE_RE.fullmatch(entry) is None:
+                raise Reject('invalid custom group %d can_access_groups' % number)
+            checked_access.append(entry)
+        groups.append({
+            'name': name,
+            'color': _string(item['color'], 'custom group color'),
+            'icon': _string(item['icon'], 'custom group icon'),
+            'description': _string(item['description'], 'custom group description'),
+            'lan_access': _string(item['lan_access'], 'custom group lan_access'),
+            'can_access_groups': checked_access,
+        })
+    out['custom_groups'] = groups
+
+    devices_in = settings['devices']
+    if not isinstance(devices_in, list):
+        raise Reject('devices is not a list')
+    devices = []
+    for number, item in enumerate(devices_in, 1):
+        _exact_keys(item, DEVICE_KEYS, 'device %d' % number)
+        mac = item['mac']
+        if not isinstance(mac, str) or MAC_RE.fullmatch(mac) is None:
+            raise Reject('invalid device %d mac' % number)
+        zone = item['zone']
+        if not isinstance(zone, str) or ZONE_RE.fullmatch(zone) is None:
+            raise Reject('invalid device %d zone' % number)
+        devices.append({
+            'mac': mac,
+            'ip': _ipv4(item['ip'], 'device %d ip' % number),
+            'zone': zone,
+        })
+    out['devices'] = devices
+    return out
+
+
+# ============================================================ rendering (byte-for-byte the PHP generator) ============================================================
+
+def _scalar(value):
+    """PHP yamlScalar(): json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE). PHP still escapes
+    U+2028/U+2029 even with that flag, so they are escaped here too."""
+    return (json.dumps(value, ensure_ascii=False)
+            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+
+
+def render_config(settings, now=None):
+    """The same bytes web/api.php applyIrongateConfig() wrote, for the same settings."""
+    stamp = now if now is not None else time.strftime('%Y-%m-%d %H:%M:%S')
+    network = settings['network']
+    out = '# Irongate Configuration\n'
+    out += '# Generated: ' + stamp + '\n\n'
+    out += 'network:\n'
+    out += '  interface: ' + _scalar(network['interface']) + '\n'
+    out += '  local_ip: ' + _scalar(network['local_ip']) + '\n'
+    out += '  local_mac: ' + _scalar(network['local_mac']) + '\n'
+    out += '  gateway_ip: ' + _scalar(network['gateway_ip']) + '\n'
+    out += '  gateway_mac: ' + _scalar(network['gateway_mac']) + '\n\n'
+    out += 'mode: ' + _scalar(settings['mode']) + '\n\n'
+
+    bridge = settings.get('bridge')
+    if bridge is not None:
+        out += 'bridge:\n'
+        out += '  enabled: true\n'
+        out += '  isolated_interface: ' + _scalar(bridge['isolated_interface']) + '\n'
+        out += '  bridge_name: ' + _scalar(bridge['bridge_name']) + '\n'
+        out += '  bridge_ip: ' + _scalar(bridge['bridge_ip']) + '\n'
+        out += '  bridge_netmask: ' + _scalar(bridge['bridge_netmask']) + '\n'
+        out += '  dhcp_start: ' + _scalar(bridge['dhcp_start']) + '\n'
+        out += '  dhcp_end: ' + _scalar(bridge['dhcp_end']) + '\n'
+        out += '  port_isolation: true\n\n'
+
+    layers = settings['layers']
+    out += 'layers:\n'
+    for key in LAYER_KEYS:
+        out += '  %s: %s\n' % (key, 'true' if layers[key] else 'false')
+    out += '\n'
+
+    blockchain = settings['blockchain']
+    out += '# Layer 8: Midnight Blockchain Verification\n'
+    out += 'blockchain:\n'
+    out += '  enabled: %s\n' % ('true' if blockchain['enabled'] else 'false')
+    out += '  network: ' + _scalar(blockchain['network']) + '\n'
+    if blockchain['contract_address'] is not None:
+        out += '  contract_address: ' + _scalar(blockchain['contract_address']) + '\n'
+    else:
+        out += '  contract_address: null\n'
+    if blockchain['indexer_url'] is not None:
+        out += '  indexer_url: ' + _scalar(blockchain['indexer_url']) + '\n'
+    else:
+        out += '  indexer_url: null\n'
+    out += '  cache_ttl: %d\n' % blockchain['cache_ttl']
+    out += '  fallback_allow: %s\n' % ('true' if blockchain['fallback_allow'] else 'false')
+    out += '  audit_logging: %s\n' % ('true' if blockchain['audit_logging'] else 'false')
+    out += '  allow_rogue_devices: %s\n\n' % ('true' if blockchain['allow_rogue_devices'] else 'false')
+
+    groups = settings['custom_groups']
+    out += '# Custom Device Groups\n'
+    out += 'custom_groups:\n'
+    if groups:
+        for group in groups:
+            out += '  - name: ' + _scalar(group['name']) + '\n'
+            out += '    color: ' + _scalar(group['color']) + '\n'
+            out += '    icon: ' + _scalar(group['icon']) + '\n'
+            out += '    description: ' + _scalar(group['description']) + '\n'
+            out += '    lan_access: ' + _scalar(group['lan_access']) + '\n'
+            out += '    can_access_groups: [' + ', '.join(_scalar(g) for g in group['can_access_groups']) + ']\n'
+    else:
+        out += '  []\n'
+    out += '\n'
+
+    devices = settings['devices']
+    out += 'devices:\n'
+    if devices:
+        for device in devices:
+            out += '  - mac: ' + _scalar(device['mac']) + '\n'
+            out += '    ip: ' + _scalar(device['ip']) + '\n'
+            out += '    zone: ' + _scalar(device['zone']) + '\n'
+    else:
+        out += '  []\n'
+    return out
+
+
+def _normalize_generated(data):
+    lines = []
+    for line in data.splitlines(keepends=True):
+        if line.startswith(b'# Generated: '):
+            lines.append(b'# Generated: X\n')
+        else:
+            lines.append(line)
+    return b''.join(lines)
+
+
+# ============================================================ PHP-compatible auth.json ============================================================
+
+def _php_string(value):
+    """json_encode()'s string escaping without JSON_UNESCAPED_* (what the web tier used for auth.json)."""
+    pieces = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch == '"':
+            pieces.append('\\"')
+        elif ch == '\\':
+            pieces.append('\\\\')
+        elif ch == '/':
+            pieces.append('\\/')
+        elif ch == '\b':
+            pieces.append('\\b')
+        elif ch == '\f':
+            pieces.append('\\f')
+        elif ch == '\n':
+            pieces.append('\\n')
+        elif ch == '\r':
+            pieces.append('\\r')
+        elif ch == '\t':
+            pieces.append('\\t')
+        elif code < 0x20:
+            pieces.append('\\u%04x' % code)
+        elif code < 0x7f:
+            pieces.append(ch)
+        elif code <= 0xffff:
+            pieces.append('\\u%04x' % code)
+        else:
+            value2 = code - 0x10000
+            pieces.append('\\u%04x\\u%04x' % (0xd800 + (value2 >> 10), 0xdc00 + (value2 & 0x3ff)))
+    pieces.append('"')
+    return ''.join(pieces)
+
+
+def _php_pretty(value, level=1):
+    pad = '    ' * level
+    if isinstance(value, dict):
+        if not value:
+            return '{}'
+        items = [pad + _php_string(str(key)) + ': ' + _php_pretty(item, level + 1)
+                 for key, item in value.items()]
+        return '{\n' + ',\n'.join(items) + '\n' + '    ' * (level - 1) + '}'
+    if isinstance(value, list):
+        if not value:
+            return '[]'
+        items = [pad + _php_pretty(item, level + 1) for item in value]
+        return '[\n' + ',\n'.join(items) + '\n' + '    ' * (level - 1) + ']'
+    if value is True:
+        return 'true'
+    if value is False:
+        return 'false'
+    if value is None:
+        return 'null'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return _php_string(value)
+
+
+def encode_auth(auth):
+    """json_encode($auth, JSON_PRETTY_PRINT) . "\\n"."""
+    return (_php_pretty(auth) + '\n').encode('utf-8')
+
+
+# ============================================================ filesystem ============================================================
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(directory):
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def check_target(path, must_exist):
+    """Refuse a link or anything that is not a regular file. Return True when it exists."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        if must_exist:
+            raise Failure('target is missing', 3)
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise Reject('target is not a regular file')
+    return True
+
+
+def read_file(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    """temp `.NAME.new.PID` in the same directory -> fsync -> rename -> fsync(dir), root:www-data 0640."""
+    directory, name = os.path.split(path)
+    tmp = os.path.join(directory, '.%s.new.%d' % (name, os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, WEB_GID)
+        os.fchmod(fd, 0o640)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(tmp)
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp, path)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    _fsync_dir(directory)
+
+
+def take_lock():
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def restart_service():
+    exe = next((path for path in SYSTEMCTL_BIN if os.access(path, os.X_OK)), None)
+    if exe is None:
+        return 127
+    try:
+        proc = subprocess.run([exe, 'restart', 'irongate'], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=SERVICE_TIMEOUT, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+                                                            'LANG': 'C', 'LC_ALL': 'C'},
+                              close_fds=True)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+    return proc.returncode
+
+
+# ============================================================ audit ============================================================
+
+def _caller_uid():
+    value = os.environ.get('SUDO_UID')
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return os.getuid()
+
+
+def _audit(verb, uid, code, reason):
+    if syslog is None:
+        return
+    try:
+        syslog.openlog('irongate-webwrite', syslog.LOG_PID, syslog.LOG_AUTH)
+        syslog.syslog(syslog.LOG_NOTICE, 'verb=%s uid=%d rc=%d %s' % (verb or '-', uid, code, reason))
+    except Exception:  # logging must never decide the outcome
+        pass
+
+
+# ============================================================ verbs ============================================================
+
+def _answer(success, error, changed):
+    return {'success': bool(success), 'error': error, 'changed': bool(changed)}
+
+
+def config_apply(obj):
+    _exact_keys(obj, ('settings',), 'request')
+    settings = normalize_settings(obj['settings'])
+    rendered = render_config(settings).encode('utf-8')
+    exists = check_target(CONFIG_PATH, must_exist=False)
+    if exists:
+        try:
+            current = read_file(CONFIG_PATH)
+        except OSError:
+            raise Failure('target is unreadable', 3)
+        if _normalize_generated(current) == _normalize_generated(rendered):
+            return 0, _answer(True, '', False), 'unchanged, no reload'
+    try:
+        write_atomic(CONFIG_PATH, rendered)
+    except OSError:
+        raise Failure('write failed', 3)
+    rc = restart_service()
+    if rc != 0:
+        return 4, _answer(False, 'service restart failed', True), 'reload failed'
+    return 0, _answer(True, '', True), 'applied'
+
+
+def auth_set(obj, field):
+    _exact_keys(obj, (field,), 'request')
+    value = obj[field]
+    if field == 'password_hash':
+        if not isinstance(value, str) or HASH_RE.fullmatch(value) is None:
+            raise Reject('invalid password_hash')
+    else:
+        if not isinstance(value, str) or USERNAME_RE.fullmatch(value) is None:
+            raise Reject('invalid username')
+    check_target(AUTH_PATH, must_exist=True)
+    try:
+        auth = json.loads(read_file(AUTH_PATH).decode('utf-8'))
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise Failure('auth file is unreadable', 3)
+    if not isinstance(auth, dict):
+        raise Failure('auth file is unreadable', 3)
+    auth[field] = value
+    auth['updated_at'] = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+    data = encode_auth(auth)
+    try:
+        if read_file(AUTH_PATH) == data:
+            return 0, _answer(True, '', False), 'unchanged'
+        write_atomic(AUTH_PATH, data)
+    except OSError:
+        raise Failure('write failed', 3)
+    return 0, _answer(True, '', True), 'applied'
+
+
+def dispatch(verb, obj):
+    if verb == 'config-apply':
+        return config_apply(obj)
+    if verb == 'auth-set-credentials':
+        return auth_set(obj, 'password_hash')
+    if verb == 'auth-set-username':
+        return auth_set(obj, 'username')
+    raise Reject('unknown verb')
+
+
+def _read_stdin():
+    chunks = []
+    total = 0
+    while total <= MAX_INPUT:
+        chunk = os.read(0, min(65536, MAX_INPUT + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b''.join(chunks)
+
+
+def main(argv):
+    os.umask(0o077)
+    verb = argv[1] if len(argv) == 2 and argv[1] in VERBS else None
+    uid = _caller_uid()
+    reason = 'ok'
+    try:
+        if os.geteuid() != 0:
+            raise Reject('must run as root (through sudo)')
+        if len(argv) != 2 or argv[1] not in VERBS:
+            raise Reject('usage: irongate-webwrite <verb>')
+        raw = _read_stdin()
+        if len(raw) > MAX_INPUT:
+            raise Reject('request is too large')
+        obj = parse_request(raw)
+        lock = take_lock()
+        try:
+            code, body, reason = dispatch(argv[1], obj)
+        finally:
+            os.close(lock)
+    except Reject as exc:
+        code, body, reason = 2, _answer(False, 'refused: %s' % exc, False), 'refused'
+    except Failure as exc:
+        code, body, reason = exc.code, _answer(False, exc.error, False), 'failed'
+    except Exception as exc:  # never a traceback to the caller
+        code, body, reason = 1, _answer(False, 'internal error (%s)' % type(exc).__name__, False), 'internal error'
+    _audit(verb if len(argv) == 2 else None, uid, code, reason)
+    print(json.dumps(body))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+IRONGATE_WEBWRITE
+chown root:root "$IG_WEBWRITE_NEW"
+chmod 755 "$IG_WEBWRITE_NEW"
+if [ ! -f /usr/local/sbin/irongate-webwrite ] || ! cmp -s "$IG_WEBWRITE_NEW" /usr/local/sbin/irongate-webwrite; then
+    mv -f "$IG_WEBWRITE_NEW" /usr/local/sbin/irongate-webwrite
+else
+    rm -f "$IG_WEBWRITE_NEW"
+fi
+# ---- web root helper: end ----
+
 mkdir -p /var/lib/irongate
 chown root:root /var/lib/irongate
 chmod 755 /var/lib/irongate
 install -d -o root -g www-data -m 0770 /var/lib/irongate/dnsmasq-staged
+
+# Login lockout counters (web/login.php): www-data owns this directory and file, so auth.json can stay
+# root:www-data 0640. Created only when absent; an existing directory or file is left exactly as it is.
+# ---- web lockout state: begin ----
+if [ ! -d /var/lib/irongate/lockout ]; then
+    install -d -o www-data -g www-data -m 0700 /var/lib/irongate/lockout
+fi
+if [ ! -e /var/lib/irongate/lockout/lockout.json ] && [ ! -L /var/lib/irongate/lockout/lockout.json ]; then
+    ( umask 077; printf '%s\n' '{"version":1,"failed_attempts":0,"first_failed_at":0,"locked_until":0}' > /var/lib/irongate/lockout/lockout.json )
+    chown www-data:www-data /var/lib/irongate/lockout/lockout.json
+    chmod 0600 /var/lib/irongate/lockout/lockout.json
+fi
+# ---- web lockout state: end ----
 
 # sudo ignores every file of /etc/sudoers.d whose name contains a dot, and a sudoers file with a syntax error
 # makes sudo refuse to work at all: the drop-in is written under a dotted name, checked there with visudo and only
@@ -6763,6 +7796,9 @@ www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
 www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block irongate-updater-now.service
 www-data ALL=(ALL) NOPASSWD: /usr/bin/touch /var/log/irongate-update.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chown www-data /var/log/irongate-update.log
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite config-apply
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-credentials
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-username
 EOF
 chown root:root "$IG_SUDOERS_WEB_NEW"
 chmod 440 "$IG_SUDOERS_WEB_NEW"

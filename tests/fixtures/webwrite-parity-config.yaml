@@ -1,0 +1,56 @@
+# Irongate Configuration
+# Generated: X
+
+network:
+  interface: "eth0"
+  local_ip: "192.168.1.50"
+  local_mac: "aa:bb:cc:dd:ee:ff"
+  gateway_ip: "192.168.1.1"
+  gateway_mac: "11:22:33:44:55:66"
+
+mode: "dual"
+
+bridge:
+  enabled: true
+  isolated_interface: "eth1"
+  bridge_name: "br-irongate"
+  bridge_ip: "10.99.0.1"
+  bridge_netmask: "255.255.0.0"
+  dhcp_start: "10.99.1.1"
+  dhcp_end: "10.99.255.254"
+  port_isolation: true
+
+layers:
+  arp_defense: true
+  ipv6_ra: true
+  gateway_takeover: true
+  bypass_detection: true
+  firewall: true
+
+# Layer 8: Midnight Blockchain Verification
+blockchain:
+  enabled: true
+  network: "preprod"
+  contract_address: "0xabababababababababababababababababababababababababababababababab"
+  indexer_url: "https://indexer.preprod.midnight.network/api/v4/graphql"
+  cache_ttl: 60
+  fallback_allow: true
+  audit_logging: false
+  allow_rogue_devices: false
+
+# Custom Device Groups
+custom_groups:
+  - name: "cams"
+    color: "#6c757d"
+    icon: "📁"
+    description: "front cameras"
+    lan_access: "selected"
+    can_access_groups: ["servers", "trusted"]
+
+devices:
+  - mac: "aa:bb:cc:dd:ee:01"
+    ip: "192.168.1.10"
+    zone: "cams"
+  - mac: "aa:bb:cc:dd:ee:02"
+    ip: ""
+    zone: "isolated"

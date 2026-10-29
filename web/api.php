@@ -50,6 +50,20 @@ $db = new SQLite3('/var/www/irongate/dhcp.db');
 $db->busyTimeout(5000);
 $action = $_GET['action'] ?? '';
 
+// CSRF gate (operator ruling): every action that changes the configuration, the credentials or the access
+// list needs this session's X-CSRF-Token. The gate is skipped only by irongate_csrf_not_required() - the one
+// cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use. update_now keeps its own check below.
+$IRONGATE_CSRF_ACTIONS = ['settings', 'irongate_settings', 'irongate_toggle', 'irongate_apply', 'device_groups',
+                          'irongate_devices', 'change_password', 'change_username', 'update_access_list',
+                          'toggle_access_list'];
+// These three also serve a read-only GET; only their writes need the token. Every other listed action changes
+// state on any method and is gated unconditionally.
+$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices'];
+if (in_array($action, $IRONGATE_CSRF_ACTIONS, true)
+    && !($_SERVER['REQUEST_METHOD'] === 'GET' && in_array($action, $IRONGATE_CSRF_READ_ACTIONS, true))) {
+    irongate_require_csrf();
+}
+
 // Helper functions
 function getSetting($db, $key) {
     $stmt = $db->prepare('SELECT value FROM settings WHERE key = ?');
@@ -92,6 +106,28 @@ function safeApplyConfig($db) {
     }
     ob_end_clean();
     return $result;
+}
+
+// Hand a request to the root helper (the only writer of config.yaml and auth.json). The verb is one of the
+// three the installer's sudoers rule allows; the payload is JSON on stdin, never a path or an argument.
+function irongateWriteViaHelper($verb, array $payload) {
+    $spec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = @proc_open(['sudo', '-n', '/usr/local/sbin/irongate-webwrite', $verb], $spec, $pipes);
+    if (!is_resource($proc)) {
+        return ['success' => false, 'error' => 'helper unavailable'];
+    }
+    @fwrite($pipes[0], json_encode($payload));
+    @fclose($pipes[0]);
+    $out = (string)stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $rc = proc_close($proc);
+    $body = json_decode(trim($out), true);
+    if ($rc !== 0 || !is_array($body) || ($body['success'] ?? false) !== true) {
+        return ['success' => false, 'error' => is_array($body) && is_string($body['error'] ?? null)
+            ? $body['error'] : 'helper failed'];
+    }
+    return ['success' => true, 'changed' => (bool)($body['changed'] ?? false)];
 }
 
 // irongate-audit (V1): zone/group names and device IPs are interpolated into an
@@ -1488,12 +1524,23 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'New passwords do not match']);
             break;
         }
-        $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
-        $auth['updated_at'] = date('c');
-        if (@file_put_contents('/etc/irongate/auth.json',
-                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
-            break;
+        if (irongate_test_sandbox()) {
+            // PHP suites (built-in server + IRONGATE_TEST_SANDBOX=1): the old direct write. Dead under php-fpm.
+            $auth['password_hash'] = password_hash($new, PASSWORD_BCRYPT);
+            $auth['updated_at'] = date('c');
+            if (@file_put_contents('/etc/irongate/auth.json',
+                    json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
+        } else {
+            // Only the new hash reaches the root helper; the plaintext never leaves this process.
+            $result = irongateWriteViaHelper('auth-set-credentials',
+                ['password_hash' => password_hash($new, PASSWORD_BCRYPT)]);
+            if (!$result['success']) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
         }
         echo json_encode(['success' => true, 'message' => 'Password changed']);
         break;
@@ -1515,12 +1562,21 @@ switch ($action) {
             echo json_encode(['success' => false, 'error' => 'Username must be 1-32 characters: letters, digits, dot, dash, underscore']);
             break;
         }
-        $auth['username'] = $newUser;
-        $auth['updated_at'] = date('c');
-        if (@file_put_contents('/etc/irongate/auth.json',
-                json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
-            echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
-            break;
+        if (irongate_test_sandbox()) {
+            // PHP suites (built-in server + IRONGATE_TEST_SANDBOX=1): the old direct write. Dead under php-fpm.
+            $auth['username'] = $newUser;
+            $auth['updated_at'] = date('c');
+            if (@file_put_contents('/etc/irongate/auth.json',
+                    json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) === false) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
+        } else {
+            $result = irongateWriteViaHelper('auth-set-username', ['username' => $newUser]);
+            if (!$result['success']) {
+                echo json_encode(['success' => false, 'error' => 'Failed to write auth config']);
+                break;
+            }
         }
         $_SESSION['username'] = $newUser;
         echo json_encode(['success' => true, 'message' => 'Username changed']);
@@ -1636,7 +1692,88 @@ function applyIrongateConfig($db) {
         $gatewayMac = trim(shell_exec("ip neigh show | grep " . escapeshellarg($gateway . ' ') . " | awk '{print \$5}' | head -n1"));
     }
     
-    // Generate YAML config
+    // The same values, as data, for the root helper (it validates and renders them; the web tier never
+    // supplies YAML text). irongateWriteViaHelper() runs only outside the PHP-suites' cli-server seam.
+    $groupResults = $db->query('SELECT * FROM device_groups ORDER BY name');
+    $customGroups = [];
+    while ($row = $groupResults->fetchArray(SQLITE3_ASSOC)) {
+        $customGroups[] = $row;
+    }
+    $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
+    $devices = [];
+    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+        $devices[] = $row;
+    }
+
+    $blockchainNetwork = $settings['blockchain_network'] ?? 'preprod';
+    if (!in_array($blockchainNetwork, ['preprod', 'preview', 'mainnet', 'undeployed'], true)) {
+        $blockchainNetwork = 'preprod';
+    }
+    $contract = $settings['blockchain_contract_address'] ?? '';
+    $contract = (!empty($contract) && $contract !== 'null') ? $contract : null;
+    $indexer = $settings['blockchain_indexer_url'] ?? '';
+    $indexer = (!empty($indexer) && $indexer !== 'null') ? $indexer : null;
+
+    $payload = ['settings' => [
+        'network' => [
+            'interface' => $interface,
+            'local_ip' => $localIp,
+            'local_mac' => $localMac,
+            'gateway_ip' => $gateway,
+            'gateway_mac' => $gatewayMac,
+        ],
+        'mode' => $mode,
+        'layers' => [
+            'arp_defense' => (($settings['irongate_arp_defense'] ?? 'true') === 'true'),
+            'ipv6_ra' => (($settings['irongate_ipv6_ra'] ?? 'true') === 'true'),
+            'gateway_takeover' => (($settings['irongate_gateway_takeover'] ?? 'true') === 'true'),
+            'bypass_detection' => (($settings['irongate_bypass_detection'] ?? 'true') === 'true'),
+            'firewall' => (($settings['irongate_firewall'] ?? 'true') === 'true'),
+        ],
+        'blockchain' => [
+            'enabled' => (($settings['blockchain_enabled'] ?? 'false') === 'true'),
+            'network' => $blockchainNetwork,
+            'contract_address' => $contract,
+            'indexer_url' => $indexer,
+            'cache_ttl' => intval($settings['blockchain_cache_ttl'] ?? 60),
+            'fallback_allow' => (($settings['blockchain_fallback_allow'] ?? 'true') === 'true'),
+            'audit_logging' => (($settings['blockchain_audit_logging'] ?? 'false') === 'true'),
+            'allow_rogue_devices' => (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true'),
+        ],
+        'custom_groups' => array_map(function($group) {
+            return [
+                'name' => (string)$group['name'],
+                'color' => (string)($group['color'] ?? ''),
+                'icon' => (string)($group['icon'] ?? ''),
+                'description' => (string)($group['description'] ?? ''),
+                'lan_access' => (string)($group['lan_access'] ?? 'none'),
+                'can_access_groups' => json_decode($group['can_access_groups'] ?? '[]', true) ?: [],
+            ];
+        }, $customGroups),
+        'devices' => array_map(function($dev) {
+            return [
+                'mac' => (string)$dev['mac'],
+                'ip' => (string)($dev['ip'] ?? ''),
+                'zone' => (string)($dev['zone'] ?? ''),
+            ];
+        }, $devices),
+    ]];
+    if ($mode === 'dual') {
+        $payload['settings']['bridge'] = [
+            'enabled' => true,
+            'isolated_interface' => (string)($settings['irongate_isolated_interface'] ?? ''),
+            'bridge_name' => 'br-irongate',
+            'bridge_ip' => (string)($settings['irongate_bridge_ip'] ?? '10.99.0.1'),
+            'bridge_netmask' => '255.255.0.0',
+            'dhcp_start' => (string)($settings['irongate_bridge_dhcp_start'] ?? '10.99.1.1'),
+            'dhcp_end' => (string)($settings['irongate_bridge_dhcp_end'] ?? '10.99.255.254'),
+            'port_isolation' => true,
+        ];
+    }
+
+    if (irongate_test_sandbox()) {
+    // The PHP suites drive api.php under the built-in server (IRONGATE_TEST_SANDBOX=1): keep their old
+    // direct write so they stay green. Dead under php-fpm - there the helper above is always used.
     $config = "# Irongate Configuration\n";
     $config .= "# Generated: " . date('Y-m-d H:i:s') . "\n\n";
     $config .= "network:\n";
@@ -1698,13 +1835,6 @@ function applyIrongateConfig($db) {
     $config .= "  audit_logging: " . (($settings['blockchain_audit_logging'] ?? 'false') === 'true' ? 'true' : 'false') . "\n";
     $config .= "  allow_rogue_devices: " . (($settings['blockchain_allow_rogue_devices'] ?? 'false') === 'true' ? 'true' : 'false') . "\n\n";
     
-    // Get custom device groups from database
-    $groupResults = $db->query('SELECT * FROM device_groups ORDER BY name');
-    $customGroups = [];
-    while ($row = $groupResults->fetchArray(SQLITE3_ASSOC)) {
-        $customGroups[] = $row;
-    }
-
     $config .= "# Custom Device Groups\n";
     $config .= "custom_groups:\n";
     if (!empty($customGroups)) {
@@ -1722,13 +1852,6 @@ function applyIrongateConfig($db) {
     }
     $config .= "\n";
 
-    // Get protected devices from database
-    $results = $db->query('SELECT mac, ip, zone FROM irongate_devices');
-    $devices = [];
-    while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
-        $devices[] = $row;
-    }
-
     $config .= "devices:\n";
     if (!empty($devices)) {
         foreach ($devices as $dev) {
@@ -1740,25 +1863,28 @@ function applyIrongateConfig($db) {
         $config .= "  []\n";
     }
 
-    // Write config
-    @mkdir('/etc/irongate', 0775, true);
+    // Write config. The directory is created 0750 only when absent and never chmodded/chowned afterwards:
+    // outside this seam the installer creates it and the root helper does the writing.
+    @mkdir('/etc/irongate', 0750, true);
     $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
     if ($writeResult === false) {
-        // Try to fix permissions and retry
-        @chmod('/etc/irongate', 0775);
-        @chown('/etc/irongate', 'root');
-        @chgrp('/etc/irongate', 'www-data');
-        $writeResult = @file_put_contents('/etc/irongate/config.yaml', $config);
-        if ($writeResult === false) {
-            return [
-                'success' => false,
-                'error' => 'Failed to write config file - check /etc/irongate permissions'
-            ];
-        }
+        return [
+            'success' => false,
+            'error' => 'Failed to write config file - check /etc/irongate permissions'
+        ];
     }
-    
-    // Restart service in background - don't wait for it
-    exec('sudo systemctl restart irongate >/dev/null 2>&1 &');
-    
+
+    return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
+    }
+
+    // Root helper: it writes atomically and restarts irongate only when the bytes changed.
+    $result = irongateWriteViaHelper('config-apply', $payload);
+    if (!$result['success']) {
+        return [
+            'success' => false,
+            'error' => 'Failed to write config file - check /etc/irongate permissions'
+        ];
+    }
+
     return ['success' => true, 'message' => 'Irongate configuration applied', 'mode' => $mode];
 }
