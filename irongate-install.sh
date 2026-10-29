@@ -711,15 +711,18 @@ $db = new SQLite3('/var/www/irongate/dhcp.db');
 $db->busyTimeout(5000);
 $action = $_GET['action'] ?? '';
 
-// CSRF gate (operator ruling): every action that changes the configuration, the credentials or the access
-// list needs this session's X-CSRF-Token. The gate is skipped only by irongate_csrf_not_required() - the one
-// cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use. update_now keeps its own check below.
+// CSRF gate (operator ruling): every action that changes the configuration, the credentials, the access list,
+// the DHCP service or the update settings needs this session's X-CSRF-Token, on any method. The gate is skipped
+// only by irongate_csrf_not_required() - the one cli-server + IRONGATE_TEST_SANDBOX=1 seam the PHP suites use.
+// update_now keeps its own check below.
 $IRONGATE_CSRF_ACTIONS = ['settings', 'irongate_settings', 'irongate_toggle', 'irongate_apply', 'device_groups',
                           'irongate_devices', 'change_password', 'change_username', 'update_access_list',
-                          'toggle_access_list'];
-// These three also serve a read-only GET; only their writes need the token. Every other listed action changes
-// state on any method and is gated unconditionally.
-$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices'];
+                          'toggle_access_list', 'apply', 'reservations', 'start', 'stop', 'restart', 'repair',
+                          'validate', 'update_check', 'update_settings'];
+// These five also serve a read-only GET; only their writes need the token. Every other listed action runs on any
+// method (apply, validate, update_check, start, stop, restart, repair) and is gated unconditionally, GET included.
+$IRONGATE_CSRF_READ_ACTIONS = ['settings', 'device_groups', 'irongate_devices', 'reservations',
+                               'update_settings'];
 if (in_array($action, $IRONGATE_CSRF_ACTIONS, true)
     && !($_SERVER['REQUEST_METHOD'] === 'GET' && in_array($action, $IRONGATE_CSRF_READ_ACTIONS, true))) {
     irongate_require_csrf();
@@ -7708,10 +7711,25 @@ IG_PERM_FIX_PY
 # ---- web-tree permission helper: end ----
 echo -e "${YELLOW}Setting permissions...${NC}"
 
-# dhcp.db: written by the web API (www-data) and by root's sqlite3 (installer, updater), nothing else
-# reads it, so 0664 is enough; it was 0666, i.e. writable by every local user.
-ig_perm_fix tree /var/www/irongate www-data www-data 755
+# Web tier ownership: the code is root's, the runtime data stays www-data's. php-fpm runs as www-data, so if the
+# PHP it executes were www-data's too, one bad request could rewrite the code that the next request (and root's
+# updater) runs. The tree pass is therefore root:www-data and the five code files are pinned 0644 - readable by
+# php-fpm, writable by nobody but root. dhcp.db keeps 0664: the web API writes it, root's sqlite3
+# (installer, updater) writes it, nothing else reads it; it was 0666, i.e. writable by every local user.
+# ig_perm_fix has only `tree` and `file`, and `file` refuses a directory (see the helper above), so the directory
+# itself is set with a direct chown/chmod: safe because /var/www is root-owned 0755, so www-data cannot rename or
+# replace /var/www/irongate. 1775 keeps the SQLite rollback journal creatable in that directory (api.php opens the
+# db there) while the sticky bit stops www-data renaming or deleting the root-owned code.
+ig_perm_fix tree /var/www/irongate root www-data 755
+chown root:www-data /var/www/irongate && chmod 1775 /var/www/irongate
 ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data 664
+for IGWEB in api.php index.php session_check.php login.php logout.php; do
+    if [ -f "/var/www/irongate/$IGWEB" ]; then
+        ig_perm_fix file "/var/www/irongate/$IGWEB" root www-data 644
+    else
+        echo -e "${YELLOW}  ! /var/www/irongate/$IGWEB is missing - nothing to pin${NC}"
+    fi
+done
 
 # Allow www-data to write dnsmasq config
 chown www-data:www-data /etc/dnsmasq.conf
