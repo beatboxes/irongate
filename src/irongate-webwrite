@@ -1,0 +1,766 @@
+#!/usr/bin/python3 -I
+"""irongate-webwrite - the only program that writes /etc/irongate/config.yaml and /etc/irongate/auth.json.
+
+Why this exists. The web tier (www-data) used to write both files itself, so it owned them or had to widen
+/etc/irongate every time a save failed. Those files are read by the root engine and by nothing else that needs
+write access, so the web tier now hands this program a REQUEST as data and runs it through sudo:
+
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite config-apply
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-credentials
+    www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-username
+
+The program accepts exactly one verb and no other argument, reads a JSON object on stdin (ASCII, at most 64 KiB,
+no duplicate keys, at most four levels of nesting), checks every value against the shape the dashboard and the
+engine use, renders the YAML itself (the web tier never supplies YAML text) and replaces the file atomically as
+root:www-data 0640. It never widens or re-owns /etc/irongate.
+
+For config-apply the rendered bytes are compared with the file that is already there (the `# Generated:` line
+ignored); when nothing changed it writes nothing and does not restart irongate.
+
+Output: one JSON object on stdout, {"success": bool, "error": str, "changed": bool}.
+Exit status: 0 applied/unchanged, 2 request refused, 3 write failed, 4 service restart failed, 1 internal error.
+"""
+
+import datetime
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+
+try:
+    import syslog
+except ImportError:  # pragma: no cover
+    syslog = None
+
+# ---- paths (the tests import this file and may point these at a scratch tree) ----
+CONFIG_PATH = '/etc/irongate/config.yaml'
+AUTH_PATH = '/etc/irongate/auth.json'
+LOCK_PATH = '/run/irongate-webwrite.lock'
+SYSTEMCTL_BIN = ('/usr/bin/systemctl', '/bin/systemctl')
+WEB_GID = 33
+MAX_INPUT = 65536
+MAX_STRING = 253
+SERVICE_TIMEOUT = 20
+
+VERBS = ('config-apply', 'auth-set-credentials', 'auth-set-username')
+
+# The Midnight presets and their indexer URLs (mirror web/api.php midnightNetworks() and src/blockchain.py
+# NETWORKS). Only these hosts may appear in a custom blockchain.indexer_url; the chosen network's own preset
+# (byte for byte, including the loopback 'undeployed' one) is always accepted.
+NETWORK_PRESETS = {
+    'preprod': 'https://indexer.preprod.midnight.network/api/v4/graphql',
+    'preview': 'https://indexer.preview.midnight.network/api/v4/graphql',
+    'mainnet': 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+    'undeployed': 'http://127.0.0.1:8088/api/v4/graphql',
+}
+NETWORKS = tuple(NETWORK_PRESETS)
+INDEXER_HOSTS = frozenset((
+    'indexer.preprod.midnight.network',
+    'indexer.preview.midnight.network',
+    'indexer.mainnet.midnight.network',
+))
+
+# Engine/dashboard shapes (mirror src/irongate.py _valid_iface/_valid_zone_name and src/dnsmasq-apply _MAC_RE).
+IFACE_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}')
+ZONE_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,31}')
+MAC_RE = re.compile(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
+CONTRACT_RE = re.compile(r'0x[0-9A-Fa-f]{64}')
+HASH_RE = re.compile(r'\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}')
+USERNAME_RE = re.compile(r'[A-Za-z0-9._-]{1,32}')
+
+# ---- the exact key sets of a config-apply request ----
+NETWORK_KEYS = ('interface', 'local_ip', 'local_mac', 'gateway_ip', 'gateway_mac')
+BRIDGE_KEYS = ('enabled', 'isolated_interface', 'bridge_name', 'bridge_ip', 'bridge_netmask',
+               'dhcp_start', 'dhcp_end', 'port_isolation')
+LAYER_KEYS = ('arp_defense', 'ipv6_ra', 'gateway_takeover', 'bypass_detection', 'firewall')
+BLOCKCHAIN_KEYS = ('enabled', 'network', 'contract_address', 'indexer_url', 'cache_ttl',
+                   'fallback_allow', 'audit_logging', 'allow_rogue_devices')
+GROUP_KEYS = ('name', 'color', 'icon', 'description', 'lan_access', 'can_access_groups')
+DEVICE_KEYS = ('mac', 'ip', 'zone')
+SETTINGS_BASE_KEYS = ('network', 'mode', 'layers', 'blockchain', 'custom_groups', 'devices')
+
+
+class Reject(Exception):
+    """The request is not acceptable; nothing is written (exit 2)."""
+
+
+class Failure(Exception):
+    """A step that is not the request's fault failed. code is the exit status."""
+
+    def __init__(self, error, code):
+        Exception.__init__(self, error)
+        self.error = error
+        self.code = code
+
+
+# ============================================================ parsing ============================================================
+
+def _no_dupes(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise Reject('duplicate key in request')
+        out[key] = value
+    return out
+
+
+def _bad_constant(_name):
+    raise Reject('non-finite number in request')
+
+
+def _check_depth(node, depth):
+    """A container deeper than four levels below the request object is refused (the deepest legitimate one is
+    custom_groups[].can_access_groups)."""
+    if isinstance(node, dict) or isinstance(node, list):
+        if depth > 4:
+            raise Reject('request is nested too deeply')
+        values = node.values() if isinstance(node, dict) else node
+        for value in values:
+            _check_depth(value, depth + 1)
+
+
+def parse_request(raw):
+    """bytes -> dict. Raises Reject."""
+    if len(raw) > MAX_INPUT:
+        raise Reject('request is too large')
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        raise Reject('request is not ASCII')
+    try:
+        obj = json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
+        raise Reject('request is not valid JSON')
+    if not isinstance(obj, dict):
+        raise Reject('request is not an object')
+    _check_depth(obj, 0)
+    return obj
+
+
+def _exact_keys(obj, keys, what):
+    if not isinstance(obj, dict):
+        raise Reject('%s is not an object' % what)
+    if set(obj) != set(keys):
+        raise Reject('%s has an unknown or missing key' % what)
+
+
+# ============================================================ value shapes ============================================================
+
+def _printable(value):
+    """True when the string has no control or line-separator character. The raw request is ASCII (PHP's
+    json_encode() escapes everything else); a decoded value may still carry printable Unicode, as a group
+    icon does, and it is rendered exactly as the PHP generator rendered it."""
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or 0x7f <= code <= 0x9f or 0xd800 <= code <= 0xdfff or code in (0x2028, 0x2029):
+            return False
+    return True
+
+
+def _string(value, field, allow_empty=True):
+    if not isinstance(value, str) or len(value) > MAX_STRING or not _printable(value):
+        raise Reject('invalid %s' % field)
+    if not allow_empty and value == '':
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _iface(value, field):
+    """An empty string or a kernel interface name, as src/irongate.py _valid_iface() and web/api.php:158-161."""
+    value = _string(value, field)
+    if value != '' and IFACE_RE.fullmatch(value) is None:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _ipv4(value, field, allow_empty=True):
+    if value == '':
+        if allow_empty:
+            return ''
+        raise Reject('invalid %s' % field)
+    if not isinstance(value, str):
+        raise Reject('invalid %s' % field)
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        raise Reject('invalid %s' % field)
+    if addr.version != 4 or str(addr) != value:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _mac(value, field, allow_empty):
+    if value == '' and allow_empty:
+        return ''
+    if not isinstance(value, str):
+        raise Reject('invalid %s' % field)
+    if MAC_RE.fullmatch(value) is None:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _bool(value, field):
+    if value is not True and value is not False:
+        raise Reject('invalid %s' % field)
+    return value
+
+
+def _indexer_url(value, network):
+    """None/'' means "use the network default". The chosen network's own preset URL is accepted byte for
+    byte (that is the loopback http preset for 'undeployed'); anything else must pass the same rule as
+    web/api.php validIndexerUrl() and src/blockchain.py validate_indexer_url()."""
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str) or len(value) > MAX_STRING:
+        raise Reject('invalid indexer_url')
+    if value == NETWORK_PRESETS[network]:
+        return value
+    if re.fullmatch(r'[\x21-\x7e]+', value) is None or '\\' in value:
+        raise Reject('invalid indexer_url')
+    # urlsplit() lower-cases the scheme; PHP's parse_url() does not, and an all-upper-case
+    # scheme is not the "https" this file and the engine require.
+    if value.split(':', 1)[0] != 'https':
+        raise Reject('invalid indexer_url')
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError:
+        raise Reject('invalid indexer_url')
+    if parts.scheme != 'https' or '@' in parts.netloc or port not in (None, 443):
+        raise Reject('invalid indexer_url')
+    if (parts.hostname or '').lower() not in INDEXER_HOSTS:
+        raise Reject('invalid indexer_url')
+    return value
+
+
+def _contract_address(value):
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str) or len(value) > 66 or CONTRACT_RE.fullmatch(value) is None:
+        raise Reject('invalid contract_address')
+    return value
+
+
+def normalize_settings(settings):
+    """Strict, canonical form of the settings the dashboard's generator writes. Raises Reject."""
+    if not isinstance(settings, dict):
+        raise Reject('settings is not an object')
+    for key in settings:
+        if key not in SETTINGS_BASE_KEYS and key != 'bridge':
+            raise Reject('unknown settings key')
+    mode = settings.get('mode')
+    if mode not in ('single', 'dual'):
+        raise Reject('invalid mode')
+    required = set(SETTINGS_BASE_KEYS) | ({'bridge'} if mode == 'dual' else set())
+    if set(settings) != required:
+        raise Reject('settings has an unknown or missing key')
+
+    network_in = settings['network']
+    _exact_keys(network_in, NETWORK_KEYS, 'network')
+    iface = _string(network_in['interface'], 'interface')
+    if iface != '' and IFACE_RE.fullmatch(iface) is None:
+        raise Reject('invalid interface')
+    network = {
+        'interface': iface,
+        'local_ip': _ipv4(network_in['local_ip'], 'local_ip'),
+        'local_mac': _mac(network_in['local_mac'], 'local_mac', True),
+        'gateway_ip': _ipv4(network_in['gateway_ip'], 'gateway_ip'),
+        'gateway_mac': _mac(network_in['gateway_mac'], 'gateway_mac', True),
+    }
+
+    out = {'network': network, 'mode': mode}
+
+    if mode == 'dual':
+        bridge_in = settings['bridge']
+        _exact_keys(bridge_in, BRIDGE_KEYS, 'bridge')
+        bridge_name = _string(bridge_in['bridge_name'], 'bridge_name', allow_empty=False)
+        if IFACE_RE.fullmatch(bridge_name) is None:
+            raise Reject('invalid bridge_name')
+        bridge = {
+            'enabled': _bool(bridge_in['enabled'], 'bridge.enabled'),
+            'isolated_interface': _iface(bridge_in['isolated_interface'], 'isolated_interface'),
+            'bridge_name': bridge_name,
+            'bridge_ip': _ipv4(bridge_in['bridge_ip'], 'bridge_ip'),
+            'bridge_netmask': _ipv4(bridge_in['bridge_netmask'], 'bridge_netmask', allow_empty=False),
+            'dhcp_start': _ipv4(bridge_in['dhcp_start'], 'dhcp_start'),
+            'dhcp_end': _ipv4(bridge_in['dhcp_end'], 'dhcp_end'),
+            'port_isolation': _bool(bridge_in['port_isolation'], 'bridge.port_isolation'),
+        }
+        # The generator writes these two as constants; anything else would not be the same file.
+        if bridge['enabled'] is not True or bridge['port_isolation'] is not True:
+            raise Reject('invalid bridge enabled/port_isolation')
+        out['bridge'] = bridge
+
+    layers_in = settings['layers']
+    _exact_keys(layers_in, LAYER_KEYS, 'layers')
+    out['layers'] = dict((key, _bool(layers_in[key], 'layers.' + key)) for key in LAYER_KEYS)
+
+    blockchain_in = settings['blockchain']
+    _exact_keys(blockchain_in, BLOCKCHAIN_KEYS, 'blockchain')
+    network_name = blockchain_in['network']
+    if network_name not in NETWORKS:
+        raise Reject('unknown blockchain network')
+    cache_ttl = blockchain_in['cache_ttl']
+    if isinstance(cache_ttl, bool) or not isinstance(cache_ttl, int) or cache_ttl < 0 or cache_ttl > 2147483647:
+        raise Reject('invalid cache_ttl')
+    out['blockchain'] = {
+        'enabled': _bool(blockchain_in['enabled'], 'blockchain.enabled'),
+        'network': network_name,
+        'contract_address': _contract_address(blockchain_in['contract_address']),
+        'indexer_url': _indexer_url(blockchain_in['indexer_url'], network_name),
+        'cache_ttl': cache_ttl,
+        'fallback_allow': _bool(blockchain_in['fallback_allow'], 'blockchain.fallback_allow'),
+        'audit_logging': _bool(blockchain_in['audit_logging'], 'blockchain.audit_logging'),
+        'allow_rogue_devices': _bool(blockchain_in['allow_rogue_devices'], 'blockchain.allow_rogue_devices'),
+    }
+
+    groups_in = settings['custom_groups']
+    if not isinstance(groups_in, list):
+        raise Reject('custom_groups is not a list')
+    groups = []
+    for number, item in enumerate(groups_in, 1):
+        _exact_keys(item, GROUP_KEYS, 'custom group %d' % number)
+        name = item['name']
+        if not isinstance(name, str) or ZONE_RE.fullmatch(name) is None:
+            raise Reject('invalid custom group %d name' % number)
+        access = item['can_access_groups']
+        if not isinstance(access, list):
+            raise Reject('invalid custom group %d can_access_groups' % number)
+        checked_access = []
+        for entry in access:
+            if not isinstance(entry, str) or ZONE_RE.fullmatch(entry) is None:
+                raise Reject('invalid custom group %d can_access_groups' % number)
+            checked_access.append(entry)
+        groups.append({
+            'name': name,
+            'color': _string(item['color'], 'custom group color'),
+            'icon': _string(item['icon'], 'custom group icon'),
+            'description': _string(item['description'], 'custom group description'),
+            'lan_access': _string(item['lan_access'], 'custom group lan_access'),
+            'can_access_groups': checked_access,
+        })
+    out['custom_groups'] = groups
+
+    devices_in = settings['devices']
+    if not isinstance(devices_in, list):
+        raise Reject('devices is not a list')
+    devices = []
+    for number, item in enumerate(devices_in, 1):
+        _exact_keys(item, DEVICE_KEYS, 'device %d' % number)
+        mac = item['mac']
+        if not isinstance(mac, str) or MAC_RE.fullmatch(mac) is None:
+            raise Reject('invalid device %d mac' % number)
+        zone = item['zone']
+        if not isinstance(zone, str) or ZONE_RE.fullmatch(zone) is None:
+            raise Reject('invalid device %d zone' % number)
+        devices.append({
+            'mac': mac,
+            'ip': _ipv4(item['ip'], 'device %d ip' % number),
+            'zone': zone,
+        })
+    out['devices'] = devices
+    return out
+
+
+# ============================================================ rendering (byte-for-byte the PHP generator) ============================================================
+
+def _scalar(value):
+    """PHP yamlScalar(): json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE). PHP still escapes
+    U+2028/U+2029 even with that flag, so they are escaped here too."""
+    return (json.dumps(value, ensure_ascii=False)
+            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+
+
+def render_config(settings, now=None):
+    """The same bytes web/api.php applyIrongateConfig() wrote, for the same settings."""
+    stamp = now if now is not None else time.strftime('%Y-%m-%d %H:%M:%S')
+    network = settings['network']
+    out = '# Irongate Configuration\n'
+    out += '# Generated: ' + stamp + '\n\n'
+    out += 'network:\n'
+    out += '  interface: ' + _scalar(network['interface']) + '\n'
+    out += '  local_ip: ' + _scalar(network['local_ip']) + '\n'
+    out += '  local_mac: ' + _scalar(network['local_mac']) + '\n'
+    out += '  gateway_ip: ' + _scalar(network['gateway_ip']) + '\n'
+    out += '  gateway_mac: ' + _scalar(network['gateway_mac']) + '\n\n'
+    out += 'mode: ' + _scalar(settings['mode']) + '\n\n'
+
+    bridge = settings.get('bridge')
+    if bridge is not None:
+        out += 'bridge:\n'
+        out += '  enabled: true\n'
+        out += '  isolated_interface: ' + _scalar(bridge['isolated_interface']) + '\n'
+        out += '  bridge_name: ' + _scalar(bridge['bridge_name']) + '\n'
+        out += '  bridge_ip: ' + _scalar(bridge['bridge_ip']) + '\n'
+        out += '  bridge_netmask: ' + _scalar(bridge['bridge_netmask']) + '\n'
+        out += '  dhcp_start: ' + _scalar(bridge['dhcp_start']) + '\n'
+        out += '  dhcp_end: ' + _scalar(bridge['dhcp_end']) + '\n'
+        out += '  port_isolation: true\n\n'
+
+    layers = settings['layers']
+    out += 'layers:\n'
+    for key in LAYER_KEYS:
+        out += '  %s: %s\n' % (key, 'true' if layers[key] else 'false')
+    out += '\n'
+
+    blockchain = settings['blockchain']
+    out += '# Layer 8: Midnight Blockchain Verification\n'
+    out += 'blockchain:\n'
+    out += '  enabled: %s\n' % ('true' if blockchain['enabled'] else 'false')
+    out += '  network: ' + _scalar(blockchain['network']) + '\n'
+    if blockchain['contract_address'] is not None:
+        out += '  contract_address: ' + _scalar(blockchain['contract_address']) + '\n'
+    else:
+        out += '  contract_address: null\n'
+    if blockchain['indexer_url'] is not None:
+        out += '  indexer_url: ' + _scalar(blockchain['indexer_url']) + '\n'
+    else:
+        out += '  indexer_url: null\n'
+    out += '  cache_ttl: %d\n' % blockchain['cache_ttl']
+    out += '  fallback_allow: %s\n' % ('true' if blockchain['fallback_allow'] else 'false')
+    out += '  audit_logging: %s\n' % ('true' if blockchain['audit_logging'] else 'false')
+    out += '  allow_rogue_devices: %s\n\n' % ('true' if blockchain['allow_rogue_devices'] else 'false')
+
+    groups = settings['custom_groups']
+    out += '# Custom Device Groups\n'
+    out += 'custom_groups:\n'
+    if groups:
+        for group in groups:
+            out += '  - name: ' + _scalar(group['name']) + '\n'
+            out += '    color: ' + _scalar(group['color']) + '\n'
+            out += '    icon: ' + _scalar(group['icon']) + '\n'
+            out += '    description: ' + _scalar(group['description']) + '\n'
+            out += '    lan_access: ' + _scalar(group['lan_access']) + '\n'
+            out += '    can_access_groups: [' + ', '.join(_scalar(g) for g in group['can_access_groups']) + ']\n'
+    else:
+        out += '  []\n'
+    out += '\n'
+
+    devices = settings['devices']
+    out += 'devices:\n'
+    if devices:
+        for device in devices:
+            out += '  - mac: ' + _scalar(device['mac']) + '\n'
+            out += '    ip: ' + _scalar(device['ip']) + '\n'
+            out += '    zone: ' + _scalar(device['zone']) + '\n'
+    else:
+        out += '  []\n'
+    return out
+
+
+def _normalize_generated(data):
+    lines = []
+    for line in data.splitlines(keepends=True):
+        if line.startswith(b'# Generated: '):
+            lines.append(b'# Generated: X\n')
+        else:
+            lines.append(line)
+    return b''.join(lines)
+
+
+# ============================================================ PHP-compatible auth.json ============================================================
+
+def _php_string(value):
+    """json_encode()'s string escaping without JSON_UNESCAPED_* (what the web tier used for auth.json)."""
+    pieces = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch == '"':
+            pieces.append('\\"')
+        elif ch == '\\':
+            pieces.append('\\\\')
+        elif ch == '/':
+            pieces.append('\\/')
+        elif ch == '\b':
+            pieces.append('\\b')
+        elif ch == '\f':
+            pieces.append('\\f')
+        elif ch == '\n':
+            pieces.append('\\n')
+        elif ch == '\r':
+            pieces.append('\\r')
+        elif ch == '\t':
+            pieces.append('\\t')
+        elif code < 0x20:
+            pieces.append('\\u%04x' % code)
+        elif code < 0x7f:
+            pieces.append(ch)
+        elif code <= 0xffff:
+            pieces.append('\\u%04x' % code)
+        else:
+            value2 = code - 0x10000
+            pieces.append('\\u%04x\\u%04x' % (0xd800 + (value2 >> 10), 0xdc00 + (value2 & 0x3ff)))
+    pieces.append('"')
+    return ''.join(pieces)
+
+
+def _php_pretty(value, level=1):
+    pad = '    ' * level
+    if isinstance(value, dict):
+        if not value:
+            return '{}'
+        items = [pad + _php_string(str(key)) + ': ' + _php_pretty(item, level + 1)
+                 for key, item in value.items()]
+        return '{\n' + ',\n'.join(items) + '\n' + '    ' * (level - 1) + '}'
+    if isinstance(value, list):
+        if not value:
+            return '[]'
+        items = [pad + _php_pretty(item, level + 1) for item in value]
+        return '[\n' + ',\n'.join(items) + '\n' + '    ' * (level - 1) + ']'
+    if value is True:
+        return 'true'
+    if value is False:
+        return 'false'
+    if value is None:
+        return 'null'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return _php_string(value)
+
+
+def encode_auth(auth):
+    """json_encode($auth, JSON_PRETTY_PRINT) . "\\n"."""
+    return (_php_pretty(auth) + '\n').encode('utf-8')
+
+
+# ============================================================ filesystem ============================================================
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(directory):
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def check_target(path, must_exist):
+    """Refuse a link or anything that is not a regular file. Return True when it exists."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        if must_exist:
+            raise Failure('target is missing', 3)
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise Reject('target is not a regular file')
+    return True
+
+
+def read_file(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    """temp `.NAME.new.PID` in the same directory -> fsync -> rename -> fsync(dir), root:www-data 0640."""
+    directory, name = os.path.split(path)
+    tmp = os.path.join(directory, '.%s.new.%d' % (name, os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchown(fd, 0, WEB_GID)
+        os.fchmod(fd, 0o640)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(tmp)
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp, path)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    _fsync_dir(directory)
+
+
+def take_lock():
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def restart_service():
+    exe = next((path for path in SYSTEMCTL_BIN if os.access(path, os.X_OK)), None)
+    if exe is None:
+        return 127
+    try:
+        proc = subprocess.run([exe, 'restart', 'irongate'], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=SERVICE_TIMEOUT, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+                                                            'LANG': 'C', 'LC_ALL': 'C'},
+                              close_fds=True)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+    return proc.returncode
+
+
+# ============================================================ audit ============================================================
+
+def _caller_uid():
+    value = os.environ.get('SUDO_UID')
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return os.getuid()
+
+
+def _audit(verb, uid, code, reason):
+    if syslog is None:
+        return
+    try:
+        syslog.openlog('irongate-webwrite', syslog.LOG_PID, syslog.LOG_AUTH)
+        syslog.syslog(syslog.LOG_NOTICE, 'verb=%s uid=%d rc=%d %s' % (verb or '-', uid, code, reason))
+    except Exception:  # logging must never decide the outcome
+        pass
+
+
+# ============================================================ verbs ============================================================
+
+def _answer(success, error, changed):
+    return {'success': bool(success), 'error': error, 'changed': bool(changed)}
+
+
+def config_apply(obj):
+    _exact_keys(obj, ('settings',), 'request')
+    settings = normalize_settings(obj['settings'])
+    rendered = render_config(settings).encode('utf-8')
+    exists = check_target(CONFIG_PATH, must_exist=False)
+    if exists:
+        try:
+            current = read_file(CONFIG_PATH)
+        except OSError:
+            raise Failure('target is unreadable', 3)
+        if _normalize_generated(current) == _normalize_generated(rendered):
+            return 0, _answer(True, '', False), 'unchanged, no reload'
+    try:
+        write_atomic(CONFIG_PATH, rendered)
+    except OSError:
+        raise Failure('write failed', 3)
+    rc = restart_service()
+    if rc != 0:
+        return 4, _answer(False, 'service restart failed', True), 'reload failed'
+    return 0, _answer(True, '', True), 'applied'
+
+
+def auth_set(obj, field):
+    _exact_keys(obj, (field,), 'request')
+    value = obj[field]
+    if field == 'password_hash':
+        if not isinstance(value, str) or HASH_RE.fullmatch(value) is None:
+            raise Reject('invalid password_hash')
+    else:
+        if not isinstance(value, str) or USERNAME_RE.fullmatch(value) is None:
+            raise Reject('invalid username')
+    check_target(AUTH_PATH, must_exist=True)
+    try:
+        auth = json.loads(read_file(AUTH_PATH).decode('utf-8'))
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise Failure('auth file is unreadable', 3)
+    if not isinstance(auth, dict):
+        raise Failure('auth file is unreadable', 3)
+    auth[field] = value
+    auth['updated_at'] = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+    data = encode_auth(auth)
+    try:
+        if read_file(AUTH_PATH) == data:
+            return 0, _answer(True, '', False), 'unchanged'
+        write_atomic(AUTH_PATH, data)
+    except OSError:
+        raise Failure('write failed', 3)
+    return 0, _answer(True, '', True), 'applied'
+
+
+def dispatch(verb, obj):
+    if verb == 'config-apply':
+        return config_apply(obj)
+    if verb == 'auth-set-credentials':
+        return auth_set(obj, 'password_hash')
+    if verb == 'auth-set-username':
+        return auth_set(obj, 'username')
+    raise Reject('unknown verb')
+
+
+def _read_stdin():
+    chunks = []
+    total = 0
+    while total <= MAX_INPUT:
+        chunk = os.read(0, min(65536, MAX_INPUT + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b''.join(chunks)
+
+
+def main(argv):
+    os.umask(0o077)
+    verb = argv[1] if len(argv) == 2 and argv[1] in VERBS else None
+    uid = _caller_uid()
+    reason = 'ok'
+    try:
+        if os.geteuid() != 0:
+            raise Reject('must run as root (through sudo)')
+        if len(argv) != 2 or argv[1] not in VERBS:
+            raise Reject('usage: irongate-webwrite <verb>')
+        raw = _read_stdin()
+        if len(raw) > MAX_INPUT:
+            raise Reject('request is too large')
+        obj = parse_request(raw)
+        lock = take_lock()
+        try:
+            code, body, reason = dispatch(argv[1], obj)
+        finally:
+            os.close(lock)
+    except Reject as exc:
+        code, body, reason = 2, _answer(False, 'refused: %s' % exc, False), 'refused'
+    except Failure as exc:
+        code, body, reason = exc.code, _answer(False, exc.error, False), 'failed'
+    except Exception as exc:  # never a traceback to the caller
+        code, body, reason = 1, _answer(False, 'internal error (%s)' % type(exc).__name__, False), 'internal error'
+    _audit(verb if len(argv) == 2 else None, uid, code, reason)
+    print(json.dumps(body))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

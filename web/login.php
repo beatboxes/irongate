@@ -8,6 +8,9 @@ session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, '
 session_start();
 
 $AUTH_FILE = '/etc/irongate/auth.json';
+// Login lockout counters: a www-data-owned state file, not auth.json (which is root:www-data 0640 and is
+// only READ on this path now). One GLOBAL counter, as before: 5 failures in 15 minutes -> 15 minute lockout.
+$LOCKOUT_FILE = '/var/lib/irongate/lockout/lockout.json';
 $MAX_ATTEMPTS = 5;
 $WINDOW_SECONDS = 15 * 60;
 $LOCKOUT_SECONDS = 15 * 60;
@@ -26,8 +29,78 @@ function loadAuth($file) {
     return is_array($auth) ? $auth : null;
 }
 
-function saveAuth($file, $auth) {
-    return @file_put_contents($file, json_encode($auth, JSON_PRETTY_PRINT) . "\n", LOCK_EX) !== false;
+// The lockout state is read and written under an exclusive flock on the counter file itself. The write
+// renames a new file over it, so after locking, the descriptor is checked against the path: a lock on the
+// replaced inode would not serialise the next writer, and the caller retries on the current file.
+function lockoutOpen($file) {
+    for ($i = 0; $i < 20; $i++) {
+        $fh = @fopen($file, 'c+');
+        if ($fh === false) {
+            return false;
+        }
+        if (!flock($fh, LOCK_EX)) {
+            fclose($fh);
+            return false;
+        }
+        clearstatcache(true, $file);
+        $a = fstat($fh);
+        $b = @stat($file);
+        if ($a !== false && $b !== false && $a['dev'] === $b['dev'] && $a['ino'] === $b['ino']) {
+            return $fh;
+        }
+        flock($fh, LOCK_UN);
+        fclose($fh);
+    }
+    return false;
+}
+
+function lockoutZero() {
+    return ['version' => 1, 'failed_attempts' => 0, 'first_failed_at' => 0, 'locked_until' => 0];
+}
+
+function lockoutRead($fh) {
+    rewind($fh);
+    $raw = stream_get_contents($fh);
+    $data = json_decode((string)$raw, true);
+    if (!is_array($data)) {
+        // Missing or unparsable: zero counters, logged, and rewritten clean on the next write.
+        error_log('Irongate login: lockout state is missing or unreadable; counters reset');
+        return lockoutZero();
+    }
+    return [
+        'version' => 1,
+        'failed_attempts' => intval($data['failed_attempts'] ?? 0),
+        'first_failed_at' => intval($data['first_failed_at'] ?? 0),
+        'locked_until' => intval($data['locked_until'] ?? 0),
+    ];
+}
+
+function lockoutWrite($fh, $file, $state) {
+    $dir = dirname($file);
+    $tmp = $dir . '/.lockout.json.new.' . getmypid();
+    @unlink($tmp);
+    $out = @fopen($tmp, 'x');
+    if ($out === false) {
+        error_log('Irongate login: cannot create the lockout temporary file');
+        return false;
+    }
+    $data = json_encode($state, JSON_PRETTY_PRINT) . "\n";
+    $ok = (@fwrite($out, $data) === strlen($data)) && @fflush($out) && @fsync($out);
+    @fclose($out);
+    @chmod($tmp, 0600);
+    if (!$ok || !@rename($tmp, $file)) {
+        @unlink($tmp);
+        error_log('Irongate login: cannot write the lockout state');
+        return false;
+    }
+    return true;
+}
+
+function lockoutClose($fh) {
+    if (is_resource($fh)) {
+        flock($fh, LOCK_UN);
+        fclose($fh);
+    }
 }
 
 function safeRedirectTarget() {
@@ -55,18 +128,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Authentication is not configured correctly.';
         } else {
             $now = time();
-            $lockedUntil = intval($auth['locked_until'] ?? 0);
+            $lock = lockoutOpen($LOCKOUT_FILE);
+            if ($lock === false) {
+                error_log('Irongate login: cannot open the lockout state; counters are not persisted');
+            }
+            $counters = $lock !== false ? lockoutRead($lock) : lockoutZero();
+            $lockedUntil = $counters['locked_until'];
             if ($lockedUntil > $now) {
                 $mins = (int)ceil(($lockedUntil - $now) / 60);
                 $error = 'Too many failed attempts. Try again in ' . $mins . ' minute' . ($mins === 1 ? '' : 's') . '.';
+                lockoutClose($lock);
             } else {
                 $user = (string)($_POST['username'] ?? '');
                 $pass = (string)($_POST['password'] ?? '');
                 if ($user === $auth['username'] && password_verify($pass, $auth['password_hash'])) {
-                    $auth['failed_attempts'] = 0;
-                    $auth['first_failed_at'] = 0;
-                    $auth['locked_until'] = 0;
-                    saveAuth($AUTH_FILE, $auth);
+                    $counters = lockoutZero();
+                    if ($lock !== false) {
+                        lockoutWrite($lock, $LOCKOUT_FILE, $counters);
+                    }
+                    lockoutClose($lock);
                     session_regenerate_id(true);
                     $_SESSION['authenticated'] = true;
                     $_SESSION['username'] = $auth['username'];
@@ -75,23 +155,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     header('Location: ' . safeRedirectTarget());
                     exit;
                 }
-                // Failed attempt — rolling window
-                $first = intval($auth['first_failed_at'] ?? 0);
+                // Failed attempt - rolling window (same thresholds as before)
+                $first = $counters['first_failed_at'];
                 if ($first === 0 || ($now - $first) > $WINDOW_SECONDS) {
-                    $auth['failed_attempts'] = 1;
-                    $auth['first_failed_at'] = $now;
+                    $counters['failed_attempts'] = 1;
+                    $counters['first_failed_at'] = $now;
                 } else {
-                    $auth['failed_attempts'] = intval($auth['failed_attempts'] ?? 0) + 1;
+                    $counters['failed_attempts'] = $counters['failed_attempts'] + 1;
                 }
-                if (intval($auth['failed_attempts']) >= $MAX_ATTEMPTS) {
-                    $auth['locked_until'] = $now + $LOCKOUT_SECONDS;
-                    $auth['failed_attempts'] = 0;
-                    $auth['first_failed_at'] = 0;
+                if ($counters['failed_attempts'] >= $MAX_ATTEMPTS) {
+                    $counters['locked_until'] = $now + $LOCKOUT_SECONDS;
+                    $counters['failed_attempts'] = 0;
+                    $counters['first_failed_at'] = 0;
                     $error = 'Too many failed attempts. Locked for 15 minutes.';
                 } else {
                     $error = 'Invalid username or password.';
                 }
-                saveAuth($AUTH_FILE, $auth);
+                if ($lock !== false) {
+                    lockoutWrite($lock, $LOCKOUT_FILE, $counters);
+                }
+                lockoutClose($lock);
             }
         }
     }

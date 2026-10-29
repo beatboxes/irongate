@@ -45,6 +45,8 @@ def repo_path_for(target, quoted):
         name = special.get(target, base)
         return os.path.join('templates', name + '.template')
 
+    if target in ('"$IG_WEBWRITE_NEW"', '/usr/local/sbin/irongate-webwrite'):
+        return os.path.join('src', 'irongate-webwrite')
     if target.startswith('/opt/irongate/'):
         return os.path.join('src', base)
     if target.startswith('/var/www/irongate/'):

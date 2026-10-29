@@ -22,6 +22,36 @@ $IRONGATE_SESSION_TIMEOUT = 4 * 60 * 60; // 4 hours of inactivity
 
 $isApi = basename($_SERVER['SCRIPT_NAME'] ?? '') === 'api.php';
 
+// The ONE test/development exception: PHP's built-in server together with IRONGATE_TEST_SANDBOX=1. The PHP
+// suites drive api.php this way, so they keep the old direct writes and skip the CSRF gate. Dead under
+// php-fpm: the SAPI there is fpm-fcgi, never cli-server. (php_sapi_name() is used instead of the SAPI
+// constant so that this file keeps exactly one literal occurrence of it, which tests/test_item_e_api.php
+// relies on to rewrite the guard for its fpm-fcgi cases.)
+function irongate_test_sandbox(): bool {
+    return php_sapi_name() === 'cli-server' && getenv('IRONGATE_TEST_SANDBOX') === '1';
+}
+
+// CSRF token gate for the state-changing API actions. True here means the token is NOT required.
+function irongate_csrf_not_required(): bool {
+    return irongate_test_sandbox();
+}
+
+// Enforce X-CSRF-Token against this session's token, in constant time. A request without a session
+// (the cli-server loopback bypass) has no token and is refused too.
+function irongate_require_csrf(): void {
+    if (irongate_csrf_not_required()) {
+        return;
+    }
+    $sent = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    $want = $_SESSION['csrf_token'] ?? '';
+    if (!is_string($sent) || !is_string($want) || $want === '' || !hash_equals($want, $sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'error' => 'invalid csrf token']);
+        exit;
+    }
+}
+
 // Local service-to-service API bypass (no session cookie presented). The decision is a function of the SAPI so
 // that it can be tested for fpm-fcgi: it is true only for the built-in web server (cli-server) on loopback.
 function irongate_local_bypass_allowed(string $sapi, string $addr, bool $hasCookie): bool {

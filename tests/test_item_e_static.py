@@ -128,6 +128,9 @@ www-data ALL=(ALL) NOPASSWD: /usr/sbin/arping *
 www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block irongate-updater-now.service
 www-data ALL=(ALL) NOPASSWD: /usr/bin/touch /var/log/irongate-update.log
 www-data ALL=(ALL) NOPASSWD: /usr/bin/chown www-data /var/log/irongate-update.log
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite config-apply
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-credentials
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/irongate-webwrite auth-set-username
 '''
 NEW_LINE = 'www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block irongate-updater-now.service'
 sud_hd = heredoc(r'/etc/sudoers\.d/dnsmasq-web|\$IG_SUDOERS_WEB_NEW') or ''
