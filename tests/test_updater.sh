@@ -36,7 +36,8 @@ fi
 cat > "$T/bin/sqlite3" <<'SH'
 #!/bin/bash
 # minimal settings-table emulation: SELECT value ... key='K' / INSERT OR REPLACE ... ('K', 'V' | datetime('now'))
-sql="$2"
+# the SQL is the last argument (the updater runs `... -cmd ".timeout N" DB SQL` as www-data)
+sql="${!#}"
 if [[ "$sql" =~ SELECT\ value\ FROM\ settings\ WHERE\ key=\'([a-z_]+)\' ]]; then
     f="$T/db/${BASH_REMATCH[1]}"; [ -f "$f" ] && cat "$f"; exit 0
 elif [[ "$sql" =~ VALUES\ \(\'([a-z_]+)\',\ \'([^\']*)\'\) ]]; then
@@ -45,6 +46,16 @@ elif [[ "$sql" =~ VALUES\ \(\'([a-z_]+)\',\ datetime ]]; then
     echo now > "$T/db/${BASH_REMATCH[1]}"; exit 0
 fi
 exit 0
+SH
+# runuser: the updater writes the settings table as www-data (php-fpm owns the DB), so it goes through
+# `runuser -u www-data -- sqlite3`. The shim drops that prefix and runs the command it was given, so the write
+# under test is still the sqlite3 shim above.
+cat > "$T/bin/runuser" <<'SH'
+#!/bin/bash
+echo "ARGS $*" >> "$T/runuser.args"
+[ "${1:-}" = "-u" ] && shift 2
+[ "${1:-}" = "--" ] && shift
+exec "$@"
 SH
 cat > "$T/bin/curl" <<'SH'
 #!/bin/bash
@@ -60,8 +71,10 @@ case "$url" in
     *) exit 22 ;;
 esac
 SH
-chmod +x "$T/bin/sqlite3" "$T/bin/curl"
+chmod +x "$T/bin/sqlite3" "$T/bin/runuser" "$T/bin/curl"
 export MAINSHA_FOR_SHIM="$MAINSHA" PATH="$T/bin:$PATH"
+# the updater's database writes run as www-data through runuser; point both at the shims
+export IG_DB_RUNUSER="$T/bin/runuser" IG_DB_SQLITE3="$T/bin/sqlite3" IG_DB_BUSY_MS=5000
 
 # --- fixture installers (>= 100000 bytes, valid bash) -----------------------------
 make_installer() {   # $1=file $2=extra body

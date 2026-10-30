@@ -482,6 +482,13 @@ echo -e "${YELLOW}Setting up database...${NC}"
 IG_DB_MODE_BEFORE=""   # the mode dhcp.db has when this run starts (permission and mode step further down)
 IG_DB_CREATED=0
 IG_DB_BACKUP=""
+IG_DB_STAMP=""         # names the backup AND the sidecar files of the restore below, so the two cannot be confused
+# www-data owns the database on a re-install (php-fpm writes it), and root's write to it fails with
+# SQLITE_READONLY; a database migrated from dhcp-admin is still root-owned here, so that case stays root.
+IG_SQLITE_WRITE=("${IG_DB_SQLITE3:-/usr/bin/sqlite3}" -cmd ".timeout ${IG_DB_BUSY_MS:-5000}")
+if [ "$(stat -c %U /var/www/irongate/dhcp.db 2>/dev/null)" = "www-data" ]; then
+    IG_SQLITE_WRITE=("${IG_DB_RUNUSER:-/usr/sbin/runuser}" -u www-data -- "${IG_DB_SQLITE3:-/usr/bin/sqlite3}" -cmd ".timeout ${IG_DB_BUSY_MS:-5000}")
+fi
 if [ -f /var/www/irongate/dhcp.db ]; then
     # keep the permission bits the operator gave the file - except setuid/setgid/sticky and world-write (0666 was the
     # mode the O1 hardening took away from every local user); a link is not looked through
@@ -491,7 +498,8 @@ if [ -f /var/www/irongate/dhcp.db ]; then
     fi
     # BACKUP THE DATABASE FIRST - safety measure
     # (a backup holds everything dhcp.db does: it is created 0600, never wider - umask 077)
-    IG_DB_BACKUP=/var/www/irongate/dhcp.db.bak.$(date +%s)
+    IG_DB_STAMP=$(date +%s)
+    IG_DB_BACKUP=/var/www/irongate/dhcp.db.bak.$IG_DB_STAMP
     ( umask 077; cp /var/www/irongate/dhcp.db "$IG_DB_BACKUP" )
     echo -e "${GREEN}Created database backup${NC}"
     
@@ -510,8 +518,10 @@ if [ -f /var/www/irongate/dhcp.db ]; then
     fi
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
-    # Just ensure tables exist without overwriting data (INSERT OR IGNORE keeps existing values)
-    sqlite3 /var/www/irongate/dhcp.db << 'EOSQL'
+    # Just ensure tables exist without overwriting data (INSERT OR IGNORE keeps existing values). The writer is the
+    # one chosen above (www-data on a re-install): a failure here stops the install instead of leaving the schema
+    # half ensured under set -e's silent exit.
+    if ! "${IG_SQLITE_WRITE[@]}" /var/www/irongate/dhcp.db << 'EOSQL'
 CREATE TABLE IF NOT EXISTS reservations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mac TEXT UNIQUE NOT NULL,
@@ -572,22 +582,89 @@ CREATE TABLE IF NOT EXISTS device_groups (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 EOSQL
+    then
+        echo -e "${RED}ERROR: could not ensure the dhcp.db schema/defaults (see above)${NC}" >&2
+        exit 1
+    fi
 
     # Always fix hostnames with spaces in database (replace space with hyphen)
     echo -e "${YELLOW}  → Sanitizing hostnames in database...${NC}"
-    # Note: UPDATE and SELECT changes() must be in same session to get correct count
-    FIXED_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %'; SELECT changes();" 2>/dev/null || echo "0")
-    echo -e "${GREEN}  ✓ Database hostnames sanitized${NC}"
+    # Note: UPDATE and SELECT changes() must be in same session to get correct count. A failure is reported but does
+    # not stop the install: the verify/restore below is what protects the data. `|| DB_RC=$?` keeps set -e from
+    # exiting on the assignment itself.
+    DB_RC=0
+    FIXED_COUNT=$("${IG_SQLITE_WRITE[@]}" /var/www/irongate/dhcp.db "UPDATE reservations SET hostname = REPLACE(hostname, ' ', '-') WHERE hostname LIKE '% %'; SELECT changes();") || DB_RC=$?
+    if [ "$DB_RC" -ne 0 ]; then
+        echo -e "${RED}ERROR: could not sanitize hostnames in dhcp.db${NC}" >&2
+        echo -e "${RED}  hostnames left as they were${NC}" >&2
+        FIXED_COUNT=0
+    else
+        echo -e "${GREEN}  ✓ Database hostnames sanitized${NC}"
+    fi
     
     # Verify data wasn't lost
     VERIFY_COUNT=$(sqlite3 /var/www/irongate/dhcp.db "SELECT COUNT(*) FROM reservations;" 2>/dev/null || echo "0")
     if [ "$VERIFY_COUNT" != "$DB_RESERVATION_COUNT" ]; then
         echo -e "${RED}WARNING: Reservation count changed! Restoring backup...${NC}"
-        # Get the most recent backup file (sorted by modification time)
+        # >>> IG_DB_RESTORE (tests/test_installer_db_restore.sh extracts this block and runs it verbatim)
+        # Get the most recent backup file (sorted by modification time). Only dhcp.db.bak.* names a backup: the sidecars
+        # below are moved to dhcp.db-sidecar.<stamp>-<suffix>, which this glob cannot match, and the -f test keeps a
+        # non-file (a directory) from being installed as the database. -f follows a link, so a link is refused outright.
         LATEST_BACKUP=$(ls -t /var/www/irongate/dhcp.db.bak.* 2>/dev/null | head -n1)
-        if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP" ]; then
-            cp "$LATEST_BACKUP" /var/www/irongate/dhcp.db
+        if [ -n "$LATEST_BACKUP" ] && [ -L "$LATEST_BACKUP" ]; then
+            echo -e "${RED}ERROR: $LATEST_BACKUP is a symlink - refusing to restore the database from it${NC}" >&2
+            exit 1
         fi
+        if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP" ] && [ ! -L "$LATEST_BACKUP" ]; then
+            # A rollback journal or WAL left hot by php-fpm would be replayed over the file installed below. Move each
+            # one aside FIRST, never deleting it and never overwriting an existing destination; a move that fails stops
+            # the install while dhcp.db is still untouched. The webroot is group-writable for www-data, so a sidecar can
+            # be a LINK: it is refused before any move. `mv` renames a name, so what follows is about the destination
+            # name, never what it points at. chown keeps -h (GNU chown has it); GNU chmod has NO -h and follows a link, so
+            # the plain chmod below is safe only because the destination is proven to be a regular file right before it
+            # and checked again right after it, and any link seen there stops the install.
+            for IG_DB_SIDECAR in journal wal shm; do
+                IG_DB_SIDECAR_SRC=/var/www/irongate/dhcp.db-$IG_DB_SIDECAR
+                IG_DB_SIDECAR_DST=/var/www/irongate/dhcp.db-sidecar.$IG_DB_STAMP-$IG_DB_SIDECAR
+                if [ -L "$IG_DB_SIDECAR_SRC" ]; then
+                    echo -e "${RED}ERROR: $IG_DB_SIDECAR_SRC is a symlink - refusing to move it or touch what it points at; dhcp.db was NOT restored${NC}" >&2
+                    exit 1
+                fi
+                [ -e "$IG_DB_SIDECAR_SRC" ] || continue
+                # mv -n never clobbers: if something is already at the destination the source stays put and the check
+                # below fails, so nothing an attacker planted there is ever overwritten or installed.
+                if ! mv -n -- "$IG_DB_SIDECAR_SRC" "$IG_DB_SIDECAR_DST" || [ -e "$IG_DB_SIDECAR_SRC" ] \
+                    || [ ! -e "$IG_DB_SIDECAR_DST" ] || [ -L "$IG_DB_SIDECAR_DST" ]; then
+                    echo -e "${RED}ERROR: could not move the stale $IG_DB_SIDECAR_SRC aside to $IG_DB_SIDECAR_DST (something is already there, or the move failed) - dhcp.db was NOT restored${NC}" >&2
+                    exit 1
+                fi
+                if ! chown -h root:root "$IG_DB_SIDECAR_DST"; then
+                    echo -e "${RED}ERROR: moved $IG_DB_SIDECAR_SRC to $IG_DB_SIDECAR_DST but could not give it to root:root - dhcp.db was NOT restored${NC}" >&2
+                    exit 1
+                fi
+                if [ -L "$IG_DB_SIDECAR_DST" ] || ! chmod 600 "$IG_DB_SIDECAR_DST"; then
+                    echo -e "${RED}ERROR: moved $IG_DB_SIDECAR_SRC to $IG_DB_SIDECAR_DST but could not set its mode to 600 - dhcp.db was NOT restored${NC}" >&2
+                    exit 1
+                fi
+                if [ -L "$IG_DB_SIDECAR_DST" ]; then
+                    echo -e "${RED}ERROR: $IG_DB_SIDECAR_DST is a symlink after the move - refusing to go on; dhcp.db was NOT restored${NC}" >&2
+                    exit 1
+                fi
+            done
+            # php-fpm can also delete and re-create dhcp.db as a LINK (it owns the file): install must never write the
+            # backup through such a link, so the database itself is refused when it is one.
+            if [ -L /var/www/irongate/dhcp.db ]; then
+                echo -e "${RED}ERROR: /var/www/irongate/dhcp.db is a symlink - refusing to install the backup over it${NC}" >&2
+                exit 1
+            fi
+            # Replace the database with install instead of rewriting it in place with cp: the backup is root:root 0600
+            # (umask 077), so a www-data copy is impossible, and install writes the file fresh under the intended owner.
+            if ! install -o www-data -g www-data -m "${IG_DB_MODE_BEFORE:-660}" "$LATEST_BACKUP" /var/www/irongate/dhcp.db; then
+                echo -e "${RED}ERROR: could not restore $LATEST_BACKUP over /var/www/irongate/dhcp.db${NC}" >&2
+                exit 1
+            fi
+        fi
+        # <<< IG_DB_RESTORE
     fi
 else
     echo -e "${YELLOW}Creating new database${NC}"
@@ -7768,6 +7845,18 @@ fi
 if [ -n "$IG_DB_BACKUP" ]; then
     ig_perm_fix file "$IG_DB_BACKUP" root root 600 || echo -e "${YELLOW}  ! could not restrict $IG_DB_BACKUP to root${NC}"
 fi
+# The sidecars the restore moved aside sit in the same (group-writable) directory, and the tree pass above just made
+# them root:www-data 0755: put them back to root:root 0600, exactly like the backup, so nginx can never serve a SQLite
+# page image (the artifact deny rule matches their name too).
+# >>> IG_DB_SIDECAR_PERM (tests/test_installer_db_restore.sh extracts this block and runs it verbatim)
+if [ -n "$IG_DB_STAMP" ]; then
+    for IG_DB_SIDECAR in journal wal shm; do
+        IG_DB_SIDECAR_DST=/var/www/irongate/dhcp.db-sidecar.$IG_DB_STAMP-$IG_DB_SIDECAR
+        [ -e "$IG_DB_SIDECAR_DST" ] || continue
+        ig_perm_fix file "$IG_DB_SIDECAR_DST" root root 600 || echo -e "${YELLOW}  ! could not restrict $IG_DB_SIDECAR_DST to root${NC}"
+    done
+fi
+# <<< IG_DB_SIDECAR_PERM
 if [ -n "$IG_DB_MODE_BEFORE" ]; then
     ig_perm_fix file /var/www/irongate/dhcp.db www-data www-data "$IG_DB_MODE_BEFORE"
 elif [ "$IG_DB_CREATED" = 1 ]; then
@@ -11204,8 +11293,44 @@ FORCE=0
 DB_PATH="/var/www/irongate/dhcp.db"
 LOG_FILE="/var/log/irongate-update.log"
 
+# The database is www-data-owned and php-fpm writes it on every dashboard save,
+# while root's own write to it fails on the live host. Every write below runs as
+# www-data through runuser; sqlite3 exiting 5 (SQLITE_BUSY) or 6 (SQLITE_LOCKED)
+# means another writer holds it, which is expected and is retried once.
+DB_RUNUSER="${IG_DB_RUNUSER:-/usr/sbin/runuser}"
+DB_SQLITE="${IG_DB_SQLITE3:-/usr/bin/sqlite3}"
+DB_BUSY_MS="${IG_DB_BUSY_MS:-5000}"
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Run exactly one SQL statement against $DB_PATH as www-data and return sqlite3's
+# exit status. A busy or locked database is retried once; every other non-zero
+# status is returned to the caller without a retry.
+ig_sqlite3_write() {
+    local sql="$1" rc
+    "$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql"
+    rc=$?
+    if [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+        "$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql"
+        rc=$?
+    fi
+    return "$rc"
+}
+
+# Read one SQL statement the same way: the query result goes to stdout and sqlite3's exit status is returned. Another
+# writer holding the database makes a read exit 5 (SQLITE_BUSY) or 6 (SQLITE_LOCKED) too, so the read is retried once.
+ig_sqlite3_read() {
+    local sql="$1" out rc
+    out=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql")
+    rc=$?
+    if [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+        out=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql")
+        rc=$?
+    fi
+    printf '%s\n' "$out"
+    return "$rc"
 }
 
 # One update at a time (the daily timer, the dashboard's "Update now" and an operator can all start this script): the
@@ -11288,8 +11413,13 @@ CURRENT_COMMIT=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='insta
 
 log "Current: $CURRENT_COMMIT, Pinned: $TARGET_COMMIT"
 
-# Update last check time
-sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));" 2>/dev/null
+# Update last check time. It must not stop the update when it fails, but it must
+# not be silent either (the old 2>/dev/null hid every failure).
+ig_sqlite3_write "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_update_check', datetime('now'));"
+DB_RC=$?
+if [ "$DB_RC" -ne 0 ]; then
+    log "ERROR: could not record last_update_check in $DB_PATH (sqlite3 status $DB_RC) - continuing"
+fi
 
 # --force re-runs nothing that is already installed: at the pinned commit it is a logged no-op (nothing is downloaded)
 if [ "$FORCE" -eq 1 ] && [ "$CURRENT_COMMIT" = "$TARGET_COMMIT" ]; then
@@ -11379,8 +11509,25 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
     rm -f "$SNAPSHOT"
     log "Installer succeeded - snapshot removed"
     # The installer stamps installed_commit with the moving main HEAD; restore
-    # the pinned commit so the next scheduled run does not reinstall.
-    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');" 2>/dev/null
+    # the pinned commit so the next scheduled run does not reinstall. A stamp
+    # that does not land leaves installed != pin, so every "Update now" press
+    # would reinstall: it is an error here, never a quiet success.
+    if ! [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{7}$ ]]; then
+        log "ERROR: refusing to record installed_commit '$TARGET_COMMIT' - not a 7-hex commit id"
+        exit 1
+    fi
+    ig_sqlite3_write "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '$TARGET_COMMIT');"
+    DB_RC=$?
+    if [ "$DB_RC" -ne 0 ]; then
+        log "ERROR: could not record installed_commit $TARGET_COMMIT in $DB_PATH (sqlite3 status $DB_RC) - the next run will reinstall"
+        exit 1
+    fi
+    STAMPED_COMMIT=$(ig_sqlite3_read "SELECT value FROM settings WHERE key='installed_commit';")
+    DB_RC=$?
+    if [ "$DB_RC" -ne 0 ] || [ "$STAMPED_COMMIT" != "$TARGET_COMMIT" ]; then
+        log "ERROR: installed_commit read-back failed (sqlite3 status $DB_RC, read '${STAMPED_COMMIT:-}') - expected $TARGET_COMMIT"
+        exit 1
+    fi
     log "Update complete!"
     log "Update check finished"
     # The installer rewrites this very file; bash reads scripts incrementally, so
@@ -11544,6 +11691,8 @@ server {
     # Backup files (api.php.bak.<ts>) do not end in .php, so the php location
     # never claims them and \`location /\` returned them as plaintext source.
     # The SQLite device database was likewise downloadable in full.
+    location ~* (^|/)\.(?!well-known/) { deny all; return 404; }
+    location ~* \.(bak|orig|old|save|swp|db|db-sidecar|db-wal|db-shm|db-journal|sqlite|sqlite3|sql|tar|gz|zip)(\..*)?\$|~\$ { deny all; return 404; }
     location ~* \.(bak|old|orig|swp|save|sql|sqlite|sqlite3|db)(\.[0-9]+)?\$ {
         deny all;
         return 403;
@@ -11930,7 +12079,24 @@ ig_stamp_commit() {
         echo -e "${YELLOW}  installed_commit left as it was (not a commit id)${NC}"
         return 0
     fi
-    sqlite3 /var/www/irongate/dhcp.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '${IRONGATE_COMMIT}');"
+    # The database is www-data-owned and php-fpm writes it, so a root write fails
+    # with SQLITE_READONLY on the live host: the stamp runs as www-data through the
+    # same seam as the updater, and a stamp that does not land stops the install
+    # instead of leaving it unrecorded. sqlite3 exiting 5 (SQLITE_BUSY) or 6
+    # (SQLITE_LOCKED) is a dashboard save holding the database: retried once.
+    RU="${IG_DB_RUNUSER:-/usr/sbin/runuser}"
+    SQ="${IG_DB_SQLITE3:-/usr/bin/sqlite3}"
+    BUSY="${IG_DB_BUSY_MS:-5000}"
+    rc=0
+    for attempt in 1 2; do
+        rc=0
+        "$RU" -u www-data -- "$SQ" -cmd ".timeout $BUSY" /var/www/irongate/dhcp.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('installed_commit', '${IRONGATE_COMMIT}');" || rc=$?   # sqlite3 as www-data: php-fpm owns the database
+        if [ "$rc" -ne 5 ] && [ "$rc" -ne 6 ]; then break; fi
+    done
+    if [ "$rc" -ne 0 ]; then
+        echo -e "${RED}ERROR: could not record installed_commit in /var/www/irongate/dhcp.db${NC}" >&2
+        exit 1
+    fi
     echo -e "${GREEN}  ✓ Commit: ${IRONGATE_COMMIT}${NC}"
 }
 ig_stamp_commit
