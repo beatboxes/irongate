@@ -91,7 +91,7 @@ BODY = NGINX or ''
 BLINES = BODY.split('\n')
 
 DOTFILE = r'    location ~* (^|/)\.(?!well-known/) { deny all; return 404; }'
-ARTIFACT = (r'    location ~* \.(bak|orig|old|save|swp|db|db-journal|sqlite|sqlite3|sql|tar|gz|zip)'
+ARTIFACT = (r'    location ~* \.(bak|orig|old|save|swp|db|db-sidecar|db-wal|db-shm|db-journal|sqlite|sqlite3|sql|tar|gz|zip)'
             r'(\..*)?\$|~\$ { deny all; return 404; }')
 NARROW = r'    location ~* \.(bak|old|orig|swp|save|sql|sqlite|sqlite3|db)(\.[0-9]+)?\$ {'
 PHP = r'    location ~ \.php\$ {'

@@ -47,6 +47,20 @@ ig_sqlite3_write() {
     return "$rc"
 }
 
+# Read one SQL statement the same way: the query result goes to stdout and sqlite3's exit status is returned. Another
+# writer holding the database makes a read exit 5 (SQLITE_BUSY) or 6 (SQLITE_LOCKED) too, so the read is retried once.
+ig_sqlite3_read() {
+    local sql="$1" out rc
+    out=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql")
+    rc=$?
+    if [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+        out=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "$sql")
+        rc=$?
+    fi
+    printf '%s\n' "$out"
+    return "$rc"
+}
+
 # One update at a time (the daily timer, the dashboard's "Update now" and an operator can all start this script): the
 # second one logs it and exits non-zero. The lock is held on fd 9 until this process exits (the installer it runs gets
 # fd 9 closed, so nothing it leaves running can keep the lock).
@@ -236,7 +250,7 @@ if [ "$FORCE" -eq 1 ] || { [ "$CURRENT_COMMIT" != "$TARGET_COMMIT" ] && [ "$CURR
         log "ERROR: could not record installed_commit $TARGET_COMMIT in $DB_PATH (sqlite3 status $DB_RC) - the next run will reinstall"
         exit 1
     fi
-    STAMPED_COMMIT=$("$DB_RUNUSER" -u www-data -- "$DB_SQLITE" -cmd ".timeout $DB_BUSY_MS" "$DB_PATH" "SELECT value FROM settings WHERE key='installed_commit';")
+    STAMPED_COMMIT=$(ig_sqlite3_read "SELECT value FROM settings WHERE key='installed_commit';")
     DB_RC=$?
     if [ "$DB_RC" -ne 0 ] || [ "$STAMPED_COMMIT" != "$TARGET_COMMIT" ]; then
         log "ERROR: installed_commit read-back failed (sqlite3 status $DB_RC, read '${STAMPED_COMMIT:-}') - expected $TARGET_COMMIT"
